@@ -2,6 +2,12 @@
 set -eu
 
 daemon="${1:-target/debug/onedrive-daemon}"
+if [ "${SMOKE_TEST_LOGIN:-0}" = 1 ]; then
+    export ONEDRIVE_CLIENT_ID=test-client
+else
+    # An explicit empty value prevents startup credential restoration.
+    export ONEDRIVE_CLIENT_ID=
+fi
 "$daemon" &
 daemon_pid=$!
 trap 'kill "$daemon_pid" 2>/dev/null || true' EXIT HUP INT TERM
@@ -26,4 +32,26 @@ result=$(gdbus call --session \
     --object-path /io/github/onedrive_linux/Daemon \
     --method io.github.onedrive_linux.Daemon.Status)
 test "$result" = "('needs-login',)"
+kill -0 "$daemon_pid"
+
+if [ "${SMOKE_TEST_LOGIN:-0}" != 1 ]; then
+    exit 0
+fi
+
+login_url=$(gdbus call --session \
+    --dest io.github.onedrive_linux.Daemon \
+    --object-path /io/github/onedrive_linux/Daemon \
+    --method io.github.onedrive_linux.Daemon.BeginLogin)
+case "$login_url" in
+    *login.microsoftonline.com*code_challenge_method=S256*) ;;
+    *) exit 1 ;;
+esac
+
+# A second login must not replace the pending PKCE challenge.
+if gdbus call --session \
+    --dest io.github.onedrive_linux.Daemon \
+    --object-path /io/github/onedrive_linux/Daemon \
+    --method io.github.onedrive_linux.Daemon.BeginLogin >/dev/null 2>&1; then
+    exit 1
+fi
 kill -0 "$daemon_pid"

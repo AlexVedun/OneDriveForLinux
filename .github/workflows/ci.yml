@@ -17,4 +17,4 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
       - run: cargo build -p onedrive-daemon
-      - run: dbus-run-session -- sh scripts/smoke-dbus.sh
+      - run: SMOKE_TEST_LOGIN=1 dbus-run-session -- sh scripts/smoke-dbus.sh

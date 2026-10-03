@@ -14,6 +14,7 @@ pub enum EngineState {
     Paused,
     Transferring,
     Checking,
+    Connected,
     Synced,
 }
 
@@ -26,6 +27,7 @@ impl EngineState {
             Self::Paused => "paused",
             Self::Transferring => "transferring",
             Self::Checking => "checking",
+            Self::Connected => "connected",
             Self::Synced => "synced",
         }
     }
@@ -37,7 +39,8 @@ impl EngineState {
             Self::Paused => 3,
             Self::Transferring => 4,
             Self::Checking => 5,
-            Self::Synced => 6,
+            Self::Connected => 6,
+            Self::Synced => 7,
         }
     }
 }
