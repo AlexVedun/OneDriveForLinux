@@ -21,6 +21,7 @@ pub enum SyncError {
     RootHasState,
     MissingRootId,
     InvalidCheckpoint,
+    InvalidApproval,
     DriveMismatch,
 }
 
@@ -37,6 +38,7 @@ impl std::fmt::Display for SyncError {
             ),
             Self::MissingRootId => write!(f, "OneDrive root ID is missing; refresh the catalog"),
             Self::InvalidCheckpoint => write!(f, "invalid upload checkpoint"),
+            Self::InvalidApproval => write!(f, "operation cannot be approved"),
             Self::DriveMismatch => write!(f, "sync state belongs to a different or unknown drive"),
         }
     }
@@ -186,6 +188,7 @@ impl SyncStore {
                 remote_id TEXT,
                 expected_etag TEXT,
                 local_fingerprint TEXT,
+                approved INTEGER NOT NULL DEFAULT 0 CHECK (approved IN (0, 1)),
                 status TEXT NOT NULL DEFAULT 'pending',
                 attempts INTEGER NOT NULL DEFAULT 0,
                 last_error TEXT
@@ -213,6 +216,20 @@ impl SyncStore {
         if !columns.iter().any(|name| name == "from_path") {
             connection.execute("ALTER TABLE operation ADD COLUMN from_path TEXT", [])?;
         }
+        if !columns.iter().any(|name| name == "approved") {
+            connection.execute(
+                "ALTER TABLE operation ADD COLUMN approved INTEGER NOT NULL DEFAULT 0 CHECK (approved IN (0, 1))",
+                [],
+            )?;
+        }
+        // Existing automatic work may continue after migration. Destructive
+        // operations and unresolved conflicts remain unapproved.
+        connection.execute(
+            "UPDATE operation SET approved = 1
+             WHERE kind IN ('UploadNew', 'DownloadNew', 'UploadChanged',
+                            'DownloadChanged', 'RenameLocal')",
+            [],
+        )?;
         // A process crash may interrupt an operation before its result is
         // recorded. The future executor must recheck both sides on retry.
         connection.execute(
@@ -389,8 +406,8 @@ impl SyncStore {
         Ok(plan(&local, &remote, &baseline, skipped))
     }
 
-    /// Save an approved plan before any network work. Repeated submissions do
-    /// not duplicate operations or reset attempt counters.
+    /// Save a plan before any network work. Actions that need review stay
+    /// unapproved regardless of the caller-supplied preview flag.
     pub fn enqueue(&mut self, operation: &PlannedOperation) -> Result<i64, SyncError> {
         let mut hasher = Sha256::new();
         let kind = format!("{:?}", operation.action);
@@ -413,8 +430,8 @@ impl SyncStore {
         let key = format!("{:x}", hasher.finalize());
         self.connection.execute(
             "INSERT OR IGNORE INTO operation
-             (idempotency_key, kind, path, from_path, remote_id, expected_etag, local_fingerprint)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+             (idempotency_key, kind, path, from_path, remote_id, expected_etag, local_fingerprint, approved)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 key,
                 kind,
@@ -423,6 +440,7 @@ impl SyncStore {
                 operation.remote_id,
                 operation.expected_etag,
                 operation.local_fingerprint,
+                !operation.action.requires_confirmation(),
             ],
         )?;
         self.connection
@@ -443,12 +461,36 @@ impl SyncStore {
         Ok(u64::try_from(count).unwrap_or(0))
     }
 
+    pub fn review_count(&self) -> Result<u64, SyncError> {
+        let count: i64 = self.connection.query_row(
+            "SELECT count(*) FROM operation WHERE status = 'pending' AND approved = 0",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(u64::try_from(count).unwrap_or(0))
+    }
+
+    /// Only a separately reviewed deletion or remote rename can be approved.
+    /// A conflict needs its own resolution operation instead.
+    pub fn approve_operation(&self, id: i64) -> Result<(), SyncError> {
+        let changed = self.connection.execute(
+            "UPDATE operation SET approved = 1 WHERE id = ?1 AND status = 'pending'
+             AND approved = 0 AND kind IN ('DeleteRemote', 'DeleteLocal', 'RenameRemote')",
+            [id],
+        )?;
+        if changed != 1 {
+            return Err(SyncError::InvalidApproval);
+        }
+        Ok(())
+    }
+
     pub fn claim_next(&mut self) -> Result<Option<QueuedOperation>, SyncError> {
         let transaction = self.connection.transaction()?;
         let next: Option<QueuedOperation> = transaction
             .query_row(
                 "SELECT id, kind, path, remote_id, expected_etag, attempts, local_fingerprint, from_path
-             FROM operation WHERE status = 'pending'
+             FROM operation WHERE status = 'pending' AND approved = 1
+               AND kind <> 'Conflict'
                AND NOT EXISTS (SELECT 1 FROM sync_control WHERE singleton = 1 AND paused = 1)
              ORDER BY id LIMIT 1",
                 [],
@@ -497,7 +539,8 @@ impl SyncStore {
         let next: Option<QueuedOperation> = transaction
             .query_row(
                 "SELECT id, kind, path, remote_id, expected_etag, attempts, local_fingerprint, from_path
-             FROM operation WHERE status = 'pending' AND kind = 'UploadChanged'
+             FROM operation WHERE status = 'pending' AND approved = 1
+               AND kind = 'UploadChanged'
                AND NOT EXISTS (SELECT 1 FROM sync_control WHERE singleton = 1 AND paused = 1)
              ORDER BY id LIMIT 1",
                 [],
@@ -1218,8 +1261,8 @@ mod tests {
         store
             .connection
             .execute(
-                "INSERT INTO operation(idempotency_key, kind, path, local_fingerprint)
-             VALUES (?1, 'UploadNew', 'file.txt', 'hash')",
+                "INSERT INTO operation(idempotency_key, kind, path, local_fingerprint, approved)
+             VALUES (?1, 'UploadNew', 'file.txt', 'hash', 1)",
                 ["81f7011b8f12139db6715dc832fc3f5c96ac83786383d005c841f67ee884a08a"],
             )
             .unwrap();
@@ -1255,6 +1298,111 @@ mod tests {
         assert_eq!(queued.kind, "RenameLocal");
         assert_eq!(queued.path, "new.txt");
         assert_eq!(queued.from_path.as_deref(), Some("old.txt"));
+    }
+
+    #[test]
+    fn review_gate_survives_restart_and_ignores_preview_flag() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sync.sqlite3");
+        let deletion = PlannedOperation {
+            action: Action::DeleteRemote,
+            path: "gone.txt".into(),
+            from_path: None,
+            remote_id: Some("id".into()),
+            expected_etag: Some("v1".into()),
+            local_fingerprint: None,
+            requires_confirmation: false,
+        };
+        let conflict = PlannedOperation {
+            action: Action::Conflict,
+            path: "changed.txt".into(),
+            from_path: None,
+            remote_id: Some("other".into()),
+            expected_etag: Some("v2".into()),
+            local_fingerprint: Some("hash".into()),
+            requires_confirmation: false,
+        };
+        let automatic = PlannedOperation {
+            action: Action::UploadNew,
+            path: "new.txt".into(),
+            from_path: None,
+            remote_id: None,
+            expected_etag: None,
+            local_fingerprint: Some("hash".into()),
+            requires_confirmation: false,
+        };
+        let (deletion_id, conflict_id) = {
+            let mut store = SyncStore::open(&path).unwrap();
+            let deletion_id = store.enqueue(&deletion).unwrap();
+            let conflict_id = store.enqueue(&conflict).unwrap();
+            store.enqueue(&automatic).unwrap();
+            assert_eq!(store.review_count().unwrap(), 2);
+            let claimed = store.claim_next().unwrap().unwrap();
+            assert_eq!(claimed.kind, "UploadNew");
+            store.mark_done(claimed.id).unwrap();
+            assert!(store.claim_next().unwrap().is_none());
+            (deletion_id, conflict_id)
+        };
+        let mut store = SyncStore::open(&path).unwrap();
+        assert_eq!(store.review_count().unwrap(), 2);
+        assert!(matches!(
+            store.approve_operation(conflict_id),
+            Err(SyncError::InvalidApproval)
+        ));
+        store.approve_operation(deletion_id).unwrap();
+        assert!(matches!(
+            store.approve_operation(deletion_id),
+            Err(SyncError::InvalidApproval)
+        ));
+        assert_eq!(store.review_count().unwrap(), 1);
+        assert_eq!(store.claim_next().unwrap().unwrap().kind, "DeleteRemote");
+        assert!(store.claim_next().unwrap().is_none());
+    }
+
+    #[test]
+    fn migration_keeps_legacy_deletion_awaiting_review() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("old.sqlite3");
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE operation (
+                    id INTEGER PRIMARY KEY, idempotency_key TEXT NOT NULL UNIQUE,
+                    kind TEXT NOT NULL, path TEXT NOT NULL, remote_id TEXT,
+                    expected_etag TEXT, status TEXT NOT NULL DEFAULT 'pending',
+                    attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT
+                 );
+                 INSERT INTO operation(idempotency_key, kind, path)
+                 VALUES ('old-delete', 'DeleteRemote', 'old.txt'),
+                        ('old-upload', 'UploadNew', 'new.txt');",
+            )
+            .unwrap();
+        let mut store = SyncStore::open(&path).unwrap();
+        assert_eq!(store.review_count().unwrap(), 1);
+        assert_eq!(store.claim_next().unwrap().unwrap().kind, "UploadNew");
+        assert!(store.claim_next().unwrap().is_none());
+    }
+
+    #[test]
+    fn local_deletion_and_remote_rename_also_need_approval() {
+        let mut store = SyncStore::in_memory().unwrap();
+        for action in [Action::DeleteLocal, Action::RenameRemote] {
+            let operation = PlannedOperation {
+                action,
+                path: "new.txt".into(),
+                from_path: Some("old.txt".into()),
+                remote_id: Some("id".into()),
+                expected_etag: Some("v1".into()),
+                local_fingerprint: Some("hash".into()),
+                requires_confirmation: false,
+            };
+            let id = store.enqueue(&operation).unwrap();
+            assert!(store.claim_next().unwrap().is_none());
+            store.approve_operation(id).unwrap();
+            let claimed = store.claim_next().unwrap().unwrap();
+            assert_eq!(claimed.id, id);
+            store.mark_done(id).unwrap();
+        }
     }
 
     #[test]

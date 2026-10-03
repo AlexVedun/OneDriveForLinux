@@ -73,6 +73,14 @@ impl Daemon {
             .map_err(|_| zbus::fdo::Error::Failed("cannot save sync pause".to_owned()))
     }
 
+    fn sync_review_count(&self) -> zbus::fdo::Result<u64> {
+        self.sync
+            .lock()
+            .unwrap()
+            .review_count()
+            .map_err(|_| zbus::fdo::Error::Failed("cannot read sync review count".to_owned()))
+    }
+
     fn catalog_items(&self) -> zbus::fdo::Result<String> {
         let catalog = self.catalog.lock().unwrap();
         let drive_id = catalog
