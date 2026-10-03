@@ -268,6 +268,7 @@ mod tests {
                 .enqueue(&PlannedOperation {
                     action: Action::UploadChanged,
                     path: "large.bin".into(),
+                    from_path: None,
                     remote_id: Some("item".into()),
                     expected_etag: Some("v1".into()),
                     local_fingerprint: Some(fingerprint),
@@ -312,6 +313,7 @@ mod tests {
             .enqueue(&PlannedOperation {
                 action: Action::UploadNew,
                 path: "file".into(),
+                from_path: None,
                 remote_id: None,
                 expected_etag: None,
                 local_fingerprint: Some("old".into()),
