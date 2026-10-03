@@ -53,6 +53,11 @@ paused=$(gdbus call --session \
     --object-path /io/github/onedrive_linux/Daemon \
     --method io.github.onedrive_linux.Daemon.SyncPaused)
 test "$paused" = "(false,)"
+reviews=$(gdbus call --session \
+    --dest io.github.onedrive_linux.Daemon \
+    --object-path /io/github/onedrive_linux/Daemon \
+    --method io.github.onedrive_linux.Daemon.SyncReviewCount)
+test "$reviews" = "(uint64 0,)"
 gdbus call --session \
     --dest io.github.onedrive_linux.Daemon \
     --object-path /io/github/onedrive_linux/Daemon \
