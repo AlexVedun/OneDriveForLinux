@@ -8,6 +8,7 @@ use keyring::v1::Entry;
 use oauth2::{TokenResponse, basic::BasicTokenResponse};
 use onedrive_catalog::{Catalog, FetchError};
 use onedrive_core::{BUS_NAME, EngineState, OBJECT_PATH};
+use onedrive_sync::SyncStore;
 use std::fs::{self, OpenOptions};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
@@ -29,6 +30,7 @@ struct Daemon {
     state: Arc<Mutex<EngineState>>,
     login_in_progress: Arc<AtomicBool>,
     catalog: Arc<Mutex<Catalog>>,
+    sync: Arc<Mutex<SyncStore>>,
     scan_in_progress: Arc<AtomicBool>,
     download_in_progress: Arc<AtomicBool>,
 }
@@ -61,6 +63,54 @@ impl Daemon {
             .map_err(|_| zbus::fdo::Error::Failed("cannot read catalog".to_owned()))?;
         serde_json::to_string(&items)
             .map_err(|_| zbus::fdo::Error::Failed("cannot encode catalog".to_owned()))
+    }
+
+    fn set_sync_root(&self, root: &str) -> zbus::fdo::Result<String> {
+        let state_directory = state_directory()
+            .map_err(|_| zbus::fdo::Error::Failed("cannot access state directory".to_owned()))?;
+        let path = self
+            .sync
+            .lock()
+            .unwrap()
+            .set_root(&PathBuf::from(root), &state_directory)
+            .map_err(|error| zbus::fdo::Error::InvalidArgs(error.to_string()))?;
+        Ok(path.to_string_lossy().into_owned())
+    }
+
+    async fn preview_sync(&self) -> zbus::fdo::Result<String> {
+        let catalog = Arc::clone(&self.catalog);
+        let sync = Arc::clone(&self.sync);
+        tokio::task::spawn_blocking(move || {
+            let catalog = catalog.lock().unwrap();
+            let drive_id = catalog
+                .active_drive_id()
+                .map_err(|_| zbus::fdo::Error::Failed("cannot read catalog".to_owned()))?
+                .ok_or_else(|| zbus::fdo::Error::Failed("OneDrive catalog is empty".to_owned()))?;
+            if !catalog
+                .is_complete(&drive_id)
+                .map_err(|_| zbus::fdo::Error::Failed("cannot read catalog cursor".to_owned()))?
+            {
+                return Err(zbus::fdo::Error::Failed(
+                    "catalog scan is incomplete".to_owned(),
+                ));
+            }
+            let items = catalog
+                .items(&drive_id)
+                .map_err(|_| zbus::fdo::Error::Failed("cannot read catalog".to_owned()))?;
+            let root_id = catalog
+                .root_id(&drive_id)
+                .map_err(|_| zbus::fdo::Error::Failed("cannot read drive root".to_owned()))?;
+            drop(catalog);
+            let preview = sync
+                .lock()
+                .unwrap()
+                .preview(&items, root_id.as_deref())
+                .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
+            serde_json::to_string(&preview)
+                .map_err(|_| zbus::fdo::Error::Failed("cannot encode preview".to_owned()))
+        })
+        .await
+        .map_err(|_| zbus::fdo::Error::Failed("preview task failed".to_owned()))?
     }
 
     fn refresh_catalog(&self) -> zbus::fdo::Result<()> {
@@ -318,10 +368,16 @@ async fn scan_catalog(catalog: Arc<Mutex<Catalog>>, client_id: String) -> Result
     let access_token = access_token(&client_id).await?;
     let graph = GraphClient::new().map_err(|_| ())?;
     let drive_id = graph.drive_id(&access_token).await.map_err(|_| ())?;
+    let root_id = graph.root_id(&access_token).await.map_err(|_| ())?;
     catalog
         .lock()
         .unwrap()
         .set_active_drive_id(&drive_id)
+        .map_err(|_| ())?;
+    catalog
+        .lock()
+        .unwrap()
+        .set_root_id(&drive_id, &root_id)
         .map_err(|_| ())?;
     let mut handled_gone = false;
     loop {
@@ -407,7 +463,7 @@ async fn poll_catalog(
     }
 }
 
-fn catalog_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
+fn state_directory() -> Result<PathBuf, Box<dyn std::error::Error>> {
     let state_home = std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
@@ -416,7 +472,14 @@ fn catalog_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
     let directory = state_home.join("onedrive-linux");
     fs::create_dir_all(&directory)?;
     fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
-    let path = directory.join("catalog.sqlite3");
+    Ok(directory)
+}
+
+fn state_database_path(
+    directory: &std::path::Path,
+    name: &str,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let path = directory.join(name);
     match OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -434,13 +497,22 @@ fn catalog_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = Arc::new(Mutex::new(EngineState::NeedsLogin));
-    let catalog = Arc::new(Mutex::new(Catalog::open(&catalog_path()?)?));
+    let state_path = state_directory()?;
+    let catalog = Arc::new(Mutex::new(Catalog::open(&state_database_path(
+        &state_path,
+        "catalog.sqlite3",
+    )?)?));
+    let sync = Arc::new(Mutex::new(SyncStore::open(&state_database_path(
+        &state_path,
+        "sync.sqlite3",
+    )?)?));
     let scan_in_progress = Arc::new(AtomicBool::new(false));
     let download_in_progress = Arc::new(AtomicBool::new(false));
     let daemon = Daemon {
         state: Arc::clone(&state),
         login_in_progress: Arc::new(AtomicBool::new(false)),
         catalog: Arc::clone(&catalog),
+        sync,
         scan_in_progress: Arc::clone(&scan_in_progress),
         download_in_progress: Arc::clone(&download_in_progress),
     };

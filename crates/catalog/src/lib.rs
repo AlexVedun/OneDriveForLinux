@@ -173,6 +173,10 @@ impl Catalog {
                  singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
                  drive_id TEXT NOT NULL
              );
+             CREATE TABLE IF NOT EXISTS drive_root (
+                 drive_id TEXT PRIMARY KEY,
+                 item_id TEXT NOT NULL
+             );
              CREATE TABLE IF NOT EXISTS reconcile_seen (
                  drive_id TEXT NOT NULL,
                  item_id TEXT NOT NULL,
@@ -212,6 +216,26 @@ impl Catalog {
             "INSERT INTO active_drive(singleton, drive_id) VALUES (1, ?1)
              ON CONFLICT(singleton) DO UPDATE SET drive_id = excluded.drive_id",
             [drive_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn root_id(&self, drive_id: &str) -> Result<Option<String>, CatalogError> {
+        self.connection
+            .query_row(
+                "SELECT item_id FROM drive_root WHERE drive_id = ?1",
+                [drive_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn set_root_id(&self, drive_id: &str, item_id: &str) -> Result<(), CatalogError> {
+        self.connection.execute(
+            "INSERT INTO drive_root(drive_id, item_id) VALUES (?1, ?2)
+             ON CONFLICT(drive_id) DO UPDATE SET item_id = excluded.item_id",
+            params![drive_id, item_id],
         )?;
         Ok(())
     }
@@ -332,6 +356,19 @@ impl Catalog {
             .unwrap_or(false))
     }
 
+    pub fn is_complete(&self, drive_id: &str) -> Result<bool, CatalogError> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT delta_link IS NOT NULL AND next_link IS NULL AND needs_reconcile = 0
+             FROM delta_cursor WHERE drive_id = ?1",
+                [drive_id],
+                |row| row.get::<_, bool>(0),
+            )
+            .optional()?
+            .unwrap_or(false))
+    }
+
     pub fn items(&self, drive_id: &str) -> Result<Vec<CatalogItem>, CatalogError> {
         let mut statement = self.connection.prepare(
             "SELECT drive_id, item_id, parent_id, name, kind, size, etag, ctag, modified, deleted
@@ -416,6 +453,8 @@ mod tests {
         {
             let mut catalog = Catalog::open(&path).unwrap();
             assert_eq!(catalog.request_url("drive").unwrap(), INITIAL_DELTA_URL);
+            assert!(!catalog.is_complete("drive").unwrap());
+            catalog.set_root_id("drive", "root").unwrap();
             catalog
                 .apply_page(
                     "drive",
@@ -425,9 +464,11 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(catalog.request_url("drive").unwrap(), NEXT);
+            assert!(!catalog.is_complete("drive").unwrap());
         }
         {
             let mut catalog = Catalog::open(&path).unwrap();
+            assert_eq!(catalog.root_id("drive").unwrap().as_deref(), Some("root"));
             assert_eq!(catalog.request_url("drive").unwrap(), NEXT);
             catalog
                 .apply_page(
@@ -438,6 +479,7 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(catalog.request_url("drive").unwrap(), CURSOR);
+            assert!(catalog.is_complete("drive").unwrap());
             let items = catalog.items("drive").unwrap();
             assert_eq!(items.len(), 2);
             assert_eq!(items[0].name.as_deref(), Some("Renamed"));

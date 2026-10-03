@@ -1,0 +1,15 @@
+[package]
+name = "onedrive-sync"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+onedrive-catalog = { path = "../catalog" }
+onedrive-core = { path = "../core" }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+serde = { version = "1.0", features = ["derive"] }
+sha2 = "0.10"
+
+[dev-dependencies]
+tempfile = "3.27"

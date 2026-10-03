@@ -2,6 +2,7 @@ use adw::{gio, gtk, prelude::*};
 use onedrive_core::{BUS_NAME, INTERFACE_NAME, OBJECT_PATH};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
+use std::time::Duration;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 struct UiItem {
@@ -12,6 +13,19 @@ struct UiItem {
     size: Option<i64>,
     modified: Option<String>,
     deleted: bool,
+}
+
+#[derive(Deserialize)]
+struct UiPreview {
+    operations: Vec<UiOperation>,
+    skipped: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct UiOperation {
+    action: String,
+    path: String,
+    requires_confirmation: bool,
 }
 
 fn daemon_call<R>(method: &str) -> zbus::Result<R>
@@ -36,6 +50,41 @@ fn download_item(item_id: &str, destination: &str) -> zbus::Result<()> {
     let connection = zbus::blocking::Connection::session()?;
     let proxy = zbus::blocking::Proxy::new(&connection, BUS_NAME, OBJECT_PATH, INTERFACE_NAME)?;
     proxy.call("DownloadItem", &(item_id, destination))
+}
+
+fn set_sync_root(path: &str) -> zbus::Result<String> {
+    let connection = zbus::blocking::Connection::session()?;
+    let proxy = zbus::blocking::Proxy::new(&connection, BUS_NAME, OBJECT_PATH, INTERFACE_NAME)?;
+    proxy.call("SetSyncRoot", &(path))
+}
+
+fn read_sync_preview() -> Result<UiPreview, String> {
+    let json: String = daemon_call("PreviewSync").map_err(|error| error.to_string())?;
+    serde_json::from_str(&json).map_err(|error| error.to_string())
+}
+
+fn preview_text(preview: UiPreview) -> String {
+    let mut lines = vec![format!(
+        "Операций: {} · пропущено: {}",
+        preview.operations.len(),
+        preview.skipped.len()
+    )];
+    for operation in preview.operations {
+        lines.push(format!(
+            "{}{}  {}",
+            if operation.requires_confirmation {
+                "⚠ "
+            } else {
+                ""
+            },
+            operation.action,
+            operation.path
+        ));
+    }
+    for path in preview.skipped {
+        lines.push(format!("Пропущено: {path}"));
+    }
+    lines.join("\n")
 }
 
 fn flatten_tree(items: Vec<UiItem>) -> Vec<(usize, UiItem)> {
@@ -189,11 +238,16 @@ fn main() {
         let list_for_reload = list.clone();
         reload.connect_clicked(move |_| refresh_view(&status_for_reload, &list_for_reload));
         let download = gtk::Button::with_label("Скачать выбранный файл");
+        let choose_sync = gtk::Button::with_label("Папка синхронизации");
+        let preview_sync = gtk::Button::with_label("План синхронизации");
         let controls = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         controls.append(&login);
         controls.append(&scan);
         controls.append(&reload);
         controls.append(&download);
+        let sync_controls = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        sync_controls.append(&choose_sync);
+        sync_controls.append(&preview_sync);
         let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
         content.set_margin_start(18);
         content.set_margin_end(18);
@@ -201,6 +255,7 @@ fn main() {
         content.set_margin_bottom(18);
         content.append(&status);
         content.append(&controls);
+        content.append(&sync_controls);
         content.append(&scroll);
         let window = adw::ApplicationWindow::builder()
             .application(app)
@@ -241,6 +296,71 @@ fn main() {
                     );
                 },
             );
+        });
+        let window_for_folder = window.clone();
+        let status_for_folder = status.clone();
+        choose_sync.connect_clicked(move |_| {
+            let dialog = gtk::FileDialog::new();
+            dialog.set_title("Выберите папку синхронизации");
+            let status_after_dialog = status_for_folder.clone();
+            dialog.select_folder(
+                Some(&window_for_folder),
+                None::<&gio::Cancellable>,
+                move |result| {
+                    let Ok(folder) = result else { return };
+                    let Some(path) = folder.path() else {
+                        status_after_dialog.set_text("Нужна локальная папка");
+                        return;
+                    };
+                    status_after_dialog.set_text(
+                        if set_sync_root(&path.to_string_lossy()).is_ok() {
+                            "Папка сохранена. Проверьте план синхронизации"
+                        } else {
+                            "Не удалось сохранить папку синхронизации"
+                        },
+                    );
+                },
+            );
+        });
+        let window_for_preview = window.clone();
+        let status_for_preview = status.clone();
+        preview_sync.connect_clicked(move |_| {
+            status_for_preview.set_text("Сканирование локальной папки…");
+            let (sender, receiver) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = sender.send(read_sync_preview());
+            });
+            let parent = window_for_preview.clone();
+            let status = status_for_preview.clone();
+            gtk::glib::timeout_add_local(Duration::from_millis(100), move || {
+                let Ok(result) = receiver.try_recv() else {
+                    return gtk::glib::ControlFlow::Continue;
+                };
+                match result {
+                    Ok(preview) => {
+                        status.set_text("План готов. Изменения пока не выполняются");
+                        let text = gtk::TextView::new();
+                        text.set_editable(false);
+                        text.set_monospace(true);
+                        text.buffer().set_text(&preview_text(preview));
+                        let scroll = gtk::ScrolledWindow::builder()
+                            .child(&text)
+                            .vexpand(true)
+                            .hexpand(true)
+                            .build();
+                        let dialog = gtk::Window::builder()
+                            .transient_for(&parent)
+                            .title("Предварительный план синхронизации")
+                            .default_width(650)
+                            .default_height(450)
+                            .child(&scroll)
+                            .build();
+                        dialog.present();
+                    }
+                    Err(error) => status.set_text(&format!("Не удалось построить план: {error}")),
+                }
+                gtk::glib::ControlFlow::Break
+            });
         });
         refresh_view(&status, &list);
         window.present();
