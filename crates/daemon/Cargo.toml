@@ -1,0 +1,10 @@
+[package]
+name = "onedrive-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+onedrive-core = { path = "../core" }
+tokio = { version = "1.53", features = ["macros", "rt-multi-thread", "signal"] }
+zbus = { version = "5.19", default-features = false, features = ["tokio"] }

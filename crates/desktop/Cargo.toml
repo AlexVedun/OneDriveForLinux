@@ -1,0 +1,10 @@
+[package]
+name = "onedrive-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+adw = { package = "libadwaita", version = "0.9.2" }
+onedrive-core = { path = "../core" }
+zbus = { version = "5.19", features = ["blocking"] }
