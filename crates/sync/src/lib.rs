@@ -88,6 +88,8 @@ pub enum Action {
     DownloadNew,
     UploadChanged,
     DownloadChanged,
+    RenameRemote,
+    RenameLocal,
     DeleteRemote,
     DeleteLocal,
     Conflict,
@@ -97,7 +99,7 @@ impl Action {
     pub fn requires_confirmation(&self) -> bool {
         matches!(
             self,
-            Self::DeleteRemote | Self::DeleteLocal | Self::Conflict
+            Self::DeleteRemote | Self::DeleteLocal | Self::RenameRemote | Self::Conflict
         )
     }
 }
@@ -106,6 +108,7 @@ impl Action {
 pub struct PlannedOperation {
     pub action: Action,
     pub path: String,
+    pub from_path: Option<String>,
     pub remote_id: Option<String>,
     pub expected_etag: Option<String>,
     pub local_fingerprint: Option<String>,
@@ -123,6 +126,7 @@ pub struct QueuedOperation {
     pub id: i64,
     pub kind: String,
     pub path: String,
+    pub from_path: Option<String>,
     pub remote_id: Option<String>,
     pub expected_etag: Option<String>,
     pub local_fingerprint: Option<String>,
@@ -178,6 +182,7 @@ impl SyncStore {
                 idempotency_key TEXT NOT NULL UNIQUE,
                 kind TEXT NOT NULL,
                 path TEXT NOT NULL,
+                from_path TEXT,
                 remote_id TEXT,
                 expected_etag TEXT,
                 local_fingerprint TEXT,
@@ -194,19 +199,19 @@ impl SyncStore {
              );",
         )?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
-        let has_fingerprint = {
+        let columns = {
             let mut statement = connection.prepare("PRAGMA table_info(operation)")?;
             let names = statement.query_map([], |row| row.get::<_, String>(1))?;
-            names
-                .collect::<Result<Vec<_>, _>>()?
-                .iter()
-                .any(|name| name == "local_fingerprint")
+            names.collect::<Result<Vec<_>, _>>()?
         };
-        if !has_fingerprint {
+        if !columns.iter().any(|name| name == "local_fingerprint") {
             connection.execute(
                 "ALTER TABLE operation ADD COLUMN local_fingerprint TEXT",
                 [],
             )?;
+        }
+        if !columns.iter().any(|name| name == "from_path") {
+            connection.execute("ALTER TABLE operation ADD COLUMN from_path TEXT", [])?;
         }
         // A process crash may interrupt an operation before its result is
         // recorded. The future executor must recheck both sides on retry.
@@ -355,7 +360,14 @@ impl SyncStore {
         let mut blocked_paths = skipped.clone();
         let mut baseline = self.baselines()?;
         for mapping in &baseline {
-            if remote_skipped.contains(&mapping.remote_id) {
+            if remote_skipped.contains(&mapping.remote_id)
+                || remote.iter().any(|item| {
+                    item.id == mapping.remote_id
+                        && skipped.iter().any(|path| {
+                            item.path == *path || item.path.starts_with(&format!("{path}/"))
+                        })
+                })
+            {
                 blocked_paths.push(mapping.path.clone());
             }
         }
@@ -392,15 +404,22 @@ impl SyncStore {
             hasher.update((component.len() as u64).to_le_bytes());
             hasher.update(component.as_bytes());
         }
+        // Keep the original key for operations queued before the from_path
+        // migration. Renames have a distinct source component.
+        if let Some(from_path) = &operation.from_path {
+            hasher.update((from_path.len() as u64).to_le_bytes());
+            hasher.update(from_path.as_bytes());
+        }
         let key = format!("{:x}", hasher.finalize());
         self.connection.execute(
             "INSERT OR IGNORE INTO operation
-             (idempotency_key, kind, path, remote_id, expected_etag, local_fingerprint)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+             (idempotency_key, kind, path, from_path, remote_id, expected_etag, local_fingerprint)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 key,
                 kind,
                 operation.path,
+                operation.from_path,
                 operation.remote_id,
                 operation.expected_etag,
                 operation.local_fingerprint,
@@ -428,7 +447,7 @@ impl SyncStore {
         let transaction = self.connection.transaction()?;
         let next: Option<QueuedOperation> = transaction
             .query_row(
-                "SELECT id, kind, path, remote_id, expected_etag, attempts, local_fingerprint
+                "SELECT id, kind, path, remote_id, expected_etag, attempts, local_fingerprint, from_path
              FROM operation WHERE status = 'pending'
                AND NOT EXISTS (SELECT 1 FROM sync_control WHERE singleton = 1 AND paused = 1)
              ORDER BY id LIMIT 1",
@@ -438,6 +457,7 @@ impl SyncStore {
                         id: row.get(0)?,
                         kind: row.get(1)?,
                         path: row.get(2)?,
+                        from_path: row.get(7)?,
                         remote_id: row.get(3)?,
                         expected_etag: row.get(4)?,
                         attempts: row.get::<_, u32>(5)? + 1,
@@ -476,7 +496,7 @@ impl SyncStore {
         let transaction = self.connection.transaction()?;
         let next: Option<QueuedOperation> = transaction
             .query_row(
-                "SELECT id, kind, path, remote_id, expected_etag, attempts, local_fingerprint
+                "SELECT id, kind, path, remote_id, expected_etag, attempts, local_fingerprint, from_path
              FROM operation WHERE status = 'pending' AND kind = 'UploadChanged'
                AND NOT EXISTS (SELECT 1 FROM sync_control WHERE singleton = 1 AND paused = 1)
              ORDER BY id LIMIT 1",
@@ -486,6 +506,7 @@ impl SyncStore {
                         id: row.get(0)?,
                         kind: row.get(1)?,
                         path: row.get(2)?,
+                        from_path: row.get(7)?,
                         remote_id: row.get(3)?,
                         expected_etag: row.get(4)?,
                         attempts: row.get::<_, u32>(5)? + 1,
@@ -784,6 +805,19 @@ pub fn plan(
         .collect();
     let remote_by_id: HashMap<&str, &RemoteFile> =
         remote.iter().map(|file| (file.id.as_str(), file)).collect();
+    let mut local_by_fingerprint: HashMap<&str, Vec<&LocalFile>> = HashMap::new();
+    for file in local {
+        local_by_fingerprint
+            .entry(&file.fingerprint)
+            .or_default()
+            .push(file);
+    }
+    let mut baseline_fingerprint_count: HashMap<&str, usize> = HashMap::new();
+    for base in baseline {
+        *baseline_fingerprint_count
+            .entry(&base.fingerprint)
+            .or_default() += 1;
+    }
     let mut remote_by_path: HashMap<&str, &RemoteFile> = HashMap::new();
     let mut ambiguous = HashSet::new();
     let mut by_case: HashMap<String, &str> = HashMap::new();
@@ -830,6 +864,23 @@ pub fn plan(
         let rename_collision = remote.is_some_and(|file| {
             file.path != base.path && local_by_path.contains_key(file.path.as_str())
         });
+        let local_move = if local.is_none()
+            && remote.is_some_and(|file| file.path == base.path && file.etag == base.etag)
+            && baseline_fingerprint_count.get(base.fingerprint.as_str()) == Some(&1)
+        {
+            local_by_fingerprint
+                .get(base.fingerprint.as_str())
+                .filter(|matches| matches.len() == 1)
+                .and_then(|matches| matches.first().copied())
+                .filter(|candidate| {
+                    candidate.path != base.path
+                        && !remote_by_path.contains_key(candidate.path.as_str())
+                        && !ambiguous.contains(&candidate.path)
+                        && !baseline.iter().any(|item| item.path == candidate.path)
+                })
+        } else {
+            None
+        };
         let action = if rename_collision
             || ambiguous.contains(&base.path)
             || remote.is_some_and(|file| ambiguous.contains(&file.path))
@@ -840,21 +891,40 @@ pub fn plan(
                 (false, false, _, _) => None,
                 (true, true, _, _) => Some(Action::Conflict),
                 (true, false, Some(_), _) => Some(Action::UploadChanged),
+                (true, false, None, _) if local_move.is_some() => Some(Action::RenameRemote),
                 (true, false, None, _) => Some(Action::DeleteRemote),
+                (false, true, Some(_), Some(file)) if file.path != base.path => {
+                    if file.etag == base.etag {
+                        Some(Action::RenameLocal)
+                    } else {
+                        Some(Action::Conflict)
+                    }
+                }
                 (false, true, _, Some(_)) => Some(Action::DownloadChanged),
                 (false, true, _, None) => Some(Action::DeleteLocal),
             }
         };
         if let Some(action) = action {
-            let path = remote.map_or_else(|| base.path.clone(), |file| file.path.clone());
-            push(
-                &mut operations,
+            let moved = action == Action::RenameRemote;
+            if let Some(candidate) = local_move.filter(|_| moved) {
+                used_local.insert(candidate.path.as_str());
+            }
+            let path = if moved {
+                local_move.expect("rename has a destination").path.clone()
+            } else {
+                remote.map_or_else(|| base.path.clone(), |file| file.path.clone())
+            };
+            let from_path = matches!(action, Action::RenameRemote | Action::RenameLocal)
+                .then(|| base.path.clone());
+            operations.push(PlannedOperation {
+                requires_confirmation: action.requires_confirmation(),
                 action,
                 path,
-                Some(base.remote_id.clone()),
-                remote.and_then(|file| file.etag.clone()),
-                local.map(|file| file.fingerprint.clone()),
-            );
+                from_path,
+                remote_id: Some(base.remote_id.clone()),
+                expected_etag: remote.and_then(|file| file.etag.clone()),
+                local_fingerprint: local.or(local_move).map(|file| file.fingerprint.clone()),
+            });
         }
     }
     for file in remote {
@@ -919,6 +989,7 @@ fn push(
     operations.push(PlannedOperation {
         action,
         path,
+        from_path: None,
         remote_id,
         expected_etag,
         local_fingerprint,
@@ -987,6 +1058,73 @@ mod tests {
     }
 
     #[test]
+    fn unique_local_move_is_one_reviewable_rename() {
+        let result = plan(
+            &[local("moved/report.txt", "hash")],
+            &[remote("id", "report.txt", "v1")],
+            &[base("id", "report.txt", "v1", "hash")],
+            vec![],
+        );
+        assert_eq!(result.operations.len(), 1);
+        let rename = &result.operations[0];
+        assert_eq!(rename.action, Action::RenameRemote);
+        assert_eq!(rename.from_path.as_deref(), Some("report.txt"));
+        assert_eq!(rename.path, "moved/report.txt");
+        assert!(rename.requires_confirmation);
+    }
+
+    #[test]
+    fn repeated_content_cannot_identify_a_local_move() {
+        let result = plan(
+            &[local("moved.txt", "same")],
+            &[
+                remote("first", "first.txt", "v1"),
+                remote("second", "second.txt", "v1"),
+            ],
+            &[
+                base("first", "first.txt", "v1", "same"),
+                base("second", "second.txt", "v1", "same"),
+            ],
+            vec![],
+        );
+        assert!(
+            !result
+                .operations
+                .iter()
+                .any(|item| item.action == Action::RenameRemote)
+        );
+        assert_eq!(
+            result
+                .operations
+                .iter()
+                .filter(|item| item.action == Action::DeleteRemote)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn remote_move_preserves_id_and_needs_unchanged_version() {
+        let baseline = [base("id", "old.txt", "v1", "hash")];
+        let moved = plan(
+            &[local("old.txt", "hash")],
+            &[remote("id", "new.txt", "v1")],
+            &baseline,
+            vec![],
+        );
+        assert_eq!(moved.operations.len(), 1);
+        assert_eq!(moved.operations[0].action, Action::RenameLocal);
+        assert_eq!(moved.operations[0].from_path.as_deref(), Some("old.txt"));
+        let changed = plan(
+            &[local("old.txt", "hash")],
+            &[remote("id", "new.txt", "v2")],
+            &baseline,
+            vec![],
+        );
+        assert_eq!(changed.operations[0].action, Action::Conflict);
+    }
+
+    #[test]
     fn scan_skips_symlink_and_never_reads_outside_root() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("sync");
@@ -1012,6 +1150,7 @@ mod tests {
         let operation = PlannedOperation {
             action: Action::UploadNew,
             path: "one.txt".into(),
+            from_path: None,
             remote_id: None,
             expected_etag: None,
             local_fingerprint: Some("hash".into()),
@@ -1070,12 +1209,22 @@ mod tests {
         let operation = PlannedOperation {
             action: Action::UploadNew,
             path: "file.txt".into(),
+            from_path: None,
             remote_id: None,
             expected_etag: None,
             local_fingerprint: Some("hash".into()),
             requires_confirmation: false,
         };
-        store.enqueue(&operation).unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO operation(idempotency_key, kind, path, local_fingerprint)
+             VALUES (?1, 'UploadNew', 'file.txt', 'hash')",
+                ["81f7011b8f12139db6715dc832fc3f5c96ac83786383d005c841f67ee884a08a"],
+            )
+            .unwrap();
+        assert_eq!(store.enqueue(&operation).unwrap(), 1);
+        assert_eq!(store.pending_count().unwrap(), 1);
         assert_eq!(
             store
                 .claim_next()
@@ -1088,12 +1237,34 @@ mod tests {
     }
 
     #[test]
+    fn queued_rename_keeps_source_path_after_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sync.sqlite3");
+        let operation = PlannedOperation {
+            action: Action::RenameLocal,
+            path: "new.txt".into(),
+            from_path: Some("old.txt".into()),
+            remote_id: Some("id".into()),
+            expected_etag: Some("v1".into()),
+            local_fingerprint: Some("hash".into()),
+            requires_confirmation: false,
+        };
+        SyncStore::open(&path).unwrap().enqueue(&operation).unwrap();
+        let mut reopened = SyncStore::open(&path).unwrap();
+        let queued = reopened.claim_next().unwrap().unwrap();
+        assert_eq!(queued.kind, "RenameLocal");
+        assert_eq!(queued.path, "new.txt");
+        assert_eq!(queued.from_path.as_deref(), Some("old.txt"));
+    }
+
+    #[test]
     fn upload_checkpoint_persists_and_rejects_regression() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("sync.sqlite3");
         let operation = PlannedOperation {
             action: Action::UploadChanged,
             path: "file.txt".into(),
+            from_path: None,
             remote_id: Some("item".into()),
             expected_etag: Some("v1".into()),
             local_fingerprint: Some("hash".into()),
@@ -1128,6 +1299,7 @@ mod tests {
         let operation = PlannedOperation {
             action: Action::UploadChanged,
             path: "file.txt".into(),
+            from_path: None,
             remote_id: Some("item".into()),
             expected_etag: Some("v1".into()),
             local_fingerprint: Some("new-hash".into()),
@@ -1161,6 +1333,7 @@ mod tests {
         let operation = PlannedOperation {
             action: Action::UploadChanged,
             path: "file.txt".into(),
+            from_path: None,
             remote_id: Some("item".into()),
             expected_etag: Some("v1".into()),
             local_fingerprint: Some("hash".into()),
@@ -1189,6 +1362,7 @@ mod tests {
         let operation = PlannedOperation {
             action: Action::UploadNew,
             path: "file".into(),
+            from_path: None,
             remote_id: None,
             expected_etag: None,
             local_fingerprint: Some("hash".into()),
@@ -1301,6 +1475,52 @@ mod tests {
         let preview = store.preview(&[item], Some("root")).unwrap();
         assert!(preview.operations.is_empty());
         assert_eq!(preview.skipped, ["file.txt"]);
+    }
+
+    #[test]
+    fn remote_move_under_skipped_symlink_does_not_delete_old_copy() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("sync");
+        let state = directory.path().join("state");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&state).unwrap();
+        fs::write(root.join("old.txt"), b"content").unwrap();
+        std::os::unix::fs::symlink(directory.path(), root.join("linked")).unwrap();
+        let store = SyncStore::in_memory().unwrap();
+        store.set_root(&root, &state).unwrap();
+        let fingerprint = format!("{:x}", Sha256::digest(b"content"));
+        store
+            .confirm_baseline(&base("id", "old.txt", "v1", &fingerprint))
+            .unwrap();
+        let items = vec![
+            CatalogItem {
+                drive_id: "drive".into(),
+                item_id: "folder".into(),
+                parent_id: Some("root".into()),
+                name: Some("linked".into()),
+                kind: "folder".into(),
+                size: None,
+                etag: None,
+                ctag: None,
+                modified: None,
+                deleted: false,
+            },
+            CatalogItem {
+                drive_id: "drive".into(),
+                item_id: "id".into(),
+                parent_id: Some("folder".into()),
+                name: Some("new.txt".into()),
+                kind: "file".into(),
+                size: Some(7),
+                etag: Some("v1".into()),
+                ctag: None,
+                modified: None,
+                deleted: false,
+            },
+        ];
+        let preview = store.preview(&items, Some("root")).unwrap();
+        assert!(preview.operations.is_empty());
+        assert_eq!(preview.skipped, ["linked"]);
     }
 
     #[test]

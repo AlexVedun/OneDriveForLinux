@@ -25,6 +25,7 @@ struct UiPreview {
 struct UiOperation {
     action: String,
     path: String,
+    from_path: Option<String>,
     requires_confirmation: bool,
 }
 
@@ -78,7 +79,10 @@ fn preview_text(preview: UiPreview) -> String {
                 ""
             },
             operation.action,
-            operation.path
+            operation.from_path.map_or_else(
+                || operation.path.clone(),
+                |source| format!("{source} → {}", operation.path),
+            )
         ));
     }
     for path in preview.skipped {

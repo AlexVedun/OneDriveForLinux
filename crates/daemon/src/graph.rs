@@ -402,6 +402,7 @@ mod tests {
             id: 1,
             kind: "UploadChanged".into(),
             path: "file.txt".into(),
+            from_path: None,
             remote_id: Some("item".into()),
             expected_etag: Some("v1".into()),
             local_fingerprint: Some("hash".into()),
