@@ -10,6 +10,8 @@ sudo dnf install rust cargo rustfmt clippy gcc pkgconf-pkg-config gtk4-devel lib
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+cargo build -p onedrive-daemon
+dbus-run-session -- sh scripts/smoke-dbus.sh
 ```
 
 В терминале с пользовательской шиной D-Bus запустите процессы отдельно:
