@@ -1,7 +1,8 @@
 # OneDrive для Linux
 
-Разработка по [плану](onedrive-linux-plan.md). Сейчас реализуется этап 0: каркас
-движка, окна и входа. Синхронизация ещё не реализована.
+Разработка по [плану](onedrive-linux-plan.md). Реализованы каркас и основа
+режима только чтения: каталог SQLite, чтение страниц `delta` и скачивание
+выбранного файла. Двусторонняя синхронизация ещё не реализована.
 
 ## Разработка на Fedora 44
 
@@ -10,6 +11,7 @@ sudo dnf install rust cargo rustfmt clippy gcc pkgconf-pkg-config gtk4-devel lib
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+cargo test -p onedrive-catalog
 cargo build -p onedrive-daemon
 dbus-run-session -- sh scripts/smoke-dbus.sh
 ```
@@ -36,7 +38,15 @@ cargo run -p onedrive-desktop
 Окно запрашивает `Status` у фонового процесса. Кнопка входа открывает системный
 браузер; демон проверяет `state`, обменивает код с PKCE, проверяет доступ к
 `/me/drive` и сохраняет refresh token в системном хранилище секретов.
-Кнопка «Обновить состояние» покажет `connected` после успешного входа.
+После входа кнопка «Проверить OneDrive» получает дерево. Дальнейшие изменения
+проверяются каждые пять минут или по этой кнопке. Кнопка «Обновить список»
+перечитывает локальный каталог, а «Скачать выбранный файл» предлагает путь
+сохранения. База находится в `$XDG_STATE_HOME/onedrive-linux/catalog.sqlite3`
+(по умолчанию `~/.local/state/onedrive-linux/catalog.sqlite3`).
+
+Без тестовой регистрации можно запускать все тесты каталога и скачивания:
+они используют локальные ответы Graph и временные файлы. После `410 Gone`
+каталог сохраняется для сверки, а статус становится `reconciliation-needed`.
 При недоступной шине или процессе окно сообщает `daemon-unavailable`.
 
 Для будущего виртуального диска понадобятся `fuse3 fuse3-devel`. AppImage

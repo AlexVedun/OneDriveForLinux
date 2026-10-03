@@ -2,6 +2,8 @@
 set -eu
 
 daemon="${1:-target/debug/onedrive-daemon}"
+test_state=$(mktemp -d)
+export XDG_STATE_HOME="$test_state"
 if [ "${SMOKE_TEST_LOGIN:-0}" = 1 ]; then
     export ONEDRIVE_CLIENT_ID=test-client
 else
@@ -10,7 +12,7 @@ else
 fi
 "$daemon" &
 daemon_pid=$!
-trap 'kill "$daemon_pid" 2>/dev/null || true' EXIT HUP INT TERM
+trap 'kill "$daemon_pid" 2>/dev/null || true; rm -rf "$test_state"' EXIT HUP INT TERM
 
 attempt=0
 while [ "$attempt" -lt 10 ]; do
@@ -33,6 +35,12 @@ result=$(gdbus call --session \
     --method io.github.onedrive_linux.Daemon.Status)
 test "$result" = "('needs-login',)"
 kill -0 "$daemon_pid"
+
+items=$(gdbus call --session \
+    --dest io.github.onedrive_linux.Daemon \
+    --object-path /io/github/onedrive_linux/Daemon \
+    --method io.github.onedrive_linux.Daemon.CatalogItems)
+test "$items" = "('[]',)"
 
 if [ "${SMOKE_TEST_LOGIN:-0}" != 1 ]; then
     exit 0

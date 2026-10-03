@@ -10,6 +10,7 @@ pub const INTERFACE_NAME: &str = "io.github.onedrive_linux.Daemon";
 pub enum EngineState {
     NeedsLogin,
     Error,
+    NeedsReconcile,
     Offline,
     Paused,
     Transferring,
@@ -23,6 +24,7 @@ impl EngineState {
         match self {
             Self::NeedsLogin => "needs-login",
             Self::Error => "error",
+            Self::NeedsReconcile => "reconciliation-needed",
             Self::Offline => "offline",
             Self::Paused => "paused",
             Self::Transferring => "transferring",
@@ -34,7 +36,7 @@ impl EngineState {
 
     pub const fn priority(self) -> u8 {
         match self {
-            Self::NeedsLogin | Self::Error => 1,
+            Self::NeedsLogin | Self::Error | Self::NeedsReconcile => 1,
             Self::Offline => 2,
             Self::Paused => 3,
             Self::Transferring => 4,
