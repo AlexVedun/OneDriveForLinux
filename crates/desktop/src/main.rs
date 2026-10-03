@@ -1,4 +1,3 @@
-mod locale;
 use adw::prelude::*;
 use onedrive_core::{BUS_NAME, INTERFACE_NAME, OBJECT_PATH};
 
@@ -18,16 +17,12 @@ fn main() {
     app.connect_activate(|app| {
         let status = adw::StatusPage::builder()
             .icon_name("folder-remote-symbolic")
-            .title(locale::text("OneDrive for Linux", "OneDrive для Linux"))
-            .description(format!(
-                "{}: {}",
-                locale::text("Status", "Стан"),
-                read_status()
-            ))
+            .title("OneDrive для Linux")
+            .description(format!("Состояние: {}", read_status()))
             .build();
         let window = adw::ApplicationWindow::builder()
             .application(app)
-            .title(locale::text("OneDrive for Linux", "OneDrive для Linux"))
+            .title("OneDrive для Linux")
             .default_width(540)
             .default_height(360)
             .content(&status)
