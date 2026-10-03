@@ -163,6 +163,10 @@ impl SyncStore {
                 singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
                 drive_id TEXT NOT NULL
              );
+             CREATE TABLE IF NOT EXISTS sync_control (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                paused INTEGER NOT NULL DEFAULT 0 CHECK (paused IN (0, 1))
+             );
              CREATE TABLE IF NOT EXISTS mapping (
                 remote_id TEXT PRIMARY KEY,
                 path TEXT NOT NULL UNIQUE,
@@ -248,6 +252,28 @@ impl SyncStore {
             )
             .optional()?;
         Ok(root.map(PathBuf::from))
+    }
+
+    pub fn is_paused(&self) -> Result<bool, SyncError> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT paused FROM sync_control WHERE singleton = 1",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .optional()?
+            .unwrap_or(false))
+    }
+
+    /// A pause stops new claims; work already in progress finishes normally.
+    pub fn set_paused(&self, paused: bool) -> Result<(), SyncError> {
+        self.connection.execute(
+            "INSERT INTO sync_control(singleton, paused) VALUES (1, ?1)
+             ON CONFLICT(singleton) DO UPDATE SET paused = excluded.paused",
+            [paused],
+        )?;
+        Ok(())
     }
 
     pub fn ensure_drive(&self, drive_id: &str) -> Result<(), SyncError> {
@@ -403,7 +429,9 @@ impl SyncStore {
         let next: Option<QueuedOperation> = transaction
             .query_row(
                 "SELECT id, kind, path, remote_id, expected_etag, attempts, local_fingerprint
-             FROM operation WHERE status = 'pending' ORDER BY id LIMIT 1",
+             FROM operation WHERE status = 'pending'
+               AND NOT EXISTS (SELECT 1 FROM sync_control WHERE singleton = 1 AND paused = 1)
+             ORDER BY id LIMIT 1",
                 [],
                 |row| {
                     Ok(QueuedOperation {
@@ -446,15 +474,26 @@ impl SyncStore {
 
     pub fn claim_upload_changed(&mut self) -> Result<Option<QueuedOperation>, SyncError> {
         let transaction = self.connection.transaction()?;
-        let next: Option<QueuedOperation> = transaction.query_row(
-            "SELECT id, kind, path, remote_id, expected_etag, attempts, local_fingerprint
-             FROM operation WHERE status = 'pending' AND kind = 'UploadChanged' ORDER BY id LIMIT 1",
-            [], |row| Ok(QueuedOperation {
-                id: row.get(0)?, kind: row.get(1)?, path: row.get(2)?,
-                remote_id: row.get(3)?, expected_etag: row.get(4)?,
-                attempts: row.get::<_, u32>(5)? + 1, local_fingerprint: row.get(6)?,
-            }),
-        ).optional()?;
+        let next: Option<QueuedOperation> = transaction
+            .query_row(
+                "SELECT id, kind, path, remote_id, expected_etag, attempts, local_fingerprint
+             FROM operation WHERE status = 'pending' AND kind = 'UploadChanged'
+               AND NOT EXISTS (SELECT 1 FROM sync_control WHERE singleton = 1 AND paused = 1)
+             ORDER BY id LIMIT 1",
+                [],
+                |row| {
+                    Ok(QueuedOperation {
+                        id: row.get(0)?,
+                        kind: row.get(1)?,
+                        path: row.get(2)?,
+                        remote_id: row.get(3)?,
+                        expected_etag: row.get(4)?,
+                        attempts: row.get::<_, u32>(5)? + 1,
+                        local_fingerprint: row.get(6)?,
+                    })
+                },
+            )
+            .optional()?;
         if let Some(operation) = &next {
             transaction.execute(
                 "UPDATE operation SET status = 'running', attempts = attempts + 1 WHERE id = ?1",
@@ -1113,6 +1152,34 @@ mod tests {
         assert_eq!(mapping[0].etag.as_deref(), Some("v2"));
         assert_eq!(mapping[0].fingerprint, "new-hash");
         assert_eq!(store.pending_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn pause_persists_and_prevents_new_claims() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sync.sqlite3");
+        let operation = PlannedOperation {
+            action: Action::UploadChanged,
+            path: "file.txt".into(),
+            remote_id: Some("item".into()),
+            expected_etag: Some("v1".into()),
+            local_fingerprint: Some("hash".into()),
+            requires_confirmation: false,
+        };
+        {
+            let mut store = SyncStore::open(&path).unwrap();
+            store.enqueue(&operation).unwrap();
+            store.set_paused(true).unwrap();
+            assert!(store.is_paused().unwrap());
+            assert!(store.claim_next().unwrap().is_none());
+            assert_eq!(store.pending_count().unwrap(), 1);
+        }
+        let mut store = SyncStore::open(&path).unwrap();
+        assert!(store.is_paused().unwrap());
+        assert!(store.claim_upload_changed().unwrap().is_none());
+        store.set_paused(false).unwrap();
+        assert!(!store.is_paused().unwrap());
+        assert!(store.claim_upload_changed().unwrap().is_some());
     }
 
     #[test]
