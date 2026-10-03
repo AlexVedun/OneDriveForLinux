@@ -1547,6 +1547,7 @@ dependencies = [
  "oauth2",
  "onedrive-catalog",
  "onedrive-core",
+ "onedrive-sync",
  "reqwest",
  "serde",
  "serde_json",
@@ -1567,6 +1568,18 @@ dependencies = [
  "serde",
  "serde_json",
  "zbus",
+]
+
+[[package]]
+name = "onedrive-sync"
+version = "0.1.0"
+dependencies = [
+ "onedrive-catalog",
+ "onedrive-core",
+ "rusqlite",
+ "serde",
+ "sha2 0.10.9",
+ "tempfile",
 ]
 
 [[package]]

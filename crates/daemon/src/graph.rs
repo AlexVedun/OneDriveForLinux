@@ -10,6 +10,7 @@ use std::time::Duration;
 use crate::transfer::AtomicDownload;
 
 const DRIVE_URL: &str = "https://graph.microsoft.com/v1.0/me/drive";
+const ROOT_URL: &str = "https://graph.microsoft.com/v1.0/me/drive/root?$select=id";
 
 #[derive(Clone)]
 pub struct GraphClient {
@@ -38,6 +39,15 @@ impl GraphClient {
             return Err(FetchError::Failed);
         }
         Ok(drive.id)
+    }
+
+    pub async fn root_id(&self, access_token: &str) -> Result<String, FetchError> {
+        let response = self.get_with_retry(ROOT_URL, access_token).await?;
+        let root: Drive = response.json().await.map_err(|_| FetchError::Failed)?;
+        if root.id.is_empty() {
+            return Err(FetchError::Failed);
+        }
+        Ok(root.id)
     }
 
     pub async fn delta_page(&self, url: &str, access_token: &str) -> Result<DeltaPage, FetchError> {
