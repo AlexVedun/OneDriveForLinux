@@ -534,13 +534,13 @@ impl SyncStore {
         Ok(())
     }
 
-    pub fn claim_upload_changed(&mut self) -> Result<Option<QueuedOperation>, SyncError> {
+    pub fn claim_upload(&mut self) -> Result<Option<QueuedOperation>, SyncError> {
         let transaction = self.connection.transaction()?;
         let next: Option<QueuedOperation> = transaction
             .query_row(
                 "SELECT id, kind, path, remote_id, expected_etag, attempts, local_fingerprint, from_path
              FROM operation WHERE status = 'pending' AND approved = 1
-               AND kind = 'UploadChanged'
+               AND kind IN ('UploadNew', 'UploadChanged')
                AND NOT EXISTS (SELECT 1 FROM sync_control WHERE singleton = 1 AND paused = 1)
              ORDER BY id LIMIT 1",
                 [],
@@ -582,7 +582,12 @@ impl SyncStore {
         remote_id: &str,
         etag: &str,
     ) -> Result<(), SyncError> {
-        if operation.remote_id.as_deref() != Some(remote_id) || etag.is_empty() {
+        let identity_matches = match operation.kind.as_str() {
+            "UploadChanged" => operation.remote_id.as_deref() == Some(remote_id),
+            "UploadNew" => operation.remote_id.is_none(),
+            _ => false,
+        };
+        if !identity_matches || remote_id.is_empty() || etag.is_empty() {
             return Err(SyncError::InvalidCheckpoint);
         }
         let fingerprint = operation
@@ -1454,7 +1459,7 @@ mod tests {
             requires_confirmation: false,
         };
         let id = store.enqueue(&operation).unwrap();
-        let claimed = store.claim_upload_changed().unwrap().unwrap();
+        let claimed = store.claim_upload().unwrap().unwrap();
         let checkpoint = UploadCheckpoint {
             operation_id: id,
             upload_url: "https://upload.example/secret".into(),
@@ -1472,6 +1477,36 @@ mod tests {
         assert_eq!(mapping[0].etag.as_deref(), Some("v2"));
         assert_eq!(mapping[0].fingerprint, "new-hash");
         assert_eq!(store.pending_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn new_upload_confirms_server_identity_and_baseline() {
+        let mut store = SyncStore::in_memory().unwrap();
+        let operation = PlannedOperation {
+            action: Action::UploadNew,
+            path: "new.txt".into(),
+            from_path: None,
+            remote_id: None,
+            expected_etag: None,
+            local_fingerprint: Some("hash".into()),
+            requires_confirmation: false,
+        };
+        let id = store.enqueue(&operation).unwrap();
+        let claimed = store.claim_upload().unwrap().unwrap();
+        assert_eq!(claimed.id, id);
+        assert!(store.finish_uploaded(&claimed, "", "v1").is_err());
+        assert!(store.baselines().unwrap().is_empty());
+        store.finish_uploaded(&claimed, "created-id", "v1").unwrap();
+        assert_eq!(store.pending_count().unwrap(), 0);
+        assert_eq!(
+            store.baselines().unwrap(),
+            [Baseline {
+                remote_id: "created-id".into(),
+                path: "new.txt".into(),
+                etag: Some("v1".into()),
+                fingerprint: "hash".into(),
+            }]
+        );
     }
 
     #[test]
@@ -1497,10 +1532,10 @@ mod tests {
         }
         let mut store = SyncStore::open(&path).unwrap();
         assert!(store.is_paused().unwrap());
-        assert!(store.claim_upload_changed().unwrap().is_none());
+        assert!(store.claim_upload().unwrap().is_none());
         store.set_paused(false).unwrap();
         assert!(!store.is_paused().unwrap());
-        assert!(store.claim_upload_changed().unwrap().is_some());
+        assert!(store.claim_upload().unwrap().is_some());
     }
 
     #[test]

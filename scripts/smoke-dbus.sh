@@ -77,6 +77,12 @@ if gdbus call --session \
     --method io.github.onedrive_linux.Daemon.PreviewSync >/dev/null 2>&1; then
     exit 1
 fi
+if gdbus call --session \
+    --dest io.github.onedrive_linux.Daemon \
+    --object-path /io/github/onedrive_linux/Daemon \
+    --method io.github.onedrive_linux.Daemon.QueueUploadNew "new.txt" >/dev/null 2>&1; then
+    exit 1
+fi
 
 # The experimental write path stays disabled in the normal daemon.
 if gdbus call --session \

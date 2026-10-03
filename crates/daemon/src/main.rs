@@ -3,7 +3,7 @@ mod graph;
 mod transfer;
 
 use auth::LoginAttempt;
-use graph::{ExistingUpload, GraphClient};
+use graph::{GraphClient, GraphUpload};
 use keyring::v1::Entry;
 use oauth2::{TokenResponse, basic::BasicTokenResponse};
 use onedrive_catalog::{Catalog, FetchError};
@@ -149,52 +149,23 @@ impl Daemon {
     }
 
     async fn queue_upload_changed(&self, item_id: &str) -> zbus::fdo::Result<i64> {
-        let item_id = item_id.to_owned();
-        let catalog = Arc::clone(&self.catalog);
-        let sync = Arc::clone(&self.sync);
-        tokio::task::spawn_blocking(move || {
-            let catalog = catalog.lock().unwrap();
-            let drive_id = catalog
-                .active_drive_id()
-                .map_err(|_| zbus::fdo::Error::Failed("cannot read catalog".to_owned()))?
-                .ok_or_else(|| zbus::fdo::Error::Failed("OneDrive catalog is empty".to_owned()))?;
-            if !catalog
-                .is_complete(&drive_id)
-                .map_err(|_| zbus::fdo::Error::Failed("cannot read catalog cursor".to_owned()))?
-            {
-                return Err(zbus::fdo::Error::Failed(
-                    "catalog scan is incomplete".to_owned(),
-                ));
-            }
-            let items = catalog
-                .items(&drive_id)
-                .map_err(|_| zbus::fdo::Error::Failed("cannot read catalog".to_owned()))?;
-            let root_id = catalog
-                .root_id(&drive_id)
-                .map_err(|_| zbus::fdo::Error::Failed("cannot read drive root".to_owned()))?;
-            drop(catalog);
-            let mut sync = sync.lock().unwrap();
-            sync.bind_drive(&drive_id)
-                .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
-            let preview = sync
-                .preview(&items, root_id.as_deref())
-                .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
-            let operation = preview
-                .operations
-                .into_iter()
-                .find(|operation| {
-                    operation.action == Action::UploadChanged
-                        && operation.remote_id.as_deref() == Some(&item_id)
-                        && operation.expected_etag.is_some()
-                })
-                .ok_or_else(|| {
-                    zbus::fdo::Error::Failed("no safe changed-file upload is available".to_owned())
-                })?;
-            sync.enqueue(&operation)
-                .map_err(|_| zbus::fdo::Error::Failed("cannot queue upload".to_owned()))
-        })
+        queue_upload_candidate(
+            Arc::clone(&self.catalog),
+            Arc::clone(&self.sync),
+            Action::UploadChanged,
+            item_id.to_owned(),
+        )
         .await
-        .map_err(|_| zbus::fdo::Error::Failed("queue task failed".to_owned()))?
+    }
+
+    async fn queue_upload_new(&self, path: &str) -> zbus::fdo::Result<i64> {
+        queue_upload_candidate(
+            Arc::clone(&self.catalog),
+            Arc::clone(&self.sync),
+            Action::UploadNew,
+            path.to_owned(),
+        )
+        .await
     }
 
     async fn run_queued_upload(&self) -> zbus::fdo::Result<i64> {
@@ -242,11 +213,9 @@ impl Daemon {
                         zbus::fdo::Error::Failed("sync root is not configured".to_owned())
                     })?;
                 let operation = sync
-                    .claim_upload_changed()
+                    .claim_upload()
                     .map_err(|_| zbus::fdo::Error::Failed("cannot read upload queue".to_owned()))?
-                    .ok_or_else(|| {
-                        zbus::fdo::Error::Failed("no changed-file upload is pending".to_owned())
-                    })?;
+                    .ok_or_else(|| zbus::fdo::Error::Failed("no upload is pending".to_owned()))?;
                 (operation, root)
             };
             Ok::<_, zbus::fdo::Error>((token, drive_id, operation, root))
@@ -269,7 +238,7 @@ impl Daemon {
                 let mut store = sync.lock().unwrap();
                 let result = (|| {
                     let graph = GraphClient::new().map_err(|_| UploadError::Transient)?;
-                    let transport = ExistingUpload::new(&graph, &drive_id, &token)
+                    let transport = GraphUpload::new(&graph, &drive_id, &token)
                         .map_err(|_| UploadError::Transient)?;
                     tokio::runtime::Handle::current()
                         .block_on(upload_queued(&store, &transport, &root, &operation))
@@ -462,6 +431,63 @@ impl Daemon {
         });
         Ok(url.to_string())
     }
+}
+
+async fn queue_upload_candidate(
+    catalog: Arc<Mutex<Catalog>>,
+    sync: Arc<Mutex<SyncStore>>,
+    action: Action,
+    selector: String,
+) -> zbus::fdo::Result<i64> {
+    tokio::task::spawn_blocking(move || {
+        let catalog = catalog.lock().unwrap();
+        let drive_id = catalog
+            .active_drive_id()
+            .map_err(|_| zbus::fdo::Error::Failed("cannot read catalog".to_owned()))?
+            .ok_or_else(|| zbus::fdo::Error::Failed("OneDrive catalog is empty".to_owned()))?;
+        if !catalog
+            .is_complete(&drive_id)
+            .map_err(|_| zbus::fdo::Error::Failed("cannot read catalog cursor".to_owned()))?
+        {
+            return Err(zbus::fdo::Error::Failed(
+                "catalog scan is incomplete".to_owned(),
+            ));
+        }
+        let items = catalog
+            .items(&drive_id)
+            .map_err(|_| zbus::fdo::Error::Failed("cannot read catalog".to_owned()))?;
+        let root_id = catalog
+            .root_id(&drive_id)
+            .map_err(|_| zbus::fdo::Error::Failed("cannot read drive root".to_owned()))?;
+        drop(catalog);
+        let mut sync = sync.lock().unwrap();
+        sync.bind_drive(&drive_id)
+            .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
+        let preview = sync
+            .preview(&items, root_id.as_deref())
+            .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
+        let operation = preview
+            .operations
+            .into_iter()
+            .find(|operation| match action {
+                Action::UploadChanged => {
+                    operation.action == Action::UploadChanged
+                        && operation.remote_id.as_deref() == Some(selector.as_str())
+                        && operation.expected_etag.is_some()
+                }
+                Action::UploadNew => {
+                    operation.action == Action::UploadNew
+                        && operation.path == selector
+                        && !selector.contains('/')
+                }
+                _ => false,
+            })
+            .ok_or_else(|| zbus::fdo::Error::Failed("no safe upload is available".to_owned()))?;
+        sync.enqueue(&operation)
+            .map_err(|_| zbus::fdo::Error::Failed("cannot queue upload".to_owned()))
+    })
+    .await
+    .map_err(|_| zbus::fdo::Error::Failed("queue task failed".to_owned()))?
 }
 
 fn client_id() -> Option<String> {
