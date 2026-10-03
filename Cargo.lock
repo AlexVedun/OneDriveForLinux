@@ -1574,12 +1574,15 @@ dependencies = [
 name = "onedrive-sync"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "onedrive-catalog",
  "onedrive-core",
  "rusqlite",
  "serde",
  "sha2 0.10.9",
  "tempfile",
+ "tokio",
+ "url",
 ]
 
 [[package]]
