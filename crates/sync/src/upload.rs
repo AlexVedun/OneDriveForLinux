@@ -330,4 +330,42 @@ mod tests {
         ));
         assert!(store.upload_checkpoint(operation.id).unwrap().is_none());
     }
+
+    #[tokio::test]
+    async fn new_file_upload_uses_existing_state_machine() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("new.txt"), b"hello").unwrap();
+        let fingerprint = scan_local(directory.path()).unwrap().0[0]
+            .fingerprint
+            .clone();
+        let mut store = SyncStore::in_memory().unwrap();
+        let id = store
+            .enqueue(&PlannedOperation {
+                action: Action::UploadNew,
+                path: "new.txt".into(),
+                from_path: None,
+                remote_id: None,
+                expected_etag: None,
+                local_fingerprint: Some(fingerprint),
+                requires_confirmation: false,
+            })
+            .unwrap();
+        let operation = store.claim_upload().unwrap().unwrap();
+        let transport = FakeTransport {
+            state: Mutex::new((0, false, 0)),
+        };
+        let result = upload_queued(&store, &transport, directory.path(), &operation)
+            .await
+            .unwrap();
+        assert_eq!(
+            result,
+            UploadStep::Complete {
+                remote_id: "item".into(),
+                etag: Some("v2".into()),
+            }
+        );
+        store.finish_uploaded(&operation, "item", "v2").unwrap();
+        assert!(store.upload_checkpoint(id).unwrap().is_none());
+        assert_eq!(store.baselines().unwrap()[0].path, "new.txt");
+    }
 }

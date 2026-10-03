@@ -46,14 +46,14 @@ struct UploadedItem {
     etag: Option<String>,
 }
 
-pub struct ExistingUpload<'a> {
+pub struct GraphUpload<'a> {
     pub graph: &'a GraphClient,
     pub drive_id: &'a str,
     pub access_token: &'a str,
     http: Client,
 }
 
-impl<'a> ExistingUpload<'a> {
+impl<'a> GraphUpload<'a> {
     pub fn new(
         graph: &'a GraphClient,
         drive_id: &'a str,
@@ -74,31 +74,67 @@ impl<'a> ExistingUpload<'a> {
     fn create_session_request(
         &self,
         operation: &QueuedOperation,
+        size: u64,
     ) -> Result<reqwest::Request, UploadError> {
-        if operation.kind != "UploadChanged" {
-            return Err(UploadError::InvalidResponse);
-        }
-        let id = operation
-            .remote_id
-            .as_deref()
-            .ok_or(UploadError::InvalidResponse)?;
-        let etag = operation
-            .expected_etag
-            .as_deref()
-            .ok_or(UploadError::InvalidResponse)?;
         let mut url = reqwest::Url::parse("https://graph.microsoft.com/v1.0/")
             .map_err(|_| UploadError::InvalidResponse)?;
-        url.path_segments_mut()
-            .map_err(|_| UploadError::InvalidResponse)?
-            .pop_if_empty()
-            .extend(["drives", self.drive_id, "items", id, "createUploadSession"]);
-        self.graph
-            .http
-            .post(url)
-            .bearer_auth(self.access_token)
-            .header(IF_MATCH, etag)
-            .build()
-            .map_err(|_| UploadError::InvalidResponse)
+        match operation.kind.as_str() {
+            "UploadChanged" => {
+                let id = operation
+                    .remote_id
+                    .as_deref()
+                    .ok_or(UploadError::InvalidResponse)?;
+                let etag = operation
+                    .expected_etag
+                    .as_deref()
+                    .ok_or(UploadError::InvalidResponse)?;
+                url.path_segments_mut()
+                    .map_err(|_| UploadError::InvalidResponse)?
+                    .pop_if_empty()
+                    .extend(["drives", self.drive_id, "items", id, "createUploadSession"]);
+                self.graph
+                    .http
+                    .post(url)
+                    .bearer_auth(self.access_token)
+                    .header(IF_MATCH, etag)
+                    .build()
+                    .map_err(|_| UploadError::InvalidResponse)
+            }
+            "UploadNew" => {
+                let name = &operation.path;
+                if operation.remote_id.is_some()
+                    || operation.expected_etag.is_some()
+                    || !valid_new_file_name(name)
+                    || size == 0
+                {
+                    return Err(UploadError::InvalidResponse);
+                }
+                url.path_segments_mut()
+                    .map_err(|_| UploadError::InvalidResponse)?
+                    .pop_if_empty()
+                    .extend([
+                        "drives",
+                        self.drive_id,
+                        "root:",
+                        &format!("{name}:"),
+                        "createUploadSession",
+                    ]);
+                self.graph
+                    .http
+                    .post(url)
+                    .bearer_auth(self.access_token)
+                    .json(&serde_json::json!({
+                        "item": {
+                            "@microsoft.graph.conflictBehavior": "fail",
+                            "name": name,
+                            "fileSize": size,
+                        }
+                    }))
+                    .build()
+                    .map_err(|_| UploadError::InvalidResponse)
+            }
+            _ => Err(UploadError::InvalidResponse),
+        }
     }
 
     fn range_request(
@@ -123,6 +159,16 @@ impl<'a> ExistingUpload<'a> {
             .build()
             .map_err(|_| UploadError::InvalidResponse)
     }
+}
+
+fn valid_new_file_name(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.ends_with([' ', '.'])
+        && !name
+            .chars()
+            .any(|character| "\"*:<>?/\\|".contains(character) || character.is_control())
 }
 
 fn session_url(value: &str) -> Result<reqwest::Url, UploadError> {
@@ -182,16 +228,16 @@ async fn upload_error(response: reqwest::Response) -> UploadError {
     }
 }
 
-impl UploadTransport for ExistingUpload<'_> {
+impl UploadTransport for GraphUpload<'_> {
     async fn create_session(
         &self,
         operation: &QueuedOperation,
-        _: u64,
+        size: u64,
     ) -> Result<String, UploadError> {
         let response = self
             .graph
             .http
-            .execute(self.create_session_request(operation)?)
+            .execute(self.create_session_request(operation, size)?)
             .await
             .map_err(|_| UploadError::Transient)?;
         if !response.status().is_success() {
@@ -397,7 +443,7 @@ mod tests {
     #[test]
     fn session_fragments_never_carry_bearer_token() {
         let graph = GraphClient::new().unwrap();
-        let upload = ExistingUpload::new(&graph, "drive", "test-token").unwrap();
+        let upload = GraphUpload::new(&graph, "drive", "test-token").unwrap();
         let operation = QueuedOperation {
             id: 1,
             kind: "UploadChanged".into(),
@@ -408,7 +454,7 @@ mod tests {
             local_fingerprint: Some("hash".into()),
             attempts: 1,
         };
-        let create = upload.create_session_request(&operation).unwrap();
+        let create = upload.create_session_request(&operation, 10).unwrap();
         assert_eq!(create.headers().get(IF_MATCH).unwrap(), "v1");
         assert!(create.headers().contains_key(AUTHORIZATION));
         assert_eq!(
@@ -434,5 +480,38 @@ mod tests {
             item_content_url("drive", "item").unwrap().path(),
             "/v1.0/drives/drive/items/item/content"
         );
+    }
+
+    #[test]
+    fn new_upload_fails_on_name_conflict_and_escapes_name() {
+        let graph = GraphClient::new().unwrap();
+        let upload = GraphUpload::new(&graph, "drive", "test-token").unwrap();
+        let mut operation = QueuedOperation {
+            id: 1,
+            kind: "UploadNew".into(),
+            path: "new file.txt".into(),
+            from_path: None,
+            remote_id: None,
+            expected_etag: None,
+            local_fingerprint: Some("hash".into()),
+            attempts: 1,
+        };
+        let request = upload.create_session_request(&operation, 42).unwrap();
+        assert_eq!(
+            request.url().path(),
+            "/v1.0/drives/drive/root:/new%20file.txt:/createUploadSession"
+        );
+        assert!(request.headers().contains_key(AUTHORIZATION));
+        assert!(!request.headers().contains_key(IF_MATCH));
+        let body: serde_json::Value =
+            serde_json::from_slice(request.body().unwrap().as_bytes().unwrap()).unwrap();
+        assert_eq!(body["item"]["@microsoft.graph.conflictBehavior"], "fail");
+        assert_eq!(body["item"]["name"], "new file.txt");
+        assert_eq!(body["item"]["fileSize"], 42);
+        operation.path = "../secret".into();
+        assert!(upload.create_session_request(&operation, 42).is_err());
+        operation.path = "new.txt".into();
+        operation.remote_id = Some("existing".into());
+        assert!(upload.create_session_request(&operation, 42).is_err());
     }
 }
