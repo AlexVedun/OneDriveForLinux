@@ -5,11 +5,15 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+libc = "0.2"
 onedrive-catalog = { path = "../catalog" }
 onedrive-core = { path = "../core" }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
 sha2 = "0.10"
+tempfile = "3.27"
+tokio = { version = "1.53", features = ["fs", "io-util", "rt"] }
+url = "2.5"
 
 [dev-dependencies]
-tempfile = "3.27"
+tokio = { version = "1.53", features = ["macros", "rt-multi-thread"] }

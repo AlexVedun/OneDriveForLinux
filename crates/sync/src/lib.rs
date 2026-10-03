@@ -1,5 +1,7 @@
 //! Offline sync planning. It never changes local or remote files.
 
+pub mod upload;
+
 use onedrive_catalog::CatalogItem;
 use onedrive_core::{PathError, resolve_path, validate_distinct_paths};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -18,6 +20,8 @@ pub enum SyncError {
     InvalidRoot,
     RootHasState,
     MissingRootId,
+    InvalidCheckpoint,
+    DriveMismatch,
 }
 
 impl std::fmt::Display for SyncError {
@@ -32,6 +36,8 @@ impl std::fmt::Display for SyncError {
                 "sync root cannot change while mappings or queued operations exist"
             ),
             Self::MissingRootId => write!(f, "OneDrive root ID is missing; refresh the catalog"),
+            Self::InvalidCheckpoint => write!(f, "invalid upload checkpoint"),
+            Self::DriveMismatch => write!(f, "sync state belongs to a different or unknown drive"),
         }
     }
 }
@@ -102,6 +108,7 @@ pub struct PlannedOperation {
     pub path: String,
     pub remote_id: Option<String>,
     pub expected_etag: Option<String>,
+    pub local_fingerprint: Option<String>,
     pub requires_confirmation: bool,
 }
 
@@ -118,7 +125,17 @@ pub struct QueuedOperation {
     pub path: String,
     pub remote_id: Option<String>,
     pub expected_etag: Option<String>,
+    pub local_fingerprint: Option<String>,
     pub attempts: u32,
+}
+
+/// The upload URL is a preauthenticated secret. Never include it in logs.
+pub struct UploadCheckpoint {
+    pub operation_id: i64,
+    pub upload_url: String,
+    pub total_size: u64,
+    pub fingerprint: String,
+    pub next_offset: u64,
 }
 
 pub struct SyncStore {
@@ -142,6 +159,10 @@ impl SyncStore {
                 singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
                 root TEXT NOT NULL
              );
+             CREATE TABLE IF NOT EXISTS sync_drive (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                drive_id TEXT NOT NULL
+             );
              CREATE TABLE IF NOT EXISTS mapping (
                 remote_id TEXT PRIMARY KEY,
                 path TEXT NOT NULL UNIQUE,
@@ -155,11 +176,34 @@ impl SyncStore {
                 path TEXT NOT NULL,
                 remote_id TEXT,
                 expected_etag TEXT,
+                local_fingerprint TEXT,
                 status TEXT NOT NULL DEFAULT 'pending',
                 attempts INTEGER NOT NULL DEFAULT 0,
                 last_error TEXT
+             );
+             CREATE TABLE IF NOT EXISTS transfer (
+                operation_id INTEGER PRIMARY KEY REFERENCES operation(id) ON DELETE CASCADE,
+                upload_url TEXT NOT NULL,
+                total_size INTEGER NOT NULL,
+                fingerprint TEXT NOT NULL,
+                next_offset INTEGER NOT NULL
              );",
         )?;
+        connection.pragma_update(None, "foreign_keys", "ON")?;
+        let has_fingerprint = {
+            let mut statement = connection.prepare("PRAGMA table_info(operation)")?;
+            let names = statement.query_map([], |row| row.get::<_, String>(1))?;
+            names
+                .collect::<Result<Vec<_>, _>>()?
+                .iter()
+                .any(|name| name == "local_fingerprint")
+        };
+        if !has_fingerprint {
+            connection.execute(
+                "ALTER TABLE operation ADD COLUMN local_fingerprint TEXT",
+                [],
+            )?;
+        }
         // A process crash may interrupt an operation before its result is
         // recorded. The future executor must recheck both sides on retry.
         connection.execute(
@@ -204,6 +248,39 @@ impl SyncStore {
             )
             .optional()?;
         Ok(root.map(PathBuf::from))
+    }
+
+    pub fn ensure_drive(&self, drive_id: &str) -> Result<(), SyncError> {
+        let stored: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT drive_id FROM sync_drive WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if stored.as_deref() == Some(drive_id) {
+            return Ok(());
+        }
+        let mappings: i64 =
+            self.connection
+                .query_row("SELECT count(*) FROM mapping", [], |row| row.get(0))?;
+        let operations: i64 =
+            self.connection
+                .query_row("SELECT count(*) FROM operation", [], |row| row.get(0))?;
+        if mappings != 0 || operations != 0 || stored.is_some() {
+            return Err(SyncError::DriveMismatch);
+        }
+        Ok(())
+    }
+
+    pub fn bind_drive(&self, drive_id: &str) -> Result<(), SyncError> {
+        self.ensure_drive(drive_id)?;
+        self.connection.execute(
+            "INSERT OR IGNORE INTO sync_drive(singleton, drive_id) VALUES (1, ?1)",
+            [drive_id],
+        )?;
+        Ok(())
     }
 
     pub fn baselines(&self) -> Result<Vec<Baseline>, SyncError> {
@@ -276,26 +353,40 @@ impl SyncStore {
 
     /// Save an approved plan before any network work. Repeated submissions do
     /// not duplicate operations or reset attempt counters.
-    pub fn enqueue(&mut self, operation: &PlannedOperation) -> Result<(), SyncError> {
-        let key = format!(
-            "{:?}:{}:{}",
-            operation.action,
+    pub fn enqueue(&mut self, operation: &PlannedOperation) -> Result<i64, SyncError> {
+        let mut hasher = Sha256::new();
+        let kind = format!("{:?}", operation.action);
+        for component in [
+            kind.as_str(),
             operation.remote_id.as_deref().unwrap_or(""),
-            operation.path
-        );
+            &operation.path,
+            operation.expected_etag.as_deref().unwrap_or(""),
+            operation.local_fingerprint.as_deref().unwrap_or(""),
+        ] {
+            hasher.update((component.len() as u64).to_le_bytes());
+            hasher.update(component.as_bytes());
+        }
+        let key = format!("{:x}", hasher.finalize());
         self.connection.execute(
             "INSERT OR IGNORE INTO operation
-             (idempotency_key, kind, path, remote_id, expected_etag)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+             (idempotency_key, kind, path, remote_id, expected_etag, local_fingerprint)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 key,
-                format!("{:?}", operation.action),
+                kind,
                 operation.path,
                 operation.remote_id,
-                operation.expected_etag
+                operation.expected_etag,
+                operation.local_fingerprint,
             ],
         )?;
-        Ok(())
+        self.connection
+            .query_row(
+                "SELECT id FROM operation WHERE idempotency_key = ?1",
+                [key],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
     }
 
     pub fn pending_count(&self) -> Result<u64, SyncError> {
@@ -311,7 +402,7 @@ impl SyncStore {
         let transaction = self.connection.transaction()?;
         let next: Option<QueuedOperation> = transaction
             .query_row(
-                "SELECT id, kind, path, remote_id, expected_etag, attempts
+                "SELECT id, kind, path, remote_id, expected_etag, attempts, local_fingerprint
              FROM operation WHERE status = 'pending' ORDER BY id LIMIT 1",
                 [],
                 |row| {
@@ -322,6 +413,7 @@ impl SyncStore {
                         remote_id: row.get(3)?,
                         expected_etag: row.get(4)?,
                         attempts: row.get::<_, u32>(5)? + 1,
+                        local_fingerprint: row.get(6)?,
                     })
                 },
             )
@@ -348,6 +440,166 @@ impl SyncStore {
         self.connection.execute(
             "UPDATE operation SET status = 'done', last_error = NULL WHERE id = ?1 AND status = 'running'",
             [id],
+        )?;
+        Ok(())
+    }
+
+    pub fn claim_upload_changed(&mut self) -> Result<Option<QueuedOperation>, SyncError> {
+        let transaction = self.connection.transaction()?;
+        let next: Option<QueuedOperation> = transaction.query_row(
+            "SELECT id, kind, path, remote_id, expected_etag, attempts, local_fingerprint
+             FROM operation WHERE status = 'pending' AND kind = 'UploadChanged' ORDER BY id LIMIT 1",
+            [], |row| Ok(QueuedOperation {
+                id: row.get(0)?, kind: row.get(1)?, path: row.get(2)?,
+                remote_id: row.get(3)?, expected_etag: row.get(4)?,
+                attempts: row.get::<_, u32>(5)? + 1, local_fingerprint: row.get(6)?,
+            }),
+        ).optional()?;
+        if let Some(operation) = &next {
+            transaction.execute(
+                "UPDATE operation SET status = 'running', attempts = attempts + 1 WHERE id = ?1",
+                [operation.id],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(next)
+    }
+
+    pub fn mark_blocked(&self, id: i64, reason: &str) -> Result<(), SyncError> {
+        self.connection.execute(
+            "UPDATE operation SET status = 'blocked', last_error = ?2 WHERE id = ?1 AND status = 'running'",
+            params![id, reason],
+        )?;
+        Ok(())
+    }
+
+    pub fn finish_uploaded(
+        &mut self,
+        operation: &QueuedOperation,
+        remote_id: &str,
+        etag: &str,
+    ) -> Result<(), SyncError> {
+        if operation.remote_id.as_deref() != Some(remote_id) || etag.is_empty() {
+            return Err(SyncError::InvalidCheckpoint);
+        }
+        let fingerprint = operation
+            .local_fingerprint
+            .as_deref()
+            .ok_or(SyncError::InvalidCheckpoint)?;
+        let transaction = self.connection.transaction()?;
+        let changed = transaction.execute(
+            "UPDATE operation SET status = 'done', last_error = NULL WHERE id = ?1 AND status = 'running'",
+            [operation.id],
+        )?;
+        if changed != 1 {
+            return Err(SyncError::InvalidCheckpoint);
+        }
+        transaction.execute(
+            "INSERT INTO mapping(remote_id, path, etag, fingerprint) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(remote_id) DO UPDATE SET path = excluded.path,
+                 etag = excluded.etag, fingerprint = excluded.fingerprint",
+            params![remote_id, operation.path, etag, fingerprint],
+        )?;
+        transaction.execute(
+            "DELETE FROM transfer WHERE operation_id = ?1",
+            [operation.id],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn upload_checkpoint(
+        &self,
+        operation_id: i64,
+    ) -> Result<Option<UploadCheckpoint>, SyncError> {
+        self.connection
+            .query_row(
+                "SELECT upload_url, total_size, fingerprint, next_offset
+             FROM transfer WHERE operation_id = ?1",
+                [operation_id],
+                |row| {
+                    let size: i64 = row.get(1)?;
+                    let offset: i64 = row.get(3)?;
+                    Ok(UploadCheckpoint {
+                        operation_id,
+                        upload_url: row.get(0)?,
+                        total_size: u64::try_from(size)
+                            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(1, size))?,
+                        fingerprint: row.get(2)?,
+                        next_offset: u64::try_from(offset)
+                            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(3, offset))?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn save_upload_checkpoint(&self, checkpoint: &UploadCheckpoint) -> Result<(), SyncError> {
+        let url =
+            url::Url::parse(&checkpoint.upload_url).map_err(|_| SyncError::InvalidCheckpoint)?;
+        if url.scheme() != "https"
+            || url.host_str().is_none()
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || checkpoint.next_offset > checkpoint.total_size
+        {
+            return Err(SyncError::InvalidCheckpoint);
+        }
+        let size =
+            i64::try_from(checkpoint.total_size).map_err(|_| SyncError::InvalidCheckpoint)?;
+        let offset =
+            i64::try_from(checkpoint.next_offset).map_err(|_| SyncError::InvalidCheckpoint)?;
+        self.connection.execute(
+            "INSERT INTO transfer(operation_id, upload_url, total_size, fingerprint, next_offset)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(operation_id) DO UPDATE SET
+                 upload_url = excluded.upload_url, total_size = excluded.total_size,
+                 fingerprint = excluded.fingerprint, next_offset = excluded.next_offset",
+            params![
+                checkpoint.operation_id,
+                checkpoint.upload_url,
+                size,
+                checkpoint.fingerprint,
+                offset
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_upload_offset(&self, operation_id: i64, offset: u64) -> Result<(), SyncError> {
+        let offset = i64::try_from(offset).map_err(|_| SyncError::InvalidCheckpoint)?;
+        let changed = self.connection.execute(
+            "UPDATE transfer SET next_offset = ?2
+             WHERE operation_id = ?1 AND next_offset <= ?2 AND total_size >= ?2",
+            params![operation_id, offset],
+        )?;
+        if changed != 1 {
+            return Err(SyncError::InvalidCheckpoint);
+        }
+        Ok(())
+    }
+
+    pub fn set_upload_offset_from_server(
+        &self,
+        operation_id: i64,
+        offset: u64,
+    ) -> Result<(), SyncError> {
+        let offset = i64::try_from(offset).map_err(|_| SyncError::InvalidCheckpoint)?;
+        let changed = self.connection.execute(
+            "UPDATE transfer SET next_offset = ?2 WHERE operation_id = ?1 AND total_size >= ?2",
+            params![operation_id, offset],
+        )?;
+        if changed != 1 {
+            return Err(SyncError::InvalidCheckpoint);
+        }
+        Ok(())
+    }
+
+    pub fn clear_upload_checkpoint(&self, operation_id: i64) -> Result<(), SyncError> {
+        self.connection.execute(
+            "DELETE FROM transfer WHERE operation_id = ?1",
+            [operation_id],
         )?;
         Ok(())
     }
@@ -562,6 +814,7 @@ pub fn plan(
                 path,
                 Some(base.remote_id.clone()),
                 remote.and_then(|file| file.etag.clone()),
+                local.map(|file| file.fingerprint.clone()),
             );
         }
     }
@@ -584,6 +837,7 @@ pub fn plan(
             file.path.clone(),
             Some(file.id.clone()),
             file.etag.clone(),
+            local.map(|file| file.fingerprint.clone()),
         );
     }
     for file in local {
@@ -595,7 +849,14 @@ pub fn plan(
         } else {
             Action::UploadNew
         };
-        push(&mut operations, action, file.path.clone(), None, None);
+        push(
+            &mut operations,
+            action,
+            file.path.clone(),
+            None,
+            None,
+            Some(file.fingerprint.clone()),
+        );
     }
     operations.sort_by(|a, b| {
         (&a.path, format!("{:?}", a.action)).cmp(&(&b.path, format!("{:?}", b.action)))
@@ -613,6 +874,7 @@ fn push(
     path: String,
     remote_id: Option<String>,
     expected_etag: Option<String>,
+    local_fingerprint: Option<String>,
 ) {
     let requires_confirmation = action.requires_confirmation();
     operations.push(PlannedOperation {
@@ -620,6 +882,7 @@ fn push(
         path,
         remote_id,
         expected_etag,
+        local_fingerprint,
         requires_confirmation,
     });
 }
@@ -712,6 +975,7 @@ mod tests {
             path: "one.txt".into(),
             remote_id: None,
             expected_etag: None,
+            local_fingerprint: Some("hash".into()),
             requires_confirmation: false,
         };
         {
@@ -720,27 +984,154 @@ mod tests {
             store.enqueue(&operation).unwrap();
             store.enqueue(&operation).unwrap();
             assert_eq!(store.pending_count().unwrap(), 1);
+            let mut changed = operation.clone();
+            changed.local_fingerprint = Some("changed".into());
+            store.enqueue(&changed).unwrap();
+            assert_eq!(store.pending_count().unwrap(), 2);
             let claimed = store.claim_next().unwrap().unwrap();
             assert_eq!(claimed.attempts, 1);
-            assert_eq!(store.pending_count().unwrap(), 0);
+            assert_eq!(store.pending_count().unwrap(), 1);
             assert!(store.set_root(&state.join("nested"), &state).is_err());
         }
         let mut store = SyncStore::open(&path).unwrap();
         assert_eq!(store.root().unwrap(), Some(root.canonicalize().unwrap()));
-        assert_eq!(store.pending_count().unwrap(), 1);
+        assert_eq!(store.pending_count().unwrap(), 2);
         let claimed = store.claim_next().unwrap().unwrap();
         assert_eq!(claimed.attempts, 2);
         store.mark_retry(claimed.id, "network unavailable").unwrap();
-        assert_eq!(store.pending_count().unwrap(), 1);
+        assert_eq!(store.pending_count().unwrap(), 2);
         let claimed = store.claim_next().unwrap().unwrap();
         assert_eq!(claimed.attempts, 3);
         store.mark_done(claimed.id).unwrap();
-        assert_eq!(store.pending_count().unwrap(), 0);
+        assert_eq!(store.pending_count().unwrap(), 1);
         let replacement = directory.path().join("replacement");
         fs::create_dir(&replacement).unwrap();
         assert!(matches!(
             store.set_root(&replacement, &state),
             Err(SyncError::RootHasState)
+        ));
+    }
+
+    #[test]
+    fn existing_operation_database_gets_fingerprint_column() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("old.sqlite3");
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE operation (
+                id INTEGER PRIMARY KEY, idempotency_key TEXT NOT NULL UNIQUE,
+                kind TEXT NOT NULL, path TEXT NOT NULL, remote_id TEXT,
+                expected_etag TEXT, status TEXT NOT NULL DEFAULT 'pending',
+                attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT
+             );",
+            )
+            .unwrap();
+        let mut store = SyncStore::open(&path).unwrap();
+        let operation = PlannedOperation {
+            action: Action::UploadNew,
+            path: "file.txt".into(),
+            remote_id: None,
+            expected_etag: None,
+            local_fingerprint: Some("hash".into()),
+            requires_confirmation: false,
+        };
+        store.enqueue(&operation).unwrap();
+        assert_eq!(
+            store
+                .claim_next()
+                .unwrap()
+                .unwrap()
+                .local_fingerprint
+                .as_deref(),
+            Some("hash")
+        );
+    }
+
+    #[test]
+    fn upload_checkpoint_persists_and_rejects_regression() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sync.sqlite3");
+        let operation = PlannedOperation {
+            action: Action::UploadChanged,
+            path: "file.txt".into(),
+            remote_id: Some("item".into()),
+            expected_etag: Some("v1".into()),
+            local_fingerprint: Some("hash".into()),
+            requires_confirmation: false,
+        };
+        let id = {
+            let mut store = SyncStore::open(&path).unwrap();
+            let id = store.enqueue(&operation).unwrap();
+            let checkpoint = UploadCheckpoint {
+                operation_id: id,
+                upload_url: "https://upload.example/session?secret=1".into(),
+                total_size: 1_000_000,
+                fingerprint: "hash".into(),
+                next_offset: 0,
+            };
+            store.save_upload_checkpoint(&checkpoint).unwrap();
+            store.update_upload_offset(id, 327_680).unwrap();
+            assert!(store.update_upload_offset(id, 1).is_err());
+            id
+        };
+        let store = SyncStore::open(&path).unwrap();
+        let checkpoint = store.upload_checkpoint(id).unwrap().unwrap();
+        assert_eq!(checkpoint.next_offset, 327_680);
+        assert_eq!(checkpoint.total_size, 1_000_000);
+        store.clear_upload_checkpoint(id).unwrap();
+        assert!(store.upload_checkpoint(id).unwrap().is_none());
+    }
+
+    #[test]
+    fn completed_upload_updates_mapping_and_queue_atomically() {
+        let mut store = SyncStore::in_memory().unwrap();
+        let operation = PlannedOperation {
+            action: Action::UploadChanged,
+            path: "file.txt".into(),
+            remote_id: Some("item".into()),
+            expected_etag: Some("v1".into()),
+            local_fingerprint: Some("new-hash".into()),
+            requires_confirmation: false,
+        };
+        let id = store.enqueue(&operation).unwrap();
+        let claimed = store.claim_upload_changed().unwrap().unwrap();
+        let checkpoint = UploadCheckpoint {
+            operation_id: id,
+            upload_url: "https://upload.example/secret".into(),
+            total_size: 1,
+            fingerprint: "new-hash".into(),
+            next_offset: 0,
+        };
+        store.save_upload_checkpoint(&checkpoint).unwrap();
+        assert!(store.finish_uploaded(&claimed, "wrong-id", "v2").is_err());
+        assert!(store.upload_checkpoint(id).unwrap().is_some());
+        store.finish_uploaded(&claimed, "item", "v2").unwrap();
+        assert!(store.upload_checkpoint(id).unwrap().is_none());
+        let mapping = store.baselines().unwrap();
+        assert_eq!(mapping.len(), 1);
+        assert_eq!(mapping[0].etag.as_deref(), Some("v2"));
+        assert_eq!(mapping[0].fingerprint, "new-hash");
+        assert_eq!(store.pending_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn queued_state_is_bound_to_one_drive() {
+        let mut store = SyncStore::in_memory().unwrap();
+        store.bind_drive("drive-one").unwrap();
+        let operation = PlannedOperation {
+            action: Action::UploadNew,
+            path: "file".into(),
+            remote_id: None,
+            expected_etag: None,
+            local_fingerprint: Some("hash".into()),
+            requires_confirmation: false,
+        };
+        store.enqueue(&operation).unwrap();
+        assert!(store.ensure_drive("drive-one").is_ok());
+        assert!(matches!(
+            store.bind_drive("drive-two"),
+            Err(SyncError::DriveMismatch)
         ));
     }
 

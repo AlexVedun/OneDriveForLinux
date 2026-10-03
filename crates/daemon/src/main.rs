@@ -3,12 +3,15 @@ mod graph;
 mod transfer;
 
 use auth::LoginAttempt;
-use graph::GraphClient;
+use graph::{ExistingUpload, GraphClient};
 use keyring::v1::Entry;
 use oauth2::{TokenResponse, basic::BasicTokenResponse};
 use onedrive_catalog::{Catalog, FetchError};
 use onedrive_core::{BUS_NAME, EngineState, OBJECT_PATH};
-use onedrive_sync::SyncStore;
+use onedrive_sync::{
+    Action, SyncStore,
+    upload::{UploadError, UploadStep, upload_queued},
+};
 use std::fs::{self, OpenOptions};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
@@ -33,6 +36,7 @@ struct Daemon {
     sync: Arc<Mutex<SyncStore>>,
     scan_in_progress: Arc<AtomicBool>,
     download_in_progress: Arc<AtomicBool>,
+    upload_in_progress: Arc<AtomicBool>,
 }
 
 #[zbus::interface(name = "io.github.onedrive_linux.Daemon")]
@@ -101,6 +105,10 @@ impl Daemon {
                 .root_id(&drive_id)
                 .map_err(|_| zbus::fdo::Error::Failed("cannot read drive root".to_owned()))?;
             drop(catalog);
+            sync.lock()
+                .unwrap()
+                .ensure_drive(&drive_id)
+                .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
             let preview = sync
                 .lock()
                 .unwrap()
@@ -113,7 +121,177 @@ impl Daemon {
         .map_err(|_| zbus::fdo::Error::Failed("preview task failed".to_owned()))?
     }
 
+    async fn queue_upload_changed(&self, item_id: &str) -> zbus::fdo::Result<i64> {
+        let item_id = item_id.to_owned();
+        let catalog = Arc::clone(&self.catalog);
+        let sync = Arc::clone(&self.sync);
+        tokio::task::spawn_blocking(move || {
+            let catalog = catalog.lock().unwrap();
+            let drive_id = catalog
+                .active_drive_id()
+                .map_err(|_| zbus::fdo::Error::Failed("cannot read catalog".to_owned()))?
+                .ok_or_else(|| zbus::fdo::Error::Failed("OneDrive catalog is empty".to_owned()))?;
+            if !catalog
+                .is_complete(&drive_id)
+                .map_err(|_| zbus::fdo::Error::Failed("cannot read catalog cursor".to_owned()))?
+            {
+                return Err(zbus::fdo::Error::Failed(
+                    "catalog scan is incomplete".to_owned(),
+                ));
+            }
+            let items = catalog
+                .items(&drive_id)
+                .map_err(|_| zbus::fdo::Error::Failed("cannot read catalog".to_owned()))?;
+            let root_id = catalog
+                .root_id(&drive_id)
+                .map_err(|_| zbus::fdo::Error::Failed("cannot read drive root".to_owned()))?;
+            drop(catalog);
+            let mut sync = sync.lock().unwrap();
+            sync.bind_drive(&drive_id)
+                .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
+            let preview = sync
+                .preview(&items, root_id.as_deref())
+                .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
+            let operation = preview
+                .operations
+                .into_iter()
+                .find(|operation| {
+                    operation.action == Action::UploadChanged
+                        && operation.remote_id.as_deref() == Some(&item_id)
+                        && operation.expected_etag.is_some()
+                })
+                .ok_or_else(|| {
+                    zbus::fdo::Error::Failed("no safe changed-file upload is available".to_owned())
+                })?;
+            sync.enqueue(&operation)
+                .map_err(|_| zbus::fdo::Error::Failed("cannot queue upload".to_owned()))
+        })
+        .await
+        .map_err(|_| zbus::fdo::Error::Failed("queue task failed".to_owned()))?
+    }
+
+    async fn run_queued_upload(&self) -> zbus::fdo::Result<i64> {
+        if std::env::var("ONEDRIVE_EXPERIMENTAL_UPLOAD").as_deref() != Ok("1") {
+            return Err(zbus::fdo::Error::Failed(
+                "upload execution is experimental and disabled".to_owned(),
+            ));
+        }
+        let client_id = client_id().ok_or_else(|| {
+            zbus::fdo::Error::Failed("ONEDRIVE_CLIENT_ID is not configured".to_owned())
+        })?;
+        if self.scan_in_progress.load(Ordering::SeqCst)
+            || self.download_in_progress.load(Ordering::SeqCst)
+            || self
+                .upload_in_progress
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+        {
+            return Err(zbus::fdo::Error::Failed(
+                "upload is already running".to_owned(),
+            ));
+        }
+        let prepare = async {
+            let token = access_token(&client_id)
+                .await
+                .map_err(|_| zbus::fdo::Error::Failed("login is required".to_owned()))?;
+            let drive_id = self
+                .catalog
+                .lock()
+                .unwrap()
+                .active_drive_id()
+                .map_err(|_| zbus::fdo::Error::Failed("cannot read catalog".to_owned()))?
+                .ok_or_else(|| zbus::fdo::Error::Failed("OneDrive catalog is empty".to_owned()))?;
+            let (operation, root) = {
+                let mut sync = self.sync.lock().unwrap();
+                sync.ensure_drive(&drive_id)
+                    .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
+                let root = sync
+                    .root()
+                    .map_err(|_| zbus::fdo::Error::Failed("cannot read sync root".to_owned()))?
+                    .ok_or_else(|| {
+                        zbus::fdo::Error::Failed("sync root is not configured".to_owned())
+                    })?;
+                let operation = sync
+                    .claim_upload_changed()
+                    .map_err(|_| zbus::fdo::Error::Failed("cannot read upload queue".to_owned()))?
+                    .ok_or_else(|| {
+                        zbus::fdo::Error::Failed("no changed-file upload is pending".to_owned())
+                    })?;
+                (operation, root)
+            };
+            Ok::<_, zbus::fdo::Error>((token, drive_id, operation, root))
+        }
+        .await;
+        let (token, drive_id, operation, root) = match prepare {
+            Ok(value) => value,
+            Err(error) => {
+                self.upload_in_progress.store(false, Ordering::SeqCst);
+                return Err(error);
+            }
+        };
+        let id = operation.id;
+        let sync = Arc::clone(&self.sync);
+        let state = Arc::clone(&self.state);
+        let in_progress = Arc::clone(&self.upload_in_progress);
+        tokio::spawn(async move {
+            *state.lock().unwrap() = EngineState::Transferring;
+            let result = tokio::task::spawn_blocking(move || {
+                let mut store = sync.lock().unwrap();
+                let result = (|| {
+                    let graph = GraphClient::new().map_err(|_| UploadError::Transient)?;
+                    let transport = ExistingUpload::new(&graph, &drive_id, &token)
+                        .map_err(|_| UploadError::Transient)?;
+                    tokio::runtime::Handle::current()
+                        .block_on(upload_queued(&store, &transport, &root, &operation))
+                })();
+                match result {
+                    Ok(UploadStep::Complete {
+                        remote_id,
+                        etag: Some(etag),
+                    }) => store
+                        .finish_uploaded(&operation, &remote_id, &etag)
+                        .map_err(UploadError::Store),
+                    Ok(_) => {
+                        store
+                            .mark_blocked(id, "upload result needs reconciliation")
+                            .map_err(UploadError::Store)?;
+                        Err(UploadError::InvalidResponse)
+                    }
+                    Err(error) => {
+                        let reason = match error {
+                            UploadError::Conflict | UploadError::SourceChanged => {
+                                "upload needs review"
+                            }
+                            _ => "upload failed; retry is possible",
+                        };
+                        let update = if matches!(
+                            error,
+                            UploadError::Conflict | UploadError::SourceChanged
+                        ) {
+                            store.mark_blocked(id, reason)
+                        } else {
+                            store.mark_retry(id, reason)
+                        };
+                        update.map_err(UploadError::Store)?;
+                        Err(error)
+                    }
+                }
+            })
+            .await;
+            *state.lock().unwrap() = if matches!(result, Ok(Ok(()))) {
+                EngineState::Connected
+            } else {
+                EngineState::Error
+            };
+            in_progress.store(false, Ordering::SeqCst);
+        });
+        Ok(id)
+    }
+
     fn refresh_catalog(&self) -> zbus::fdo::Result<()> {
+        if self.upload_in_progress.load(Ordering::SeqCst) {
+            return Err(zbus::fdo::Error::Failed("upload is running".to_owned()));
+        }
         let client_id = client_id().ok_or_else(|| {
             zbus::fdo::Error::Failed("ONEDRIVE_CLIENT_ID is not configured".to_owned())
         })?;
@@ -143,6 +321,9 @@ impl Daemon {
     }
 
     fn download_item(&self, item_id: &str, target_path: &str) -> zbus::fdo::Result<()> {
+        if self.upload_in_progress.load(Ordering::SeqCst) {
+            return Err(zbus::fdo::Error::Failed("upload is running".to_owned()));
+        }
         let client_id = client_id().ok_or_else(|| {
             zbus::fdo::Error::Failed("ONEDRIVE_CLIENT_ID is not configured".to_owned())
         })?;
@@ -434,6 +615,7 @@ async fn poll_catalog(
     catalog: Arc<Mutex<Catalog>>,
     scan_in_progress: Arc<AtomicBool>,
     download_in_progress: Arc<AtomicBool>,
+    upload_in_progress: Arc<AtomicBool>,
     client_id: String,
 ) {
     let mut interval = tokio::time::interval(Duration::from_secs(300));
@@ -446,6 +628,7 @@ async fn poll_catalog(
             current,
             EngineState::NeedsLogin | EngineState::Transferring | EngineState::Checking
         ) || download_in_progress.load(Ordering::SeqCst)
+            || upload_in_progress.load(Ordering::SeqCst)
             || scan_in_progress
                 .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
                 .is_err()
@@ -508,6 +691,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?)?));
     let scan_in_progress = Arc::new(AtomicBool::new(false));
     let download_in_progress = Arc::new(AtomicBool::new(false));
+    let upload_in_progress = Arc::new(AtomicBool::new(false));
     let daemon = Daemon {
         state: Arc::clone(&state),
         login_in_progress: Arc::new(AtomicBool::new(false)),
@@ -515,6 +699,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         sync,
         scan_in_progress: Arc::clone(&scan_in_progress),
         download_in_progress: Arc::clone(&download_in_progress),
+        upload_in_progress: Arc::clone(&upload_in_progress),
     };
     let _connection = Builder::session()?
         .name(BUS_NAME)?
@@ -528,6 +713,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             catalog,
             scan_in_progress,
             download_in_progress,
+            upload_in_progress,
             client_id,
         ));
     }
