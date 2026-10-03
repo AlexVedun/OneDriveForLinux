@@ -44,6 +44,9 @@ impl Daemon {
     fn status(&self) -> String {
         let state = *self.state.lock().unwrap();
         if state == EngineState::Connected {
+            if self.sync.lock().unwrap().is_paused().unwrap_or(false) {
+                return EngineState::Paused.as_str().to_owned();
+            }
             let catalog = self.catalog.lock().unwrap();
             if let Ok(Some(drive_id)) = catalog.active_drive_id()
                 && catalog.needs_reconcile(&drive_id).unwrap_or(false)
@@ -52,6 +55,22 @@ impl Daemon {
             }
         }
         state.as_str().to_owned()
+    }
+
+    fn sync_paused(&self) -> zbus::fdo::Result<bool> {
+        self.sync
+            .lock()
+            .unwrap()
+            .is_paused()
+            .map_err(|_| zbus::fdo::Error::Failed("cannot read sync pause".to_owned()))
+    }
+
+    fn set_sync_paused(&self, paused: bool) -> zbus::fdo::Result<()> {
+        self.sync
+            .lock()
+            .unwrap()
+            .set_paused(paused)
+            .map_err(|_| zbus::fdo::Error::Failed("cannot save sync pause".to_owned()))
     }
 
     fn catalog_items(&self) -> zbus::fdo::Result<String> {
@@ -175,6 +194,9 @@ impl Daemon {
             return Err(zbus::fdo::Error::Failed(
                 "upload execution is experimental and disabled".to_owned(),
             ));
+        }
+        if self.sync_paused()? {
+            return Err(zbus::fdo::Error::Failed("sync is paused".to_owned()));
         }
         let client_id = client_id().ok_or_else(|| {
             zbus::fdo::Error::Failed("ONEDRIVE_CLIENT_ID is not configured".to_owned())
