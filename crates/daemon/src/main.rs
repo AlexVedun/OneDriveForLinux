@@ -14,6 +14,7 @@ use onedrive_core::{BUS_NAME, EngineState, OBJECT_PATH};
 use onedrive_sync::{
     Action, Baseline, QueuedOperation, SyncStore,
     folders::local_directory_exists,
+    local_delete::{DeleteError, quarantine},
     local_rename::{RenameError, apply as apply_local_rename, fingerprint_matches, path_is_absent},
     monitor::LocalMonitor,
     remote_files, remote_parent_exists, remote_parent_id, scan_local,
@@ -1340,6 +1341,144 @@ impl Daemon {
         Ok(id)
     }
 
+    async fn run_queued_local_delete(&self) -> zbus::fdo::Result<i64> {
+        if std::env::var("ONEDRIVE_EXPERIMENTAL_DOWNLOAD").as_deref() != Ok("1") {
+            return Err(zbus::fdo::Error::Failed(
+                "local deletion is experimental and disabled".to_owned(),
+            ));
+        }
+        if self.sync_paused()? {
+            return Err(zbus::fdo::Error::Failed("sync is paused".to_owned()));
+        }
+        if self.scan_in_progress.load(Ordering::SeqCst)
+            || self.upload_in_progress.load(Ordering::SeqCst)
+            || self
+                .download_in_progress
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+        {
+            return Err(zbus::fdo::Error::Failed(
+                "another local change is running".to_owned(),
+            ));
+        }
+        let catalog = Arc::clone(&self.catalog);
+        let sync = Arc::clone(&self.sync);
+        let prepare = tokio::task::spawn_blocking(move || {
+            let catalog = catalog.lock().unwrap();
+            let drive_id = catalog
+                .active_drive_id()
+                .map_err(|_| zbus::fdo::Error::Failed("cannot read catalog".to_owned()))?
+                .ok_or_else(|| zbus::fdo::Error::Failed("OneDrive catalog is empty".to_owned()))?;
+            if !catalog
+                .is_complete(&drive_id)
+                .map_err(|_| zbus::fdo::Error::Failed("cannot read catalog cursor".to_owned()))?
+            {
+                return Err(zbus::fdo::Error::Failed(
+                    "catalog scan is incomplete".to_owned(),
+                ));
+            }
+            let items = catalog
+                .items(&drive_id)
+                .map_err(|_| zbus::fdo::Error::Failed("cannot read catalog".to_owned()))?;
+            drop(catalog);
+            let state_path = state_directory().map_err(|_| {
+                zbus::fdo::Error::Failed("cannot access state directory".to_owned())
+            })?;
+            let (operation, root, baselines) = {
+                let mut store = sync.lock().unwrap();
+                store
+                    .ensure_drive(&drive_id)
+                    .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
+                let root = store
+                    .root()
+                    .map_err(|_| zbus::fdo::Error::Failed("cannot read sync root".to_owned()))?
+                    .ok_or_else(|| {
+                        zbus::fdo::Error::Failed("sync root is not configured".to_owned())
+                    })?;
+                let operation = store
+                    .claim_local_delete()
+                    .map_err(|_| {
+                        zbus::fdo::Error::Failed("cannot read local delete queue".to_owned())
+                    })?
+                    .ok_or_else(|| {
+                        zbus::fdo::Error::Failed("no approved local deletion is pending".to_owned())
+                    })?;
+                let baselines = store.baselines().map_err(|_| {
+                    zbus::fdo::Error::Failed("cannot read sync baseline".to_owned())
+                })?;
+                (operation, root, baselines)
+            };
+            if !local_delete_candidate(&items, &root, &baselines, &operation) {
+                sync.lock()
+                    .unwrap()
+                    .mark_blocked(operation.id, "local deletion needs review")
+                    .map_err(|_| {
+                        zbus::fdo::Error::Failed("cannot block stale deletion".to_owned())
+                    })?;
+                return Err(zbus::fdo::Error::Failed(
+                    "local deletion needs review".to_owned(),
+                ));
+            }
+            Ok::<_, zbus::fdo::Error>((operation, root, state_path))
+        })
+        .await
+        .map_err(|_| zbus::fdo::Error::Failed("local delete task failed".to_owned()))?;
+        let (operation, root, state_path) = match prepare {
+            Ok(value) => value,
+            Err(error) => {
+                self.download_in_progress.store(false, Ordering::SeqCst);
+                return Err(error);
+            }
+        };
+        let id = operation.id;
+        let sync = Arc::clone(&self.sync);
+        let state = Arc::clone(&self.state);
+        let in_progress = Arc::clone(&self.download_in_progress);
+        tokio::spawn(async move {
+            *state.lock().unwrap() = EngineState::Transferring;
+            let sync_worker = Arc::clone(&sync);
+            let result = tokio::task::spawn_blocking(move || {
+                quarantine(&root, &state_path, &operation)?;
+                sync_worker
+                    .lock()
+                    .unwrap()
+                    .finish_local_deleted(&operation)
+                    .map_err(|error| match error {
+                        onedrive_sync::SyncError::InvalidCheckpoint => DeleteError::Changed,
+                        _ => DeleteError::Io(std::io::Error::other(error.to_string())),
+                    })
+            })
+            .await;
+            let success = matches!(result, Ok(Ok(())));
+            if !success {
+                let update = match result {
+                    Ok(Err(DeleteError::Changed)) => sync
+                        .lock()
+                        .unwrap()
+                        .mark_blocked(id, "local deletion needs review"),
+                    Ok(Err(DeleteError::CrossDevice)) => sync.lock().unwrap().mark_blocked(
+                        id,
+                        "sync root and recovery directory are on different filesystems",
+                    ),
+                    _ => sync
+                        .lock()
+                        .unwrap()
+                        .mark_retry(id, "local deletion failed; retry is possible"),
+                };
+                if update.is_err() {
+                    eprintln!("cannot update local deletion queue status");
+                }
+            }
+            *state.lock().unwrap() = if success {
+                EngineState::Connected
+            } else {
+                EngineState::Error
+            };
+            in_progress.store(false, Ordering::SeqCst);
+        });
+        Ok(id)
+    }
+
     fn download_item(&self, item_id: &str, target_path: &str) -> zbus::fdo::Result<()> {
         if self.upload_in_progress.load(Ordering::SeqCst) {
             return Err(zbus::fdo::Error::Failed("upload is running".to_owned()));
@@ -1697,6 +1836,38 @@ fn remote_delete_candidate(
         name: name.to_owned(),
         etag: etag.to_owned(),
     })
+}
+
+fn local_delete_candidate(
+    items: &[CatalogItem],
+    root: &std::path::Path,
+    baselines: &[Baseline],
+    operation: &QueuedOperation,
+) -> bool {
+    if operation.kind != "DeleteLocal" || operation.from_path.is_some() {
+        return false;
+    }
+    let (Some(item_id), Some(etag), Some(fingerprint)) = (
+        operation.remote_id.as_deref(),
+        operation.expected_etag.as_deref(),
+        operation.local_fingerprint.as_deref(),
+    ) else {
+        return false;
+    };
+    !item_id.is_empty()
+        && !etag.is_empty()
+        && !fingerprint.is_empty()
+        && !items
+            .iter()
+            .any(|item| item.item_id == item_id && !item.deleted)
+        && baselines.iter().any(|base| {
+            base.remote_id == item_id
+                && base.path == operation.path
+                && base.etag.as_deref() == Some(etag)
+                && base.fingerprint == fingerprint
+        })
+        && (fingerprint_matches(root, &operation.path, fingerprint)
+            || path_is_absent(root, &operation.path))
 }
 
 fn watch_local_root(sync: Arc<Mutex<SyncStore>>, epoch: Arc<AtomicU64>) {
@@ -2065,7 +2236,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::{
         Baseline, CatalogItem, QueuedOperation, client_id_from_dotenv, client_id_from_sources,
-        remote_delete_candidate, remote_folder_candidate, remote_rename_candidate,
+        local_delete_candidate, remote_delete_candidate, remote_folder_candidate,
+        remote_rename_candidate,
     };
 
     #[test]
@@ -2283,6 +2455,78 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn local_delete_candidate_requires_tombstone_and_unchanged_file() {
+        use sha2::{Digest, Sha256};
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("gone.txt"), b"content").unwrap();
+        let hash = format!("{:x}", Sha256::digest(b"content"));
+        let operation = QueuedOperation {
+            id: 1,
+            kind: "DeleteLocal".into(),
+            path: "gone.txt".into(),
+            from_path: None,
+            remote_id: Some("id".into()),
+            expected_etag: Some("v1".into()),
+            local_fingerprint: Some(hash.clone()),
+            attempts: 1,
+        };
+        let base = Baseline {
+            remote_id: "id".into(),
+            path: "gone.txt".into(),
+            etag: Some("v1".into()),
+            fingerprint: hash,
+        };
+        let live = CatalogItem {
+            drive_id: "drive".into(),
+            item_id: "id".into(),
+            parent_id: Some("root".into()),
+            name: Some("gone.txt".into()),
+            kind: "file".into(),
+            size: Some(7),
+            etag: Some("v1".into()),
+            ctag: None,
+            modified: None,
+            deleted: false,
+        };
+        assert!(!local_delete_candidate(
+            std::slice::from_ref(&live),
+            temp.path(),
+            std::slice::from_ref(&base),
+            &operation
+        ));
+        let mut tombstone = live;
+        tombstone.deleted = true;
+        assert!(local_delete_candidate(
+            std::slice::from_ref(&tombstone),
+            temp.path(),
+            std::slice::from_ref(&base),
+            &operation
+        ));
+        std::fs::write(temp.path().join("gone.txt"), b"changed").unwrap();
+        assert!(!local_delete_candidate(
+            std::slice::from_ref(&tombstone),
+            temp.path(),
+            std::slice::from_ref(&base),
+            &operation
+        ));
+        std::fs::remove_file(temp.path().join("gone.txt")).unwrap();
+        assert!(local_delete_candidate(
+            std::slice::from_ref(&tombstone),
+            temp.path(),
+            std::slice::from_ref(&base),
+            &operation
+        ));
+        let mut stale = base;
+        stale.etag = Some("v2".into());
+        assert!(!local_delete_candidate(
+            &[tombstone],
+            temp.path(),
+            &[stale],
+            &operation
+        ));
     }
 
     #[test]
