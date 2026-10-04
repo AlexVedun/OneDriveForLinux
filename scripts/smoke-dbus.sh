@@ -48,6 +48,33 @@ root=$(gdbus call --session \
     --object-path /io/github/onedrive_linux/Daemon \
     --method io.github.onedrive_linux.Daemon.SetSyncRoot "$test_state/sync")
 test "$root" = "('$test_state/sync',)"
+attempt=0
+while [ "$attempt" -lt 10 ]; do
+    epoch=$(gdbus call --session \
+        --dest io.github.onedrive_linux.Daemon \
+        --object-path /io/github/onedrive_linux/Daemon \
+        --method io.github.onedrive_linux.Daemon.LocalChangeEpoch)
+    if [ "$epoch" != "(uint64 0,)" ]; then
+        break
+    fi
+    attempt=$((attempt + 1))
+    sleep 1
+done
+test "$epoch" != "(uint64 0,)"
+printf 'changed' > "$test_state/sync/new.txt"
+attempt=0
+while [ "$attempt" -lt 10 ]; do
+    changed=$(gdbus call --session \
+        --dest io.github.onedrive_linux.Daemon \
+        --object-path /io/github/onedrive_linux/Daemon \
+        --method io.github.onedrive_linux.Daemon.LocalChangeEpoch)
+    if [ "$changed" != "$epoch" ]; then
+        break
+    fi
+    attempt=$((attempt + 1))
+    sleep 1
+done
+test "$changed" != "$epoch"
 paused=$(gdbus call --session \
     --dest io.github.onedrive_linux.Daemon \
     --object-path /io/github/onedrive_linux/Daemon \

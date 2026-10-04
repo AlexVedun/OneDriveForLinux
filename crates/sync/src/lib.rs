@@ -1,5 +1,6 @@
 //! Offline sync planning. It never changes local or remote files.
 
+pub mod monitor;
 pub mod upload;
 
 use onedrive_catalog::CatalogItem;

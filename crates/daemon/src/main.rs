@@ -10,6 +10,7 @@ use onedrive_catalog::{Catalog, FetchError};
 use onedrive_core::{BUS_NAME, EngineState, OBJECT_PATH};
 use onedrive_sync::{
     Action, SyncStore,
+    monitor::LocalMonitor,
     upload::{UploadError, UploadStep, upload_queued},
 };
 use std::fs::{self, OpenOptions};
@@ -17,7 +18,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -37,6 +38,7 @@ struct Daemon {
     scan_in_progress: Arc<AtomicBool>,
     download_in_progress: Arc<AtomicBool>,
     upload_in_progress: Arc<AtomicBool>,
+    local_change_epoch: Arc<AtomicU64>,
 }
 
 #[zbus::interface(name = "io.github.onedrive_linux.Daemon")]
@@ -79,6 +81,10 @@ impl Daemon {
             .unwrap()
             .review_count()
             .map_err(|_| zbus::fdo::Error::Failed("cannot read sync review count".to_owned()))
+    }
+
+    fn local_change_epoch(&self) -> u64 {
+        self.local_change_epoch.load(Ordering::Relaxed)
     }
 
     fn catalog_items(&self) -> zbus::fdo::Result<String> {
@@ -490,13 +496,67 @@ async fn queue_upload_candidate(
     .map_err(|_| zbus::fdo::Error::Failed("queue task failed".to_owned()))?
 }
 
+fn watch_local_root(sync: Arc<Mutex<SyncStore>>, epoch: Arc<AtomicU64>) {
+    std::thread::spawn(move || {
+        let mut watched_root: Option<PathBuf> = None;
+        let mut monitor: Option<LocalMonitor> = None;
+        loop {
+            let root = sync.lock().unwrap().root().ok().flatten();
+            if root != watched_root {
+                watched_root = root.clone();
+                monitor = None;
+                if root.is_some() {
+                    epoch.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            if monitor.is_none()
+                && let Some(path) = root.as_deref()
+                && let Ok(created) = LocalMonitor::new(path)
+            {
+                monitor = Some(created);
+                epoch.fetch_add(1, Ordering::Relaxed);
+            }
+            if let Some(active) = monitor.as_mut() {
+                match active.poll() {
+                    Ok(true) => {
+                        epoch.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Ok(false) => {}
+                    Err(_) => {
+                        monitor = None;
+                        epoch.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    });
+}
+
 fn client_id() -> Option<String> {
-    std::env::var("ONEDRIVE_CLIENT_ID")
-        .ok()
-        .filter(|value| !value.is_empty())
-        .or_else(|| client_id_from_dotenv(&fs::read_to_string(".env").ok()?))
-        .or_else(|| option_env!("ONEDRIVE_CLIENT_ID").map(str::to_owned))
-        .filter(|value| !value.is_empty())
+    match std::env::var("ONEDRIVE_CLIENT_ID") {
+        Ok(value) => client_id_from_sources(Some(&value), None, None),
+        Err(std::env::VarError::NotUnicode(_)) => None,
+        Err(std::env::VarError::NotPresent) => {
+            let dotenv = fs::read_to_string(".env").ok();
+            client_id_from_sources(None, dotenv.as_deref(), option_env!("ONEDRIVE_CLIENT_ID"))
+        }
+    }
+}
+
+fn client_id_from_sources(
+    explicit: Option<&str>,
+    dotenv: Option<&str>,
+    compiled: Option<&str>,
+) -> Option<String> {
+    if let Some(value) = explicit {
+        return (!value.is_empty()).then(|| value.to_owned());
+    }
+    dotenv.and_then(client_id_from_dotenv).or_else(|| {
+        compiled
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    })
 }
 
 fn client_id_from_dotenv(contents: &str) -> Option<String> {
@@ -765,6 +825,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let scan_in_progress = Arc::new(AtomicBool::new(false));
     let download_in_progress = Arc::new(AtomicBool::new(false));
     let upload_in_progress = Arc::new(AtomicBool::new(false));
+    let local_change_epoch = Arc::new(AtomicU64::new(0));
+    watch_local_root(Arc::clone(&sync), Arc::clone(&local_change_epoch));
     let daemon = Daemon {
         state: Arc::clone(&state),
         login_in_progress: Arc::new(AtomicBool::new(false)),
@@ -773,6 +835,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         scan_in_progress: Arc::clone(&scan_in_progress),
         download_in_progress: Arc::clone(&download_in_progress),
         upload_in_progress: Arc::clone(&upload_in_progress),
+        local_change_epoch,
     };
     let _connection = Builder::session()?
         .name(BUS_NAME)?
@@ -797,7 +860,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::client_id_from_dotenv;
+    use super::{client_id_from_dotenv, client_id_from_sources};
 
     #[test]
     fn reads_client_id_without_matching_other_keys_or_empty_values() {
@@ -805,6 +868,23 @@ mod tests {
         assert_eq!(
             client_id_from_dotenv(contents).as_deref(),
             Some("registered-id")
+        );
+    }
+
+    #[test]
+    fn empty_environment_value_disables_dotenv_fallback() {
+        assert_eq!(
+            client_id_from_sources(
+                Some(""),
+                Some("ONEDRIVE_CLIENT_ID=registered"),
+                Some("built")
+            ),
+            None
+        );
+        assert_eq!(
+            client_id_from_sources(None, Some("ONEDRIVE_CLIENT_ID=registered"), Some("built"))
+                .as_deref(),
+            Some("registered")
         );
     }
 }
