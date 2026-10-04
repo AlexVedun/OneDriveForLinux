@@ -201,6 +201,12 @@ if gdbus call --session \
     --method io.github.onedrive_linux.Daemon.RunQueuedLocalRename >/dev/null 2>&1; then
     exit 1
 fi
+if gdbus call --session \
+    --dest io.github.onedrive_linux.Daemon \
+    --object-path /io/github/onedrive_linux/Daemon \
+    --method io.github.onedrive_linux.Daemon.RunQueuedLocalDelete >/dev/null 2>&1; then
+    exit 1
+fi
 
 if [ "${SMOKE_TEST_LOGIN:-0}" != 1 ]; then
     exit 0

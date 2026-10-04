@@ -168,7 +168,7 @@ pub fn path_is_absent(root: &Path, path: &str) -> bool {
     result < 0 && io::Error::last_os_error().kind() == io::ErrorKind::NotFound
 }
 
-fn split(path: &str) -> Result<(Vec<&str>, &str), RenameError> {
+pub(crate) fn split(path: &str) -> Result<(Vec<&str>, &str), RenameError> {
     let mut parts: Vec<_> = path.split('/').collect();
     if parts.iter().any(|part| !valid_name(part)) {
         return Err(RenameError::Changed);
@@ -177,7 +177,7 @@ fn split(path: &str) -> Result<(Vec<&str>, &str), RenameError> {
     Ok((parts, name))
 }
 
-fn parent(root: &File, parts: &[&str]) -> Result<File, RenameError> {
+pub(crate) fn parent(root: &File, parts: &[&str]) -> Result<File, RenameError> {
     let mut directory = root.try_clone()?;
     for part in parts {
         let name = CString::new(*part).map_err(|_| RenameError::Changed)?;
@@ -198,7 +198,7 @@ fn parent(root: &File, parts: &[&str]) -> Result<File, RenameError> {
     Ok(directory)
 }
 
-fn open_file(parent: &File, name: &str) -> Result<Option<File>, RenameError> {
+pub(crate) fn open_file(parent: &File, name: &str) -> Result<Option<File>, RenameError> {
     let name = CString::new(name).map_err(|_| RenameError::Changed)?;
     // SAFETY: parent is an open directory and name is a valid C string.
     let fd = unsafe {
@@ -226,7 +226,7 @@ fn open_file(parent: &File, name: &str) -> Result<Option<File>, RenameError> {
     Ok(Some(file))
 }
 
-fn digest(file: &mut File) -> Result<String, RenameError> {
+pub(crate) fn digest(file: &mut File) -> Result<String, RenameError> {
     let before = file.metadata()?;
     let mut hash = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];

@@ -1,6 +1,7 @@
 //! Offline sync planning. It never changes local or remote files.
 
 pub mod folders;
+pub mod local_delete;
 pub mod local_rename;
 pub mod monitor;
 pub mod upload;
@@ -547,6 +548,10 @@ impl SyncStore {
                         .as_deref()
                         .is_some_and(|id| !id.is_empty())
                         && operation
+                            .expected_etag
+                            .as_deref()
+                            .is_some_and(|etag| !etag.is_empty())
+                        && operation
                             .local_fingerprint
                             .as_deref()
                             .is_some_and(|hash| !hash.is_empty())
@@ -935,6 +940,31 @@ impl SyncStore {
         Ok(next)
     }
 
+    pub fn claim_local_delete(&mut self) -> Result<Option<QueuedOperation>, SyncError> {
+        let transaction = self.connection.transaction()?;
+        let next = transaction.query_row(
+            "SELECT id, kind, path, remote_id, expected_etag, attempts, local_fingerprint, from_path
+             FROM operation WHERE status = 'pending' AND approved = 1 AND kind = 'DeleteLocal'
+               AND NOT EXISTS (SELECT 1 FROM sync_control WHERE singleton = 1 AND paused = 1)
+             ORDER BY id LIMIT 1",
+            [],
+            |row| Ok(QueuedOperation {
+                id: row.get(0)?, kind: row.get(1)?, path: row.get(2)?,
+                remote_id: row.get(3)?, expected_etag: row.get(4)?,
+                attempts: row.get::<_, u32>(5)? + 1,
+                local_fingerprint: row.get(6)?, from_path: row.get(7)?,
+            }),
+        ).optional()?;
+        if let Some(operation) = &next {
+            transaction.execute(
+                "UPDATE operation SET status = 'running', attempts = attempts + 1 WHERE id = ?1",
+                [operation.id],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(next)
+    }
+
     pub fn claim_remote_folder(&mut self) -> Result<Option<QueuedOperation>, SyncError> {
         let transaction = self.connection.transaction()?;
         let next: Option<QueuedOperation> = transaction
@@ -1167,6 +1197,44 @@ impl SyncStore {
         let changed = transaction.execute(
             "UPDATE operation SET status = 'done', last_error = NULL WHERE id = ?1
              AND status = 'running' AND kind = 'DeleteRemote' AND approved = 1",
+            [operation.id],
+        )?;
+        if changed != 1 {
+            return Err(SyncError::InvalidCheckpoint);
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn finish_local_deleted(&mut self, operation: &QueuedOperation) -> Result<(), SyncError> {
+        if operation.kind != "DeleteLocal"
+            || operation.remote_id.as_deref().is_none_or(str::is_empty)
+            || operation.expected_etag.as_deref().is_none_or(str::is_empty)
+            || operation
+                .local_fingerprint
+                .as_deref()
+                .is_none_or(str::is_empty)
+            || operation.from_path.is_some()
+        {
+            return Err(SyncError::InvalidCheckpoint);
+        }
+        let transaction = self.connection.transaction()?;
+        let deleted = transaction.execute(
+            "DELETE FROM mapping WHERE remote_id = ?1 AND path = ?2
+             AND etag = ?3 AND fingerprint = ?4",
+            params![
+                operation.remote_id,
+                operation.path,
+                operation.expected_etag,
+                operation.local_fingerprint
+            ],
+        )?;
+        if deleted != 1 {
+            return Err(SyncError::InvalidCheckpoint);
+        }
+        let changed = transaction.execute(
+            "UPDATE operation SET status = 'done', last_error = NULL WHERE id = ?1
+             AND status = 'running' AND kind = 'DeleteLocal' AND approved = 1",
             [operation.id],
         )?;
         if changed != 1 {
@@ -1587,13 +1655,18 @@ pub fn plan(
             } else {
                 local.or(local_move).map(|file| file.fingerprint.clone())
             };
+            let expected_etag = if action == Action::DeleteLocal {
+                base.etag.clone()
+            } else {
+                remote.and_then(|file| file.etag.clone())
+            };
             operations.push(PlannedOperation {
                 requires_confirmation: action.requires_confirmation(),
                 action,
                 path,
                 from_path,
                 remote_id: Some(base.remote_id.clone()),
-                expected_etag: remote.and_then(|file| file.etag.clone()),
+                expected_etag,
                 local_fingerprint,
             });
         }
@@ -1768,6 +1841,10 @@ mod tests {
         assert!(local_deleted.operations[0].requires_confirmation);
         let remote_deleted = plan(&[local("report.txt", "old")], &[], &baseline, vec![]);
         assert_eq!(remote_deleted.operations[0].action, Action::DeleteLocal);
+        assert_eq!(
+            remote_deleted.operations[0].expected_etag.as_deref(),
+            Some("v1")
+        );
         assert!(remote_deleted.operations[0].requires_confirmation);
     }
 
@@ -2131,6 +2208,108 @@ mod tests {
             store.finish_remote_deleted(&legacy),
             Err(SyncError::InvalidCheckpoint)
         ));
+    }
+
+    #[test]
+    fn local_delete_requires_approval_and_commits_exact_mapping() {
+        let mut store = SyncStore::in_memory().unwrap();
+        store
+            .confirm_baseline(&base("id", "gone.txt", "v1", "hash"))
+            .unwrap();
+        let id = store
+            .enqueue(&PlannedOperation {
+                action: Action::DeleteLocal,
+                path: "gone.txt".into(),
+                from_path: None,
+                remote_id: Some("id".into()),
+                expected_etag: Some("v1".into()),
+                local_fingerprint: Some("hash".into()),
+                requires_confirmation: true,
+            })
+            .unwrap();
+        assert!(store.claim_local_delete().unwrap().is_none());
+        store.approve_operation(id).unwrap();
+        store.set_paused(true).unwrap();
+        assert!(store.claim_local_delete().unwrap().is_none());
+        store.set_paused(false).unwrap();
+        let operation = store.claim_local_delete().unwrap().unwrap();
+        assert!(store.claim_local_delete().unwrap().is_none());
+        store.finish_local_deleted(&operation).unwrap();
+        assert!(store.baselines().unwrap().is_empty());
+        assert!(matches!(
+            store.finish_local_deleted(&operation),
+            Err(SyncError::InvalidCheckpoint)
+        ));
+    }
+
+    #[test]
+    fn local_delete_rejects_stale_baseline() {
+        let mut store = SyncStore::in_memory().unwrap();
+        store
+            .confirm_baseline(&base("id", "gone.txt", "v2", "hash"))
+            .unwrap();
+        let id = store
+            .enqueue(&PlannedOperation {
+                action: Action::DeleteLocal,
+                path: "gone.txt".into(),
+                from_path: None,
+                remote_id: Some("id".into()),
+                expected_etag: Some("v1".into()),
+                local_fingerprint: Some("hash".into()),
+                requires_confirmation: true,
+            })
+            .unwrap();
+        store.approve_operation(id).unwrap();
+        let operation = store.claim_local_delete().unwrap().unwrap();
+        assert!(matches!(
+            store.finish_local_deleted(&operation),
+            Err(SyncError::InvalidCheckpoint)
+        ));
+        assert_eq!(store.baselines().unwrap()[0].etag.as_deref(), Some("v2"));
+    }
+
+    #[test]
+    fn interrupted_local_delete_recovers_queue_and_mapping() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("sync");
+        let state = directory.path().join("state");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&state).unwrap();
+        fs::write(root.join("gone.txt"), b"content").unwrap();
+        let fingerprint = scan_local(&root).unwrap().0[0].fingerprint.clone();
+        let database = state.join("sync.sqlite3");
+        let id = {
+            let mut store = SyncStore::open(&database).unwrap();
+            store.set_root(&root, &state).unwrap();
+            store
+                .confirm_baseline(&base("id", "gone.txt", "v1", &fingerprint))
+                .unwrap();
+            let id = store
+                .enqueue(&PlannedOperation {
+                    action: Action::DeleteLocal,
+                    path: "gone.txt".into(),
+                    from_path: None,
+                    remote_id: Some("id".into()),
+                    expected_etag: Some("v1".into()),
+                    local_fingerprint: Some(fingerprint),
+                    requires_confirmation: true,
+                })
+                .unwrap();
+            store.approve_operation(id).unwrap();
+            let operation = store.claim_local_delete().unwrap().unwrap();
+            local_delete::quarantine(&root, &state, &operation).unwrap();
+            id
+        };
+        let mut reopened = SyncStore::open(&database).unwrap();
+        let operation = reopened.claim_local_delete().unwrap().unwrap();
+        assert_eq!(operation.id, id);
+        local_delete::quarantine(&root, &state, &operation).unwrap();
+        reopened.finish_local_deleted(&operation).unwrap();
+        assert!(reopened.baselines().unwrap().is_empty());
+        assert_eq!(
+            fs::read(state.join(format!("deleted-files/{id}"))).unwrap(),
+            b"content"
+        );
     }
 
     #[test]
