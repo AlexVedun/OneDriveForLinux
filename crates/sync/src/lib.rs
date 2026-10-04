@@ -139,6 +139,17 @@ pub struct QueuedOperation {
     pub attempts: u32,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ReviewOperation {
+    pub id: i64,
+    pub kind: String,
+    pub path: String,
+    pub from_path: Option<String>,
+    pub remote_id: Option<String>,
+    pub expected_etag: Option<String>,
+    pub can_approve: bool,
+}
+
 /// The upload URL is a preauthenticated secret. Never include it in logs.
 pub struct UploadCheckpoint {
     pub operation_id: i64,
@@ -505,6 +516,65 @@ impl SyncStore {
         Ok(self.pending_count()?.saturating_sub(before))
     }
 
+    /// Queue changes with destructive or remote-move effects for explicit,
+    /// per-operation review. Nothing in this method executes an operation.
+    pub fn enqueue_review_actions(
+        &mut self,
+        remote_items: &[CatalogItem],
+        root_id: &str,
+    ) -> Result<u64, SyncError> {
+        let preview = self.preview(remote_items, Some(root_id))?;
+        let before = self.review_count()?;
+        for operation in preview.operations {
+            let safe = match operation.action {
+                Action::DeleteRemote => {
+                    operation
+                        .remote_id
+                        .as_deref()
+                        .is_some_and(|id| !id.is_empty())
+                        && operation
+                            .expected_etag
+                            .as_deref()
+                            .is_some_and(|etag| !etag.is_empty())
+                }
+                Action::DeleteLocal => {
+                    operation
+                        .remote_id
+                        .as_deref()
+                        .is_some_and(|id| !id.is_empty())
+                        && operation
+                            .local_fingerprint
+                            .as_deref()
+                            .is_some_and(|hash| !hash.is_empty())
+                }
+                Action::RenameRemote => {
+                    operation
+                        .remote_id
+                        .as_deref()
+                        .is_some_and(|id| !id.is_empty())
+                        && operation
+                            .expected_etag
+                            .as_deref()
+                            .is_some_and(|etag| !etag.is_empty())
+                        && operation
+                            .local_fingerprint
+                            .as_deref()
+                            .is_some_and(|hash| !hash.is_empty())
+                        && operation
+                            .from_path
+                            .as_deref()
+                            .is_some_and(|path| !path.is_empty())
+                        && remote_parent_exists(remote_items, root_id, &operation.path)
+                }
+                _ => false,
+            };
+            if safe {
+                self.enqueue(&operation)?;
+            }
+        }
+        Ok(self.review_count()?.saturating_sub(before))
+    }
+
     pub fn prepare_local_folders(
         &self,
         remote_items: &[CatalogItem],
@@ -616,6 +686,42 @@ impl SyncStore {
             |row| row.get(0),
         )?;
         Ok(u64::try_from(count).unwrap_or(0))
+    }
+
+    pub fn review_operations(&self) -> Result<Vec<ReviewOperation>, SyncError> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, kind, path, from_path, remote_id, expected_etag
+             FROM operation WHERE status = 'pending' AND approved = 0 ORDER BY id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            let kind: String = row.get(1)?;
+            let can_approve = matches!(
+                kind.as_str(),
+                "DeleteRemote" | "DeleteLocal" | "RenameRemote"
+            );
+            Ok(ReviewOperation {
+                id: row.get(0)?,
+                kind,
+                path: row.get(2)?,
+                from_path: row.get(3)?,
+                remote_id: row.get(4)?,
+                expected_etag: row.get(5)?,
+                can_approve,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn dismiss_operation(&self, id: i64) -> Result<(), SyncError> {
+        let changed = self.connection.execute(
+            "UPDATE operation SET status = 'dismissed' WHERE id = ?1
+             AND status = 'pending' AND approved = 0",
+            [id],
+        )?;
+        if changed != 1 {
+            return Err(SyncError::InvalidApproval);
+        }
+        Ok(())
     }
 
     /// Only a separately reviewed deletion or remote rename can be approved.
@@ -1867,6 +1973,108 @@ mod tests {
         assert_eq!(store.review_count().unwrap(), 1);
         assert_eq!(store.claim_next().unwrap().unwrap().kind, "DeleteRemote");
         assert!(store.claim_next().unwrap().is_none());
+    }
+
+    #[test]
+    fn review_queue_lists_and_requires_individual_decisions() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("sync");
+        let state = directory.path().join("state");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&state).unwrap();
+        fs::write(root.join("keep.txt"), b"keep").unwrap();
+        fs::write(root.join("moved.txt"), b"move").unwrap();
+        let local = scan_local(&root).unwrap().0;
+        let keep_hash = &local
+            .iter()
+            .find(|file| file.path == "keep.txt")
+            .unwrap()
+            .fingerprint;
+        let move_hash = &local
+            .iter()
+            .find(|file| file.path == "moved.txt")
+            .unwrap()
+            .fingerprint;
+        let mut items = Vec::new();
+        for (id, name) in [
+            ("remote-delete", "missing.txt"),
+            ("remote-rename", "old.txt"),
+        ] {
+            let mut item = folder(id, "root", name);
+            item.kind = "file".into();
+            item.etag = Some("v1".into());
+            item.size = Some(4);
+            items.push(item);
+        }
+        let database = directory.path().join("sync.sqlite3");
+        let mut store = SyncStore::open(&database).unwrap();
+        store.set_root(&root, &state).unwrap();
+        store
+            .confirm_baseline(&base("remote-delete", "missing.txt", "v1", "missing-hash"))
+            .unwrap();
+        store
+            .confirm_baseline(&base("local-delete", "keep.txt", "v1", keep_hash))
+            .unwrap();
+        store
+            .confirm_baseline(&base("remote-rename", "old.txt", "v1", move_hash))
+            .unwrap();
+        assert_eq!(store.enqueue_review_actions(&items, "root").unwrap(), 3);
+        assert_eq!(store.enqueue_review_actions(&items, "root").unwrap(), 0);
+        assert_eq!(store.review_count().unwrap(), 3);
+        assert!(store.claim_next().unwrap().is_none());
+        let review = store.review_operations().unwrap();
+        assert_eq!(review.len(), 3);
+        assert!(review.iter().all(|item| item.can_approve));
+        let rename = review
+            .iter()
+            .find(|item| item.kind == "RenameRemote")
+            .unwrap();
+        assert_eq!(rename.from_path.as_deref(), Some("old.txt"));
+        assert_eq!(rename.path, "moved.txt");
+        let approve_id = review
+            .iter()
+            .find(|item| item.kind == "DeleteRemote")
+            .unwrap()
+            .id;
+        let dismiss_id = review
+            .iter()
+            .find(|item| item.kind == "DeleteLocal")
+            .unwrap()
+            .id;
+        drop(store);
+        let mut reopened = SyncStore::open(&database).unwrap();
+        assert_eq!(reopened.review_count().unwrap(), 3);
+        reopened.approve_operation(approve_id).unwrap();
+        reopened.dismiss_operation(dismiss_id).unwrap();
+        assert!(matches!(
+            reopened.dismiss_operation(dismiss_id),
+            Err(SyncError::InvalidApproval)
+        ));
+        assert_eq!(reopened.review_operations().unwrap().len(), 1);
+        assert_eq!(reopened.claim_next().unwrap().unwrap().kind, "DeleteRemote");
+    }
+
+    #[test]
+    fn conflicts_can_be_listed_and_dismissed_but_not_approved() {
+        let mut store = SyncStore::in_memory().unwrap();
+        let id = store
+            .enqueue(&PlannedOperation {
+                action: Action::Conflict,
+                path: "same.txt".into(),
+                from_path: None,
+                remote_id: Some("id".into()),
+                expected_etag: Some("v2".into()),
+                local_fingerprint: Some("hash".into()),
+                requires_confirmation: true,
+            })
+            .unwrap();
+        assert!(!store.review_operations().unwrap()[0].can_approve);
+        assert!(matches!(
+            store.approve_operation(id),
+            Err(SyncError::InvalidApproval)
+        ));
+        store.dismiss_operation(id).unwrap();
+        assert_eq!(store.review_count().unwrap(), 0);
     }
 
     #[test]
