@@ -135,6 +135,39 @@ pub fn fingerprint_matches(root: &Path, path: &str, expected: &str) -> bool {
     digest(&mut file).is_ok_and(|fingerprint| fingerprint == expected)
 }
 
+/// Missing file is safe only when its parent remains an ordinary directory.
+/// A link, directory, or inaccessible path is never interpreted as deletion.
+pub fn path_is_absent(root: &Path, path: &str) -> bool {
+    let Ok((dirs, name)) = split(path) else {
+        return false;
+    };
+    let Ok(root) = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(root)
+    else {
+        return false;
+    };
+    let Ok(directory) = parent(&root, &dirs) else {
+        return false;
+    };
+    let Ok(name) = CString::new(name) else {
+        return false;
+    };
+    let mut status = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: directory is open, name is a valid C string, and status points
+    // to writable storage for the result.
+    let result = unsafe {
+        libc::fstatat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            status.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    result < 0 && io::Error::last_os_error().kind() == io::ErrorKind::NotFound
+}
+
 fn split(path: &str) -> Result<(Vec<&str>, &str), RenameError> {
     let mut parts: Vec<_> = path.split('/').collect();
     if parts.iter().any(|part| !valid_name(part)) {
@@ -282,5 +315,19 @@ mod tests {
         assert!(!fingerprint_matches(temp.path(), "file", &hash));
         symlink(temp.path().join("file"), temp.path().join("link")).unwrap();
         assert!(!fingerprint_matches(temp.path(), "link", &hash));
+    }
+
+    #[test]
+    fn absence_check_needs_real_parent_and_no_destination() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir(temp.path().join("real")).unwrap();
+        assert!(path_is_absent(temp.path(), "real/missing"));
+        assert!(!path_is_absent(temp.path(), "missing/file"));
+        fs::write(temp.path().join("real/file"), b"data").unwrap();
+        assert!(!path_is_absent(temp.path(), "real/file"));
+        symlink(temp.path().join("real"), temp.path().join("linked")).unwrap();
+        assert!(!path_is_absent(temp.path(), "linked/missing"));
+        symlink(temp.path().join("real/file"), temp.path().join("real/link")).unwrap();
+        assert!(!path_is_absent(temp.path(), "real/link"));
     }
 }

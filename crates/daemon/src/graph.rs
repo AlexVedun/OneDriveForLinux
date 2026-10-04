@@ -117,6 +117,13 @@ pub enum RemoteRenameError {
     NeedsReconcile,
 }
 
+#[derive(Debug)]
+pub enum RemoteDeleteError {
+    Conflict,
+    Retry,
+    NeedsReconcile,
+}
+
 pub struct RemoteRenameInput<'a> {
     pub item_id: &'a str,
     pub source_parent_id: &'a str,
@@ -556,6 +563,78 @@ impl GraphClient {
         }
     }
 
+    fn remote_delete_request(
+        &self,
+        drive_id: &str,
+        item_id: &str,
+        etag: &str,
+        access_token: &str,
+    ) -> Result<reqwest::Request, RemoteDeleteError> {
+        if drive_id.is_empty() || item_id.is_empty() || etag.is_empty() {
+            return Err(RemoteDeleteError::Conflict);
+        }
+        let mut url = reqwest::Url::parse("https://graph.microsoft.com/v1.0/")
+            .map_err(|_| RemoteDeleteError::Retry)?;
+        url.path_segments_mut()
+            .map_err(|_| RemoteDeleteError::Retry)?
+            .pop_if_empty()
+            .extend(["drives", drive_id, "items", item_id]);
+        self.http
+            .delete(url)
+            .bearer_auth(access_token)
+            .header(IF_MATCH, etag)
+            .build()
+            .map_err(|_| RemoteDeleteError::Retry)
+    }
+
+    pub async fn delete_remote_file(
+        &self,
+        drive_id: &str,
+        item_id: &str,
+        parent_id: &str,
+        name: &str,
+        etag: &str,
+        access_token: &str,
+    ) -> Result<(), RemoteDeleteError> {
+        let source_request = self
+            .remote_rename_source_request(drive_id, item_id, access_token)
+            .map_err(|_| RemoteDeleteError::Retry)?;
+        let source_response = self
+            .http
+            .execute(source_request)
+            .await
+            .map_err(|_| RemoteDeleteError::Retry)?;
+        if source_response.status() == StatusCode::NOT_FOUND {
+            return Err(RemoteDeleteError::NeedsReconcile);
+        }
+        if !source_response.status().is_success() {
+            return Err(RemoteDeleteError::Retry);
+        }
+        let source: MovedFile = source_response
+            .json()
+            .await
+            .map_err(|_| RemoteDeleteError::Retry)?;
+        if !moved_file_matches(&source, item_id, parent_id, name)
+            || source.etag.as_deref() != Some(etag)
+        {
+            return Err(RemoteDeleteError::Conflict);
+        }
+        let request = self.remote_delete_request(drive_id, item_id, etag, access_token)?;
+        let response = self
+            .http
+            .execute(request)
+            .await
+            .map_err(|_| RemoteDeleteError::Retry)?;
+        match response.status() {
+            StatusCode::NO_CONTENT => Ok(()),
+            StatusCode::NOT_FOUND => Err(RemoteDeleteError::NeedsReconcile),
+            StatusCode::CONFLICT | StatusCode::PRECONDITION_FAILED | StatusCode::BAD_REQUEST => {
+                Err(RemoteDeleteError::Conflict)
+            }
+            _ => Err(RemoteDeleteError::Retry),
+        }
+    }
+
     fn create_folder_request(
         &self,
         drive_id: &str,
@@ -867,6 +946,24 @@ mod tests {
         }))
         .unwrap();
         assert!(!moved_file_matches(&no_etag, "item", "parent", "new.txt"));
+    }
+
+    #[test]
+    fn remote_delete_uses_item_id_and_if_match() {
+        let graph = GraphClient::new().unwrap();
+        let request = graph
+            .remote_delete_request("drive", "item", "v1", "token")
+            .unwrap();
+        assert_eq!(request.method(), reqwest::Method::DELETE);
+        assert_eq!(request.url().path(), "/v1.0/drives/drive/items/item");
+        assert_eq!(request.headers()[IF_MATCH], "v1");
+        assert!(request.headers().contains_key(AUTHORIZATION));
+        assert!(request.body().is_none());
+        assert!(
+            graph
+                .remote_delete_request("drive", "item", "", "token")
+                .is_err()
+        );
     }
 
     #[test]
