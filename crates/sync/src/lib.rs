@@ -373,7 +373,16 @@ impl SyncStore {
         if !root.is_dir() {
             return Err(SyncError::InvalidRoot);
         }
-        let (local, mut skipped) = scan_local(&root)?;
+        let (mut local, mut skipped) = scan_local(&root)?;
+        // The resumable transport cannot commit a zero-byte range. Keep such
+        // paths out of both upload and deletion planning until a safe empty
+        // file create operation is available.
+        for file in &local {
+            if file.size == 0 {
+                skipped.push(file.path.clone());
+            }
+        }
+        local.retain(|file| file.size != 0);
         let (remote, remote_skipped) = remote_files(remote_items, root_id);
         let mut blocked_paths = skipped.clone();
         let mut baseline = self.baselines()?;
@@ -405,6 +414,31 @@ impl SyncStore {
             .collect();
         skipped.extend(remote_skipped);
         Ok(plan(&local, &remote, &baseline, skipped))
+    }
+
+    /// Queue only upload actions that the current complete catalog can
+    /// execute without replacing an unknown remote item. No network work is
+    /// started here; the caller explicitly requests execution later.
+    pub fn enqueue_safe_uploads(
+        &mut self,
+        remote_items: &[CatalogItem],
+        root_id: &str,
+    ) -> Result<u64, SyncError> {
+        let preview = self.preview(remote_items, Some(root_id))?;
+        let before = self.pending_count()?;
+        for operation in preview.operations {
+            let safe = match operation.action {
+                Action::UploadChanged => {
+                    operation.remote_id.is_some() && operation.expected_etag.is_some()
+                }
+                Action::UploadNew => remote_parent_exists(remote_items, root_id, &operation.path),
+                _ => false,
+            };
+            if safe {
+                self.enqueue(&operation)?;
+            }
+        }
+        Ok(self.pending_count()?.saturating_sub(before))
     }
 
     /// Save a plan before any network work. Actions that need review stay
@@ -1730,6 +1764,80 @@ mod tests {
         let preview = store.preview(&[item], Some("root")).unwrap();
         assert!(preview.operations.is_empty());
         assert_eq!(preview.skipped, ["file.txt"]);
+    }
+
+    #[test]
+    fn empty_local_file_is_skipped_without_upload_or_delete() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("sync");
+        let state = directory.path().join("state");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&state).unwrap();
+        fs::write(root.join("empty.txt"), b"").unwrap();
+        let store = SyncStore::in_memory().unwrap();
+        store.set_root(&root, &state).unwrap();
+        store
+            .confirm_baseline(&base("id", "empty.txt", "v1", "old-hash"))
+            .unwrap();
+        let item = CatalogItem {
+            drive_id: "drive".into(),
+            item_id: "id".into(),
+            parent_id: Some("root".into()),
+            name: Some("empty.txt".into()),
+            kind: "file".into(),
+            size: Some(0),
+            etag: Some("v1".into()),
+            ctag: None,
+            modified: None,
+            deleted: false,
+        };
+        let preview = store.preview(&[item], Some("root")).unwrap();
+        assert!(preview.operations.is_empty());
+        assert_eq!(preview.skipped, ["empty.txt"]);
+    }
+
+    #[test]
+    fn safe_upload_batch_skips_empty_missing_parent_and_repeats() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("sync");
+        let state = directory.path().join("state");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&state).unwrap();
+        fs::create_dir(root.join("Docs")).unwrap();
+        fs::create_dir(root.join("Missing")).unwrap();
+        fs::write(root.join("new.txt"), b"new").unwrap();
+        fs::write(root.join("Docs/nested.txt"), b"nested").unwrap();
+        fs::write(root.join("Missing/unavailable.txt"), b"missing").unwrap();
+        fs::write(root.join("empty.txt"), b"").unwrap();
+        fs::write(root.join("matched.txt"), b"changed").unwrap();
+        let items = [
+            folder("docs", "root", "Docs"),
+            CatalogItem {
+                drive_id: "drive".into(),
+                item_id: "existing".into(),
+                parent_id: Some("root".into()),
+                name: Some("matched.txt".into()),
+                kind: "file".into(),
+                size: Some(7),
+                etag: Some("v1".into()),
+                ctag: None,
+                modified: None,
+                deleted: false,
+            },
+        ];
+        let mut store = SyncStore::in_memory().unwrap();
+        store.set_root(&root, &state).unwrap();
+        store
+            .confirm_baseline(&base("existing", "matched.txt", "v1", "old-hash"))
+            .unwrap();
+        assert_eq!(store.enqueue_safe_uploads(&items, "root").unwrap(), 3);
+        assert_eq!(store.enqueue_safe_uploads(&items, "root").unwrap(), 0);
+        let mut paths = Vec::new();
+        while let Some(operation) = store.claim_upload().unwrap() {
+            paths.push(operation.path);
+        }
+        paths.sort();
+        assert_eq!(paths, ["Docs/nested.txt", "matched.txt", "new.txt"]);
     }
 
     #[test]
