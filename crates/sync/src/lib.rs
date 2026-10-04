@@ -441,6 +441,33 @@ impl SyncStore {
         Ok(self.pending_count()?.saturating_sub(before))
     }
 
+    /// Queue downloads only when the current local parent is an ordinary
+    /// directory and the remote version can be checked before writing.
+    /// Execution still requires a separate request.
+    pub fn enqueue_safe_downloads(
+        &mut self,
+        remote_items: &[CatalogItem],
+        root_id: &str,
+    ) -> Result<u64, SyncError> {
+        let preview = self.preview(remote_items, Some(root_id))?;
+        let root = self.root()?.ok_or(SyncError::InvalidRoot)?;
+        let before = self.pending_count()?;
+        for operation in preview.operations {
+            let safe = matches!(
+                operation.action,
+                Action::DownloadNew | Action::DownloadChanged
+            ) && operation.remote_id.is_some()
+                && operation.expected_etag.is_some()
+                && (operation.action != Action::DownloadChanged
+                    || operation.local_fingerprint.is_some())
+                && safe_download_destination(&root, &operation.path, &operation.action);
+            if safe {
+                self.enqueue(&operation)?;
+            }
+        }
+        Ok(self.pending_count()?.saturating_sub(before))
+    }
+
     /// Save a plan before any network work. Actions that need review stay
     /// unapproved regardless of the caller-supplied preview flag.
     pub fn enqueue(&mut self, operation: &PlannedOperation) -> Result<i64, SyncError> {
@@ -817,6 +844,26 @@ fn valid_name(name: &str) -> bool {
         && !name
             .chars()
             .any(|character| "\"*:<>?/\\|".contains(character) || character.is_control())
+}
+
+fn safe_download_destination(root: &Path, relative: &str, action: &Action) -> bool {
+    let parts: Vec<_> = relative.split('/').collect();
+    if parts.is_empty() || parts.iter().any(|part| !valid_name(part)) {
+        return false;
+    }
+    let mut parent = root.to_path_buf();
+    for part in &parts[..parts.len() - 1] {
+        parent.push(part);
+        if !fs::symlink_metadata(&parent).is_ok_and(|metadata| metadata.is_dir()) {
+            return false;
+        }
+    }
+    let target = parent.join(parts[parts.len() - 1]);
+    match (action, fs::symlink_metadata(target)) {
+        (Action::DownloadNew, Err(error)) => error.kind() == io::ErrorKind::NotFound,
+        (Action::DownloadChanged, Ok(metadata)) => metadata.is_file(),
+        _ => false,
+    }
 }
 
 /// Accept an upload path only when every parent is a uniquely identified
@@ -1838,6 +1885,118 @@ mod tests {
         }
         paths.sort();
         assert_eq!(paths, ["Docs/nested.txt", "matched.txt", "new.txt"]);
+    }
+
+    #[test]
+    fn safe_download_batch_requires_version_and_existing_local_parent() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("sync");
+        let state = directory.path().join("state");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&state).unwrap();
+        fs::write(root.join("changed.txt"), b"old").unwrap();
+        fs::create_dir(root.join("occupied.txt")).unwrap();
+        let items = [
+            CatalogItem {
+                drive_id: "drive".into(),
+                item_id: "changed".into(),
+                parent_id: Some("root".into()),
+                name: Some("changed.txt".into()),
+                kind: "file".into(),
+                size: Some(3),
+                etag: Some("v2".into()),
+                ctag: None,
+                modified: None,
+                deleted: false,
+            },
+            CatalogItem {
+                drive_id: "drive".into(),
+                item_id: "new".into(),
+                parent_id: Some("root".into()),
+                name: Some("new.txt".into()),
+                kind: "file".into(),
+                size: Some(3),
+                etag: Some("v1".into()),
+                ctag: None,
+                modified: None,
+                deleted: false,
+            },
+            CatalogItem {
+                drive_id: "drive".into(),
+                item_id: "unversioned".into(),
+                parent_id: Some("root".into()),
+                name: Some("unversioned.txt".into()),
+                kind: "file".into(),
+                size: Some(3),
+                etag: None,
+                ctag: None,
+                modified: None,
+                deleted: false,
+            },
+            CatalogItem {
+                drive_id: "drive".into(),
+                item_id: "occupied".into(),
+                parent_id: Some("root".into()),
+                name: Some("occupied.txt".into()),
+                kind: "file".into(),
+                size: Some(3),
+                etag: Some("v1".into()),
+                ctag: None,
+                modified: None,
+                deleted: false,
+            },
+            folder("remote-folder", "root", "Missing"),
+            CatalogItem {
+                drive_id: "drive".into(),
+                item_id: "nested".into(),
+                parent_id: Some("remote-folder".into()),
+                name: Some("nested.txt".into()),
+                kind: "file".into(),
+                size: Some(3),
+                etag: Some("v1".into()),
+                ctag: None,
+                modified: None,
+                deleted: false,
+            },
+        ];
+        let mut store = SyncStore::in_memory().unwrap();
+        store.set_root(&root, &state).unwrap();
+        let fingerprint = scan_local(&root)
+            .unwrap()
+            .0
+            .into_iter()
+            .find(|file| file.path == "changed.txt")
+            .unwrap()
+            .fingerprint;
+        store
+            .confirm_baseline(&base("changed", "changed.txt", "v1", &fingerprint))
+            .unwrap();
+        assert_eq!(store.enqueue_safe_downloads(&items, "root").unwrap(), 2);
+        assert_eq!(store.enqueue_safe_downloads(&items, "root").unwrap(), 0);
+        assert_eq!(store.pending_count().unwrap(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn download_destination_rejects_symlink_parent_and_target() {
+        use std::os::unix::fs::symlink;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("sync");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(root.join("real")).unwrap();
+        fs::write(root.join("real/file.txt"), b"old").unwrap();
+        symlink(root.join("real"), root.join("linked")).unwrap();
+        symlink(root.join("real/file.txt"), root.join("target.txt")).unwrap();
+        assert!(!safe_download_destination(
+            &root,
+            "linked/new.txt",
+            &Action::DownloadNew
+        ));
+        assert!(!safe_download_destination(
+            &root,
+            "target.txt",
+            &Action::DownloadChanged
+        ));
     }
 
     #[test]
