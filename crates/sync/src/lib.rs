@@ -715,6 +715,40 @@ impl SyncStore {
         Ok(next)
     }
 
+    pub fn claim_remote_folder(&mut self) -> Result<Option<QueuedOperation>, SyncError> {
+        let transaction = self.connection.transaction()?;
+        let next: Option<QueuedOperation> = transaction
+            .query_row(
+                "SELECT id, kind, path, remote_id, expected_etag, attempts, local_fingerprint, from_path
+                 FROM operation WHERE status = 'pending' AND approved = 1
+                   AND kind = 'CreateRemoteFolder'
+                   AND NOT EXISTS (SELECT 1 FROM sync_control WHERE singleton = 1 AND paused = 1)
+                 ORDER BY id LIMIT 1",
+                [],
+                |row| {
+                    Ok(QueuedOperation {
+                        id: row.get(0)?,
+                        kind: row.get(1)?,
+                        path: row.get(2)?,
+                        remote_id: row.get(3)?,
+                        expected_etag: row.get(4)?,
+                        attempts: row.get::<_, u32>(5)? + 1,
+                        local_fingerprint: row.get(6)?,
+                        from_path: row.get(7)?,
+                    })
+                },
+            )
+            .optional()?;
+        if let Some(operation) = &next {
+            transaction.execute(
+                "UPDATE operation SET status = 'running', attempts = attempts + 1 WHERE id = ?1",
+                [operation.id],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(next)
+    }
+
     pub fn mark_blocked(&self, id: i64, reason: &str) -> Result<(), SyncError> {
         self.connection.execute(
             "UPDATE operation SET status = 'blocked', last_error = ?2 WHERE id = ?1 AND status = 'running'",

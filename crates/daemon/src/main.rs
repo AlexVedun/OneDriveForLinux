@@ -3,15 +3,18 @@ mod graph;
 mod transfer;
 
 use auth::LoginAttempt;
-use graph::{GraphClient, GraphUpload, QueuedDownloadError, QueuedDownloadTarget};
+use graph::{
+    FolderCreateError, GraphClient, GraphUpload, QueuedDownloadError, QueuedDownloadTarget,
+};
 use keyring::v1::Entry;
 use oauth2::{TokenResponse, basic::BasicTokenResponse};
-use onedrive_catalog::{Catalog, FetchError};
+use onedrive_catalog::{Catalog, CatalogItem, FetchError};
 use onedrive_core::{BUS_NAME, EngineState, OBJECT_PATH};
 use onedrive_sync::{
-    Action, SyncStore,
+    Action, QueuedOperation, SyncStore,
+    folders::local_directory_exists,
     monitor::LocalMonitor,
-    remote_files, remote_parent_exists,
+    remote_files, remote_parent_exists, remote_parent_id,
     upload::{UploadError, UploadStep, upload_queued},
 };
 use std::fs::{self, OpenOptions};
@@ -324,6 +327,138 @@ impl Daemon {
             path.to_owned(),
         )
         .await
+    }
+
+    async fn run_queued_remote_folder(&self) -> zbus::fdo::Result<i64> {
+        if std::env::var("ONEDRIVE_EXPERIMENTAL_UPLOAD").as_deref() != Ok("1") {
+            return Err(zbus::fdo::Error::Failed(
+                "remote folder creation is experimental and disabled".to_owned(),
+            ));
+        }
+        if self.sync_paused()? {
+            return Err(zbus::fdo::Error::Failed("sync is paused".to_owned()));
+        }
+        let client_id = client_id().ok_or_else(|| {
+            zbus::fdo::Error::Failed("ONEDRIVE_CLIENT_ID is not configured".to_owned())
+        })?;
+        if self.scan_in_progress.load(Ordering::SeqCst)
+            || self.download_in_progress.load(Ordering::SeqCst)
+            || self
+                .upload_in_progress
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+        {
+            return Err(zbus::fdo::Error::Failed(
+                "another transfer is running".to_owned(),
+            ));
+        }
+        let prepare = async {
+            let token = access_token(&client_id)
+                .await
+                .map_err(|_| zbus::fdo::Error::Failed("login is required".to_owned()))?;
+            let catalog = self.catalog.lock().unwrap();
+            let drive_id = catalog
+                .active_drive_id()
+                .map_err(|_| zbus::fdo::Error::Failed("cannot read catalog".to_owned()))?
+                .ok_or_else(|| zbus::fdo::Error::Failed("OneDrive catalog is empty".to_owned()))?;
+            if !catalog
+                .is_complete(&drive_id)
+                .map_err(|_| zbus::fdo::Error::Failed("cannot read catalog cursor".to_owned()))?
+            {
+                return Err(zbus::fdo::Error::Failed(
+                    "catalog scan is incomplete".to_owned(),
+                ));
+            }
+            let items = catalog
+                .items(&drive_id)
+                .map_err(|_| zbus::fdo::Error::Failed("cannot read catalog".to_owned()))?;
+            let root_id = catalog
+                .root_id(&drive_id)
+                .map_err(|_| zbus::fdo::Error::Failed("cannot read drive root".to_owned()))?
+                .ok_or_else(|| {
+                    zbus::fdo::Error::Failed("OneDrive root ID is missing".to_owned())
+                })?;
+            let (operation, root) = {
+                let mut sync = self.sync.lock().unwrap();
+                sync.ensure_drive(&drive_id)
+                    .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
+                let root = sync
+                    .root()
+                    .map_err(|_| zbus::fdo::Error::Failed("cannot read sync root".to_owned()))?
+                    .ok_or_else(|| {
+                        zbus::fdo::Error::Failed("sync root is not configured".to_owned())
+                    })?;
+                let operation = sync
+                    .claim_remote_folder()
+                    .map_err(|_| zbus::fdo::Error::Failed("cannot read folder queue".to_owned()))?
+                    .ok_or_else(|| {
+                        zbus::fdo::Error::Failed("no remote folder is pending".to_owned())
+                    })?;
+                (operation, root)
+            };
+            let candidate = remote_folder_candidate(&items, &root_id, &root, &operation);
+            let Some((parent_id, name)) = candidate else {
+                self.sync
+                    .lock()
+                    .unwrap()
+                    .mark_blocked(operation.id, "remote folder needs review")
+                    .map_err(|_| {
+                        zbus::fdo::Error::Failed("cannot block stale folder".to_owned())
+                    })?;
+                return Err(zbus::fdo::Error::Failed(
+                    "remote folder needs review".to_owned(),
+                ));
+            };
+            Ok::<_, zbus::fdo::Error>((token, drive_id, operation, parent_id, name))
+        }
+        .await;
+        let (token, drive_id, operation, parent_id, name) = match prepare {
+            Ok(value) => value,
+            Err(error) => {
+                self.upload_in_progress.store(false, Ordering::SeqCst);
+                return Err(error);
+            }
+        };
+        let id = operation.id;
+        let sync = Arc::clone(&self.sync);
+        let state = Arc::clone(&self.state);
+        let in_progress = Arc::clone(&self.upload_in_progress);
+        tokio::spawn(async move {
+            *state.lock().unwrap() = EngineState::Transferring;
+            let result = async {
+                let graph = GraphClient::new().map_err(|_| FolderCreateError::Retry)?;
+                graph
+                    .create_remote_folder(&drive_id, &parent_id, &name, &token)
+                    .await?;
+                sync.lock()
+                    .unwrap()
+                    .mark_done(id)
+                    .map_err(|_| FolderCreateError::NeedsReconcile)
+            }
+            .await;
+            if let Err(error) = &result {
+                let update = match error {
+                    FolderCreateError::Conflict | FolderCreateError::NeedsReconcile => sync
+                        .lock()
+                        .unwrap()
+                        .mark_blocked(id, "remote folder needs reconciliation"),
+                    FolderCreateError::Retry => sync
+                        .lock()
+                        .unwrap()
+                        .mark_retry(id, "remote folder creation failed; retry is possible"),
+                };
+                if update.is_err() {
+                    eprintln!("cannot update remote folder queue status");
+                }
+            }
+            *state.lock().unwrap() = if result.is_ok() {
+                EngineState::Connected
+            } else {
+                EngineState::Error
+            };
+            in_progress.store(false, Ordering::SeqCst);
+        });
+        Ok(id)
     }
 
     async fn run_queued_upload(&self) -> zbus::fdo::Result<i64> {
@@ -812,6 +947,36 @@ async fn queue_upload_candidate(
     .map_err(|_| zbus::fdo::Error::Failed("queue task failed".to_owned()))?
 }
 
+fn remote_folder_candidate(
+    items: &[CatalogItem],
+    root_id: &str,
+    root: &std::path::Path,
+    operation: &QueuedOperation,
+) -> Option<(String, String)> {
+    if operation.kind != "CreateRemoteFolder" {
+        return None;
+    }
+    let parent_id = remote_parent_id(items, root_id, &operation.path)?;
+    if operation.remote_id.as_deref() != Some(parent_id)
+        || !local_directory_exists(root, &operation.path).ok()?
+    {
+        return None;
+    }
+    let name = operation.path.rsplit('/').next()?;
+    let folded = name.to_lowercase();
+    if items.iter().any(|item| {
+        !item.deleted
+            && item.parent_id.as_deref() == Some(parent_id)
+            && item
+                .name
+                .as_deref()
+                .is_some_and(|other| other.to_lowercase() == folded)
+    }) {
+        return None;
+    }
+    Some((parent_id.to_owned(), name.to_owned()))
+}
+
 fn watch_local_root(sync: Arc<Mutex<SyncStore>>, epoch: Arc<AtomicU64>) {
     std::thread::spawn(move || {
         let mut watched_root: Option<PathBuf> = None;
@@ -1176,7 +1341,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{client_id_from_dotenv, client_id_from_sources};
+    use super::{
+        CatalogItem, QueuedOperation, client_id_from_dotenv, client_id_from_sources,
+        remote_folder_candidate,
+    };
+
+    #[test]
+    fn queued_folder_is_rechecked_before_graph_write() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("Notes")).unwrap();
+        let operation = QueuedOperation {
+            id: 1,
+            kind: "CreateRemoteFolder".into(),
+            path: "Notes".into(),
+            from_path: None,
+            remote_id: Some("root".into()),
+            expected_etag: None,
+            local_fingerprint: None,
+            attempts: 1,
+        };
+        assert_eq!(
+            remote_folder_candidate(&[], "root", temp.path(), &operation),
+            Some(("root".into(), "Notes".into()))
+        );
+        let mut wrong_parent = operation.clone();
+        wrong_parent.remote_id = Some("other".into());
+        assert!(remote_folder_candidate(&[], "root", temp.path(), &wrong_parent).is_none());
+        let occupied = CatalogItem {
+            drive_id: "drive".into(),
+            item_id: "other".into(),
+            parent_id: Some("root".into()),
+            name: Some("notes".into()),
+            kind: "file".into(),
+            size: Some(1),
+            etag: None,
+            ctag: None,
+            modified: None,
+            deleted: false,
+        };
+        assert!(remote_folder_candidate(&[occupied], "root", temp.path(), &operation).is_none());
+        std::fs::remove_dir(temp.path().join("Notes")).unwrap();
+        assert!(remote_folder_candidate(&[], "root", temp.path(), &operation).is_none());
+    }
 
     #[test]
     fn reads_client_id_without_matching_other_keys_or_empty_values() {

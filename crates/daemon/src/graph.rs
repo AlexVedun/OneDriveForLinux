@@ -55,6 +55,38 @@ struct DownloadItemVersion {
     file: Option<serde_json::Value>,
 }
 
+#[derive(Deserialize)]
+struct CreatedFolder {
+    id: String,
+    name: String,
+    folder: Option<serde_json::Value>,
+    #[serde(rename = "parentReference")]
+    parent_reference: Option<FolderParent>,
+}
+
+#[derive(Deserialize)]
+struct FolderParent {
+    id: Option<String>,
+}
+
+fn created_folder_matches(folder: &CreatedFolder, name: &str, parent_id: &str) -> bool {
+    !folder.id.is_empty()
+        && folder.name == name
+        && folder.folder.is_some()
+        && folder
+            .parent_reference
+            .as_ref()
+            .and_then(|parent| parent.id.as_deref())
+            .is_none_or(|id| id == parent_id)
+}
+
+#[derive(Debug)]
+pub enum FolderCreateError {
+    Conflict,
+    Retry,
+    NeedsReconcile,
+}
+
 #[derive(Debug)]
 pub enum QueuedDownloadError {
     Changed,
@@ -357,6 +389,65 @@ impl GraphClient {
         })
     }
 
+    fn create_folder_request(
+        &self,
+        drive_id: &str,
+        parent_id: &str,
+        name: &str,
+        access_token: &str,
+    ) -> Result<reqwest::Request, FolderCreateError> {
+        if drive_id.is_empty() || parent_id.is_empty() || !valid_new_file_name(name) {
+            return Err(FolderCreateError::Conflict);
+        }
+        let mut url = reqwest::Url::parse("https://graph.microsoft.com/v1.0/")
+            .map_err(|_| FolderCreateError::Retry)?;
+        url.path_segments_mut()
+            .map_err(|_| FolderCreateError::Retry)?
+            .pop_if_empty()
+            .extend(["drives", drive_id, "items", parent_id, "children"]);
+        self.http
+            .post(url)
+            .bearer_auth(access_token)
+            .json(&serde_json::json!({
+                "name": name,
+                "folder": {},
+                "@microsoft.graph.conflictBehavior": "fail",
+            }))
+            .build()
+            .map_err(|_| FolderCreateError::Retry)
+    }
+
+    pub async fn create_remote_folder(
+        &self,
+        drive_id: &str,
+        parent_id: &str,
+        name: &str,
+        access_token: &str,
+    ) -> Result<String, FolderCreateError> {
+        let request = self.create_folder_request(drive_id, parent_id, name, access_token)?;
+        let response = self
+            .http
+            .execute(request)
+            .await
+            .map_err(|_| FolderCreateError::Retry)?;
+        match response.status() {
+            StatusCode::CREATED => {
+                let folder: CreatedFolder = response
+                    .json()
+                    .await
+                    .map_err(|_| FolderCreateError::NeedsReconcile)?;
+                if !created_folder_matches(&folder, name, parent_id) {
+                    return Err(FolderCreateError::NeedsReconcile);
+                }
+                Ok(folder.id)
+            }
+            StatusCode::CONFLICT | StatusCode::PRECONDITION_FAILED | StatusCode::BAD_REQUEST => {
+                Err(FolderCreateError::Conflict)
+            }
+            _ => Err(FolderCreateError::Retry),
+        }
+    }
+
     pub async fn drive_id(&self, access_token: &str) -> Result<String, FetchError> {
         let response = self.get_with_retry(DRIVE_URL, access_token).await?;
         let drive: Drive = response.json().await.map_err(|_| FetchError::Failed)?;
@@ -561,6 +652,41 @@ impl GraphClient {
 mod tests {
     use super::*;
     use reqwest::header::AUTHORIZATION;
+
+    #[test]
+    fn folder_creation_uses_parent_id_and_fails_on_name_conflict() {
+        let graph = GraphClient::new().unwrap();
+        let request = graph
+            .create_folder_request("drive", "parent", "My Notes", "token")
+            .unwrap();
+        assert_eq!(
+            request.url().path(),
+            "/v1.0/drives/drive/items/parent/children"
+        );
+        assert!(request.headers().contains_key(AUTHORIZATION));
+        let body: serde_json::Value =
+            serde_json::from_slice(request.body().unwrap().as_bytes().unwrap()).unwrap();
+        assert_eq!(body["name"], "My Notes");
+        assert_eq!(body["folder"], serde_json::json!({}));
+        assert_eq!(body["@microsoft.graph.conflictBehavior"], "fail");
+        assert!(
+            graph
+                .create_folder_request("drive", "parent", "bad:name", "token")
+                .is_err()
+        );
+        let created: CreatedFolder = serde_json::from_value(serde_json::json!({
+            "id": "new-id", "name": "My Notes", "folder": {},
+            "parentReference": { "id": "parent" }
+        }))
+        .unwrap();
+        assert!(created_folder_matches(&created, "My Notes", "parent"));
+        assert!(!created_folder_matches(&created, "other", "parent"));
+        assert!(!created_folder_matches(
+            &created,
+            "My Notes",
+            "other-parent"
+        ));
+    }
 
     #[test]
     fn queued_download_requires_exact_remote_version() {
