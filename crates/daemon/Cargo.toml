@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 keyring = "4.2"
+libc = "0.2"
 onedrive-catalog = { path = "../catalog" }
 onedrive-core = { path = "../core" }
 onedrive-sync = { path = "../sync" }
