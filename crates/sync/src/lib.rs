@@ -881,6 +881,31 @@ impl SyncStore {
         Ok(next)
     }
 
+    pub fn claim_remote_rename(&mut self) -> Result<Option<QueuedOperation>, SyncError> {
+        let transaction = self.connection.transaction()?;
+        let next = transaction.query_row(
+            "SELECT id, kind, path, remote_id, expected_etag, attempts, local_fingerprint, from_path
+             FROM operation WHERE status = 'pending' AND approved = 1 AND kind = 'RenameRemote'
+               AND NOT EXISTS (SELECT 1 FROM sync_control WHERE singleton = 1 AND paused = 1)
+             ORDER BY id LIMIT 1",
+            [],
+            |row| Ok(QueuedOperation {
+                id: row.get(0)?, kind: row.get(1)?, path: row.get(2)?,
+                remote_id: row.get(3)?, expected_etag: row.get(4)?,
+                attempts: row.get::<_, u32>(5)? + 1,
+                local_fingerprint: row.get(6)?, from_path: row.get(7)?,
+            }),
+        ).optional()?;
+        if let Some(operation) = &next {
+            transaction.execute(
+                "UPDATE operation SET status = 'running', attempts = attempts + 1 WHERE id = ?1",
+                [operation.id],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(next)
+    }
+
     pub fn claim_remote_folder(&mut self) -> Result<Option<QueuedOperation>, SyncError> {
         let transaction = self.connection.transaction()?;
         let next: Option<QueuedOperation> = transaction
@@ -1029,6 +1054,52 @@ impl SyncStore {
         let changed = transaction.execute(
             "UPDATE operation SET status = 'done', last_error = NULL
              WHERE id = ?1 AND status = 'running' AND kind = 'RenameLocal'",
+            [operation.id],
+        )?;
+        if changed != 1 {
+            return Err(SyncError::InvalidCheckpoint);
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn finish_remote_rename(
+        &mut self,
+        operation: &QueuedOperation,
+        new_etag: &str,
+    ) -> Result<(), SyncError> {
+        if operation.kind != "RenameRemote"
+            || new_etag.is_empty()
+            || operation.remote_id.as_deref().is_none_or(str::is_empty)
+            || operation.expected_etag.as_deref().is_none_or(str::is_empty)
+            || operation
+                .local_fingerprint
+                .as_deref()
+                .is_none_or(str::is_empty)
+            || operation.from_path.as_deref().is_none_or(str::is_empty)
+            || operation.from_path.as_deref() == Some(operation.path.as_str())
+        {
+            return Err(SyncError::InvalidCheckpoint);
+        }
+        let transaction = self.connection.transaction()?;
+        let changed = transaction.execute(
+            "UPDATE mapping SET path = ?1, etag = ?2 WHERE remote_id = ?3 AND path = ?4
+             AND etag = ?5 AND fingerprint = ?6",
+            params![
+                operation.path,
+                new_etag,
+                operation.remote_id,
+                operation.from_path,
+                operation.expected_etag,
+                operation.local_fingerprint
+            ],
+        )?;
+        if changed != 1 {
+            return Err(SyncError::InvalidCheckpoint);
+        }
+        let changed = transaction.execute(
+            "UPDATE operation SET status = 'done', last_error = NULL WHERE id = ?1
+             AND status = 'running' AND kind = 'RenameRemote' AND approved = 1",
             [operation.id],
         )?;
         if changed != 1 {
@@ -1853,6 +1924,73 @@ mod tests {
             store.finish_local_rename(&claimed),
             Err(SyncError::InvalidCheckpoint)
         ));
+    }
+
+    #[test]
+    fn remote_rename_requires_approval_and_commits_new_version_atomically() {
+        let mut store = SyncStore::in_memory().unwrap();
+        store
+            .confirm_baseline(&base("id", "old.txt", "v1", "hash"))
+            .unwrap();
+        let id = store
+            .enqueue(&PlannedOperation {
+                action: Action::RenameRemote,
+                path: "new.txt".into(),
+                from_path: Some("old.txt".into()),
+                remote_id: Some("id".into()),
+                expected_etag: Some("v1".into()),
+                local_fingerprint: Some("hash".into()),
+                requires_confirmation: false,
+            })
+            .unwrap();
+        assert!(store.claim_remote_rename().unwrap().is_none());
+        store.approve_operation(id).unwrap();
+        store.set_paused(true).unwrap();
+        assert!(store.claim_remote_rename().unwrap().is_none());
+        store.set_paused(false).unwrap();
+        let operation = store.claim_remote_rename().unwrap().unwrap();
+        assert_eq!(operation.from_path.as_deref(), Some("old.txt"));
+        assert!(store.claim_remote_rename().unwrap().is_none());
+        assert!(matches!(
+            store.finish_remote_rename(&operation, ""),
+            Err(SyncError::InvalidCheckpoint)
+        ));
+        assert_eq!(store.baselines().unwrap()[0].path, "old.txt");
+        store.finish_remote_rename(&operation, "v2").unwrap();
+        assert_eq!(
+            store.baselines().unwrap()[0],
+            base("id", "new.txt", "v2", "hash")
+        );
+        assert!(matches!(
+            store.finish_remote_rename(&operation, "v3"),
+            Err(SyncError::InvalidCheckpoint)
+        ));
+    }
+
+    #[test]
+    fn remote_rename_rejects_stale_baseline() {
+        let mut store = SyncStore::in_memory().unwrap();
+        store
+            .confirm_baseline(&base("id", "old.txt", "v2", "hash"))
+            .unwrap();
+        let id = store
+            .enqueue(&PlannedOperation {
+                action: Action::RenameRemote,
+                path: "new.txt".into(),
+                from_path: Some("old.txt".into()),
+                remote_id: Some("id".into()),
+                expected_etag: Some("v1".into()),
+                local_fingerprint: Some("hash".into()),
+                requires_confirmation: true,
+            })
+            .unwrap();
+        store.approve_operation(id).unwrap();
+        let operation = store.claim_remote_rename().unwrap().unwrap();
+        assert!(matches!(
+            store.finish_remote_rename(&operation, "v3"),
+            Err(SyncError::InvalidCheckpoint)
+        ));
+        assert_eq!(store.baselines().unwrap()[0].path, "old.txt");
     }
 
     #[test]

@@ -115,6 +115,26 @@ pub fn apply(root: &Path, operation: &QueuedOperation) -> Result<(), RenameError
     }
 }
 
+pub fn fingerprint_matches(root: &Path, path: &str, expected: &str) -> bool {
+    let Ok((dirs, name)) = split(path) else {
+        return false;
+    };
+    let Ok(root) = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(root)
+    else {
+        return false;
+    };
+    let Ok(directory) = parent(&root, &dirs) else {
+        return false;
+    };
+    let Ok(Some(mut file)) = open_file(&directory, name) else {
+        return false;
+    };
+    digest(&mut file).is_ok_and(|fingerprint| fingerprint == expected)
+}
+
 fn split(path: &str) -> Result<(Vec<&str>, &str), RenameError> {
     let mut parts: Vec<_> = path.split('/').collect();
     if parts.iter().any(|part| !valid_name(part)) {
@@ -250,5 +270,17 @@ mod tests {
             apply(temp.path(), &operation("old", "new")),
             Err(RenameError::Changed)
         ));
+    }
+
+    #[test]
+    fn fingerprint_check_rejects_changed_file_and_link() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("file"), b"content").unwrap();
+        let hash = format!("{:x}", Sha256::digest(b"content"));
+        assert!(fingerprint_matches(temp.path(), "file", &hash));
+        fs::write(temp.path().join("file"), b"changed").unwrap();
+        assert!(!fingerprint_matches(temp.path(), "file", &hash));
+        symlink(temp.path().join("file"), temp.path().join("link")).unwrap();
+        assert!(!fingerprint_matches(temp.path(), "link", &hash));
     }
 }

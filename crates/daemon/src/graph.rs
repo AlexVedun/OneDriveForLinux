@@ -69,6 +69,29 @@ struct FolderParent {
     id: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct MovedFile {
+    id: String,
+    name: String,
+    #[serde(rename = "eTag")]
+    etag: Option<String>,
+    file: Option<serde_json::Value>,
+    #[serde(rename = "parentReference")]
+    parent_reference: Option<FolderParent>,
+}
+
+fn moved_file_matches(item: &MovedFile, id: &str, parent_id: &str, name: &str) -> bool {
+    item.id == id
+        && item.name == name
+        && item.file.is_some()
+        && item.etag.as_deref().is_some_and(|etag| !etag.is_empty())
+        && item
+            .parent_reference
+            .as_ref()
+            .and_then(|parent| parent.id.as_deref())
+            == Some(parent_id)
+}
+
 fn created_folder_matches(folder: &CreatedFolder, name: &str, parent_id: &str) -> bool {
     !folder.id.is_empty()
         && folder.name == name
@@ -85,6 +108,22 @@ pub enum FolderCreateError {
     Conflict,
     Retry,
     NeedsReconcile,
+}
+
+#[derive(Debug)]
+pub enum RemoteRenameError {
+    Conflict,
+    Retry,
+    NeedsReconcile,
+}
+
+pub struct RemoteRenameInput<'a> {
+    pub item_id: &'a str,
+    pub source_parent_id: &'a str,
+    pub source_name: &'a str,
+    pub target_parent_id: &'a str,
+    pub target_name: &'a str,
+    pub etag: &'a str,
 }
 
 #[derive(Debug)]
@@ -389,6 +428,134 @@ impl GraphClient {
         })
     }
 
+    fn remote_rename_request(
+        &self,
+        drive_id: &str,
+        item_id: &str,
+        parent_id: &str,
+        name: &str,
+        etag: &str,
+        access_token: &str,
+    ) -> Result<reqwest::Request, RemoteRenameError> {
+        if drive_id.is_empty()
+            || item_id.is_empty()
+            || parent_id.is_empty()
+            || etag.is_empty()
+            || !valid_new_file_name(name)
+        {
+            return Err(RemoteRenameError::Conflict);
+        }
+        let mut url = reqwest::Url::parse("https://graph.microsoft.com/v1.0/")
+            .map_err(|_| RemoteRenameError::Retry)?;
+        url.path_segments_mut()
+            .map_err(|_| RemoteRenameError::Retry)?
+            .pop_if_empty()
+            .extend(["drives", drive_id, "items", item_id]);
+        self.http
+            .patch(url)
+            .bearer_auth(access_token)
+            .header(IF_MATCH, etag)
+            .json(&serde_json::json!({
+                "name": name,
+                "parentReference": { "id": parent_id },
+            }))
+            .build()
+            .map_err(|_| RemoteRenameError::Retry)
+    }
+
+    fn remote_rename_source_request(
+        &self,
+        drive_id: &str,
+        item_id: &str,
+        access_token: &str,
+    ) -> Result<reqwest::Request, RemoteRenameError> {
+        if drive_id.is_empty() || item_id.is_empty() {
+            return Err(RemoteRenameError::Conflict);
+        }
+        let mut url = reqwest::Url::parse("https://graph.microsoft.com/v1.0/")
+            .map_err(|_| RemoteRenameError::Retry)?;
+        url.path_segments_mut()
+            .map_err(|_| RemoteRenameError::Retry)?
+            .pop_if_empty()
+            .extend(["drives", drive_id, "items", item_id]);
+        url.query_pairs_mut()
+            .append_pair("$select", "id,name,eTag,file,parentReference");
+        self.http
+            .get(url)
+            .bearer_auth(access_token)
+            .build()
+            .map_err(|_| RemoteRenameError::Retry)
+    }
+
+    pub async fn rename_remote_file(
+        &self,
+        drive_id: &str,
+        input: &RemoteRenameInput<'_>,
+        access_token: &str,
+    ) -> Result<String, RemoteRenameError> {
+        let source_request =
+            self.remote_rename_source_request(drive_id, input.item_id, access_token)?;
+        let source_response = self
+            .http
+            .execute(source_request)
+            .await
+            .map_err(|_| RemoteRenameError::Retry)?;
+        if source_response.status() == StatusCode::NOT_FOUND {
+            return Err(RemoteRenameError::Conflict);
+        }
+        if !source_response.status().is_success() {
+            return Err(RemoteRenameError::Retry);
+        }
+        let source: MovedFile = source_response
+            .json()
+            .await
+            .map_err(|_| RemoteRenameError::Retry)?;
+        if !moved_file_matches(
+            &source,
+            input.item_id,
+            input.source_parent_id,
+            input.source_name,
+        ) || source.etag.as_deref() != Some(input.etag)
+        {
+            return Err(RemoteRenameError::Conflict);
+        }
+        let request = self.remote_rename_request(
+            drive_id,
+            input.item_id,
+            input.target_parent_id,
+            input.target_name,
+            input.etag,
+            access_token,
+        )?;
+        let response = self
+            .http
+            .execute(request)
+            .await
+            .map_err(|_| RemoteRenameError::Retry)?;
+        match response.status() {
+            StatusCode::OK => {
+                let item: MovedFile = response
+                    .json()
+                    .await
+                    .map_err(|_| RemoteRenameError::NeedsReconcile)?;
+                if !moved_file_matches(
+                    &item,
+                    input.item_id,
+                    input.target_parent_id,
+                    input.target_name,
+                ) {
+                    return Err(RemoteRenameError::NeedsReconcile);
+                }
+                Ok(item.etag.expect("validated eTag"))
+            }
+            StatusCode::CONFLICT
+            | StatusCode::PRECONDITION_FAILED
+            | StatusCode::NOT_FOUND
+            | StatusCode::BAD_REQUEST => Err(RemoteRenameError::Conflict),
+            _ => Err(RemoteRenameError::Retry),
+        }
+    }
+
     fn create_folder_request(
         &self,
         drive_id: &str,
@@ -652,6 +819,55 @@ impl GraphClient {
 mod tests {
     use super::*;
     use reqwest::header::AUTHORIZATION;
+
+    #[test]
+    fn remote_rename_uses_id_parent_and_if_match() {
+        let graph = GraphClient::new().unwrap();
+        let source = graph
+            .remote_rename_source_request("drive", "item", "token")
+            .unwrap();
+        assert_eq!(source.method(), reqwest::Method::GET);
+        assert_eq!(source.url().path(), "/v1.0/drives/drive/items/item");
+        assert_eq!(
+            source.url().query(),
+            Some("%24select=id%2Cname%2CeTag%2Cfile%2CparentReference")
+        );
+        let request = graph
+            .remote_rename_request("drive", "item", "parent", "new.txt", "v1", "token")
+            .unwrap();
+        assert_eq!(request.method(), reqwest::Method::PATCH);
+        assert_eq!(request.url().path(), "/v1.0/drives/drive/items/item");
+        assert_eq!(request.headers()[IF_MATCH], "v1");
+        assert!(request.headers().contains_key(AUTHORIZATION));
+        let body: serde_json::Value =
+            serde_json::from_slice(request.body().unwrap().as_bytes().unwrap()).unwrap();
+        assert_eq!(body["name"], "new.txt");
+        assert_eq!(body["parentReference"]["id"], "parent");
+        assert!(
+            graph
+                .remote_rename_request("drive", "item", "parent", "bad:name", "v1", "token")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn remote_rename_response_requires_exact_identity_and_version() {
+        let item: MovedFile = serde_json::from_value(serde_json::json!({
+            "id": "item", "name": "new.txt", "eTag": "v2", "file": {},
+            "parentReference": { "id": "parent" },
+        }))
+        .unwrap();
+        assert!(moved_file_matches(&item, "item", "parent", "new.txt"));
+        assert!(!moved_file_matches(&item, "other", "parent", "new.txt"));
+        assert!(!moved_file_matches(&item, "item", "other", "new.txt"));
+        assert!(!moved_file_matches(&item, "item", "parent", "other.txt"));
+        let no_etag: MovedFile = serde_json::from_value(serde_json::json!({
+            "id": "item", "name": "new.txt", "file": {},
+            "parentReference": { "id": "parent" },
+        }))
+        .unwrap();
+        assert!(!moved_file_matches(&no_etag, "item", "parent", "new.txt"));
+    }
 
     #[test]
     fn folder_creation_uses_parent_id_and_fails_on_name_conflict() {
