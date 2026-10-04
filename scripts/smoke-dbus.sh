@@ -180,6 +180,12 @@ fi
 if gdbus call --session \
     --dest io.github.onedrive_linux.Daemon \
     --object-path /io/github/onedrive_linux/Daemon \
+    --method io.github.onedrive_linux.Daemon.RunQueuedRemoteRename >/dev/null 2>&1; then
+    exit 1
+fi
+if gdbus call --session \
+    --dest io.github.onedrive_linux.Daemon \
+    --object-path /io/github/onedrive_linux/Daemon \
     --method io.github.onedrive_linux.Daemon.RunQueuedDownload >/dev/null 2>&1; then
     exit 1
 fi
