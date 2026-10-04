@@ -89,6 +89,7 @@ pub struct Baseline {
 #[serde(rename_all = "kebab-case")]
 pub enum Action {
     UploadNew,
+    CreateRemoteFolder,
     DownloadNew,
     UploadChanged,
     DownloadChanged,
@@ -228,7 +229,7 @@ impl SyncStore {
         // operations and unresolved conflicts remain unapproved.
         connection.execute(
             "UPDATE operation SET approved = 1
-             WHERE kind IN ('UploadNew', 'DownloadNew', 'UploadChanged',
+             WHERE kind IN ('UploadNew', 'CreateRemoteFolder', 'DownloadNew', 'UploadChanged',
                             'DownloadChanged', 'RenameLocal')",
             [],
         )?;
@@ -476,6 +477,46 @@ impl SyncStore {
     ) -> Result<folders::FolderPreparation, SyncError> {
         let root = self.root()?.ok_or(SyncError::InvalidRoot)?;
         folders::prepare(&root, remote_items, root_id)
+    }
+
+    /// Queue only local directories whose exact parent is already identified
+    /// in the complete remote catalog. Missing ancestors are queued after a
+    /// later catalog refresh confirms their new IDs.
+    pub fn enqueue_safe_remote_folders(
+        &mut self,
+        remote_items: &[CatalogItem],
+        root_id: &str,
+    ) -> Result<u64, SyncError> {
+        let root = self.root()?.ok_or(SyncError::InvalidRoot)?;
+        let local_directories = folders::scan_local_directories(&root)?;
+        let before = self.pending_count()?;
+        for path in local_directories {
+            let Some(parent_id) = remote_parent_id(remote_items, root_id, &path) else {
+                continue;
+            };
+            let name = path.rsplit('/').next().unwrap_or_default();
+            let folded = name.to_lowercase();
+            if remote_items.iter().any(|item| {
+                !item.deleted
+                    && item.parent_id.as_deref() == Some(parent_id)
+                    && item
+                        .name
+                        .as_deref()
+                        .is_some_and(|other| other.to_lowercase() == folded)
+            }) {
+                continue;
+            }
+            self.enqueue(&PlannedOperation {
+                action: Action::CreateRemoteFolder,
+                path,
+                from_path: None,
+                remote_id: Some(parent_id.to_owned()),
+                expected_etag: None,
+                local_fingerprint: None,
+                requires_confirmation: false,
+            })?;
+        }
+        Ok(self.pending_count()?.saturating_sub(before))
     }
 
     /// Save a plan before any network work. Actions that need review stay
@@ -948,9 +989,17 @@ fn safe_download_destination(root: &Path, relative: &str, action: &Action) -> bo
 /// Accept an upload path only when every parent is a uniquely identified
 /// folder in the complete remote catalog. Case variants are ambiguous.
 pub fn remote_parent_exists(items: &[CatalogItem], root_id: &str, path: &str) -> bool {
+    remote_parent_id(items, root_id, path).is_some()
+}
+
+pub fn remote_parent_id<'a>(
+    items: &'a [CatalogItem],
+    root_id: &'a str,
+    path: &str,
+) -> Option<&'a str> {
     let parts: Vec<_> = path.split('/').collect();
-    if parts.is_empty() || parts.iter().any(|part| !valid_name(part)) {
-        return false;
+    if root_id.is_empty() || parts.is_empty() || parts.iter().any(|part| !valid_name(part)) {
+        return None;
     }
     let mut parent_id = root_id;
     for part in &parts[..parts.len() - 1] {
@@ -963,18 +1012,16 @@ pub fn remote_parent_exists(items: &[CatalogItem], root_id: &str, path: &str) ->
                     .as_ref()
                     .is_some_and(|name| name.to_lowercase() == folded)
         });
-        let Some(folder) = matching.next() else {
-            return false;
-        };
+        let folder = matching.next()?;
         if matching.next().is_some()
             || folder.kind != "folder"
             || folder.name.as_deref() != Some(part)
         {
-            return false;
+            return None;
         }
         parent_id = &folder.item_id;
     }
-    true
+    Some(parent_id)
 }
 
 pub fn remote_files(items: &[CatalogItem], root_id: &str) -> (Vec<RemoteFile>, Vec<String>) {
