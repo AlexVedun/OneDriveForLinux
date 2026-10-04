@@ -1,6 +1,7 @@
 //! Offline sync planning. It never changes local or remote files.
 
 pub mod folders;
+pub mod local_rename;
 pub mod monitor;
 pub mod upload;
 
@@ -470,6 +471,40 @@ impl SyncStore {
         Ok(self.pending_count()?.saturating_sub(before))
     }
 
+    pub fn enqueue_safe_local_renames(
+        &mut self,
+        remote_items: &[CatalogItem],
+        root_id: &str,
+    ) -> Result<u64, SyncError> {
+        let preview = self.preview(remote_items, Some(root_id))?;
+        let root = self.root()?.ok_or(SyncError::InvalidRoot)?;
+        let before = self.pending_count()?;
+        for operation in preview.operations {
+            let safe = operation.action == Action::RenameLocal
+                && operation
+                    .remote_id
+                    .as_deref()
+                    .is_some_and(|id| !id.is_empty())
+                && operation
+                    .expected_etag
+                    .as_deref()
+                    .is_some_and(|etag| !etag.is_empty())
+                && operation
+                    .local_fingerprint
+                    .as_deref()
+                    .is_some_and(|hash| !hash.is_empty())
+                && operation
+                    .from_path
+                    .as_deref()
+                    .is_some_and(|path| !path.is_empty())
+                && safe_download_destination(&root, &operation.path, &Action::DownloadNew);
+            if safe {
+                self.enqueue(&operation)?;
+            }
+        }
+        Ok(self.pending_count()?.saturating_sub(before))
+    }
+
     pub fn prepare_local_folders(
         &self,
         remote_items: &[CatalogItem],
@@ -715,6 +750,31 @@ impl SyncStore {
         Ok(next)
     }
 
+    pub fn claim_local_rename(&mut self) -> Result<Option<QueuedOperation>, SyncError> {
+        let transaction = self.connection.transaction()?;
+        let next = transaction.query_row(
+            "SELECT id, kind, path, remote_id, expected_etag, attempts, local_fingerprint, from_path
+             FROM operation WHERE status = 'pending' AND approved = 1 AND kind = 'RenameLocal'
+               AND NOT EXISTS (SELECT 1 FROM sync_control WHERE singleton = 1 AND paused = 1)
+             ORDER BY id LIMIT 1",
+            [],
+            |row| Ok(QueuedOperation {
+                id: row.get(0)?, kind: row.get(1)?, path: row.get(2)?,
+                remote_id: row.get(3)?, expected_etag: row.get(4)?,
+                attempts: row.get::<_, u32>(5)? + 1,
+                local_fingerprint: row.get(6)?, from_path: row.get(7)?,
+            }),
+        ).optional()?;
+        if let Some(operation) = &next {
+            transaction.execute(
+                "UPDATE operation SET status = 'running', attempts = attempts + 1 WHERE id = ?1",
+                [operation.id],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(next)
+    }
+
     pub fn claim_remote_folder(&mut self) -> Result<Option<QueuedOperation>, SyncError> {
         let transaction = self.connection.transaction()?;
         let next: Option<QueuedOperation> = transaction
@@ -828,6 +888,46 @@ impl SyncStore {
                 fingerprint
             ],
         )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn finish_local_rename(&mut self, operation: &QueuedOperation) -> Result<(), SyncError> {
+        if operation.kind != "RenameLocal"
+            || operation.remote_id.as_deref().is_none_or(str::is_empty)
+            || operation.expected_etag.as_deref().is_none_or(str::is_empty)
+            || operation
+                .local_fingerprint
+                .as_deref()
+                .is_none_or(str::is_empty)
+            || operation.from_path.as_deref().is_none_or(str::is_empty)
+            || operation.from_path.as_deref() == Some(operation.path.as_str())
+        {
+            return Err(SyncError::InvalidCheckpoint);
+        }
+        let transaction = self.connection.transaction()?;
+        let changed = transaction.execute(
+            "UPDATE mapping SET path = ?1 WHERE remote_id = ?2 AND path = ?3
+             AND etag = ?4 AND fingerprint = ?5",
+            params![
+                operation.path,
+                operation.remote_id,
+                operation.from_path,
+                operation.expected_etag,
+                operation.local_fingerprint
+            ],
+        )?;
+        if changed != 1 {
+            return Err(SyncError::InvalidCheckpoint);
+        }
+        let changed = transaction.execute(
+            "UPDATE operation SET status = 'done', last_error = NULL
+             WHERE id = ?1 AND status = 'running' AND kind = 'RenameLocal'",
+            [operation.id],
+        )?;
+        if changed != 1 {
+            return Err(SyncError::InvalidCheckpoint);
+        }
         transaction.commit()?;
         Ok(())
     }
@@ -1616,6 +1716,98 @@ mod tests {
         assert_eq!(queued.kind, "RenameLocal");
         assert_eq!(queued.path, "new.txt");
         assert_eq!(queued.from_path.as_deref(), Some("old.txt"));
+    }
+
+    #[test]
+    fn local_rename_claim_and_completion_preserve_baseline() {
+        let mut store = SyncStore::in_memory().unwrap();
+        store
+            .confirm_baseline(&base("id", "old.txt", "v1", "hash"))
+            .unwrap();
+        let operation = PlannedOperation {
+            action: Action::RenameLocal,
+            path: "new.txt".into(),
+            from_path: Some("old.txt".into()),
+            remote_id: Some("id".into()),
+            expected_etag: Some("v1".into()),
+            local_fingerprint: Some("hash".into()),
+            requires_confirmation: false,
+        };
+        store.enqueue(&operation).unwrap();
+        store.set_paused(true).unwrap();
+        assert!(store.claim_local_rename().unwrap().is_none());
+        store.set_paused(false).unwrap();
+        let claimed = store.claim_local_rename().unwrap().unwrap();
+        assert!(store.claim_local_rename().unwrap().is_none());
+        store.finish_local_rename(&claimed).unwrap();
+        assert_eq!(store.baselines().unwrap()[0].path, "new.txt");
+        assert_eq!(store.baselines().unwrap()[0].fingerprint, "hash");
+        assert_eq!(store.pending_count().unwrap(), 0);
+        assert!(matches!(
+            store.finish_local_rename(&claimed),
+            Err(SyncError::InvalidCheckpoint)
+        ));
+    }
+
+    #[test]
+    fn safe_local_rename_queue_is_idempotent_and_requires_free_target() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("sync");
+        let state = directory.path().join("state");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&state).unwrap();
+        fs::write(root.join("old.txt"), b"content").unwrap();
+        let fingerprint = scan_local(&root).unwrap().0[0].fingerprint.clone();
+        let mut store = SyncStore::in_memory().unwrap();
+        store.set_root(&root, &state).unwrap();
+        store
+            .confirm_baseline(&base("id", "old.txt", "v1", &fingerprint))
+            .unwrap();
+        let mut item = folder("id", "root", "new.txt");
+        item.kind = "file".into();
+        item.size = Some(7);
+        item.etag = Some("v1".into());
+        let items = [item];
+        assert_eq!(store.enqueue_safe_local_renames(&items, "root").unwrap(), 1);
+        assert_eq!(store.enqueue_safe_local_renames(&items, "root").unwrap(), 0);
+        assert_eq!(store.claim_local_rename().unwrap().unwrap().path, "new.txt");
+
+        let mut occupied = SyncStore::in_memory().unwrap();
+        occupied.set_root(&root, &state).unwrap();
+        occupied
+            .confirm_baseline(&base("id", "old.txt", "v1", &fingerprint))
+            .unwrap();
+        fs::write(root.join("new.txt"), b"other").unwrap();
+        assert_eq!(
+            occupied.enqueue_safe_local_renames(&items, "root").unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn local_rename_rejects_stale_mapping_without_finishing() {
+        let mut store = SyncStore::in_memory().unwrap();
+        store
+            .confirm_baseline(&base("id", "old.txt", "v2", "hash"))
+            .unwrap();
+        let operation = PlannedOperation {
+            action: Action::RenameLocal,
+            path: "new.txt".into(),
+            from_path: Some("old.txt".into()),
+            remote_id: Some("id".into()),
+            expected_etag: Some("v1".into()),
+            local_fingerprint: Some("hash".into()),
+            requires_confirmation: false,
+        };
+        store.enqueue(&operation).unwrap();
+        let claimed = store.claim_local_rename().unwrap().unwrap();
+        assert!(matches!(
+            store.finish_local_rename(&claimed),
+            Err(SyncError::InvalidCheckpoint)
+        ));
+        assert_eq!(store.baselines().unwrap()[0].path, "old.txt");
+        store.mark_retry(claimed.id, "stale").unwrap();
+        assert!(store.claim_local_rename().unwrap().is_some());
     }
 
     #[test]

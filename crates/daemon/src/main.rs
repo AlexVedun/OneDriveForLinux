@@ -13,6 +13,7 @@ use onedrive_core::{BUS_NAME, EngineState, OBJECT_PATH};
 use onedrive_sync::{
     Action, QueuedOperation, SyncStore,
     folders::local_directory_exists,
+    local_rename::{RenameError, apply as apply_local_rename},
     monitor::LocalMonitor,
     remote_files, remote_parent_exists, remote_parent_id,
     upload::{UploadError, UploadStep, upload_queued},
@@ -226,6 +227,43 @@ impl Daemon {
             sync.bind_drive(&drive_id)
                 .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
             sync.enqueue_safe_downloads(&items, &root_id)
+                .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))
+        })
+        .await
+        .map_err(|_| zbus::fdo::Error::Failed("queue task failed".to_owned()))?
+    }
+
+    async fn queue_safe_local_renames(&self) -> zbus::fdo::Result<u64> {
+        let catalog = Arc::clone(&self.catalog);
+        let sync = Arc::clone(&self.sync);
+        tokio::task::spawn_blocking(move || {
+            let catalog = catalog.lock().unwrap();
+            let drive_id = catalog
+                .active_drive_id()
+                .map_err(|_| zbus::fdo::Error::Failed("cannot read catalog".to_owned()))?
+                .ok_or_else(|| zbus::fdo::Error::Failed("OneDrive catalog is empty".to_owned()))?;
+            if !catalog
+                .is_complete(&drive_id)
+                .map_err(|_| zbus::fdo::Error::Failed("cannot read catalog cursor".to_owned()))?
+            {
+                return Err(zbus::fdo::Error::Failed(
+                    "catalog scan is incomplete".to_owned(),
+                ));
+            }
+            let items = catalog
+                .items(&drive_id)
+                .map_err(|_| zbus::fdo::Error::Failed("cannot read catalog".to_owned()))?;
+            let root_id = catalog
+                .root_id(&drive_id)
+                .map_err(|_| zbus::fdo::Error::Failed("cannot read drive root".to_owned()))?
+                .ok_or_else(|| {
+                    zbus::fdo::Error::Failed("OneDrive root ID is missing".to_owned())
+                })?;
+            drop(catalog);
+            let mut sync = sync.lock().unwrap();
+            sync.bind_drive(&drive_id)
+                .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
+            sync.enqueue_safe_local_renames(&items, &root_id)
                 .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))
         })
         .await
@@ -765,6 +803,143 @@ impl Daemon {
                 }
             }
             *state.lock().unwrap() = if result.is_ok() {
+                EngineState::Connected
+            } else {
+                EngineState::Error
+            };
+            in_progress.store(false, Ordering::SeqCst);
+        });
+        Ok(id)
+    }
+
+    async fn run_queued_local_rename(&self) -> zbus::fdo::Result<i64> {
+        if std::env::var("ONEDRIVE_EXPERIMENTAL_DOWNLOAD").as_deref() != Ok("1") {
+            return Err(zbus::fdo::Error::Failed(
+                "queued local rename execution is experimental and disabled".to_owned(),
+            ));
+        }
+        if self.sync_paused()? {
+            return Err(zbus::fdo::Error::Failed("sync is paused".to_owned()));
+        }
+        if self.scan_in_progress.load(Ordering::SeqCst)
+            || self.upload_in_progress.load(Ordering::SeqCst)
+            || self
+                .download_in_progress
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+        {
+            return Err(zbus::fdo::Error::Failed(
+                "local change is already running".to_owned(),
+            ));
+        }
+        let prepare = (|| {
+            let catalog = self.catalog.lock().unwrap();
+            let drive_id = catalog
+                .active_drive_id()
+                .map_err(|_| zbus::fdo::Error::Failed("cannot read catalog".to_owned()))?
+                .ok_or_else(|| zbus::fdo::Error::Failed("OneDrive catalog is empty".to_owned()))?;
+            if !catalog
+                .is_complete(&drive_id)
+                .map_err(|_| zbus::fdo::Error::Failed("cannot read catalog cursor".to_owned()))?
+            {
+                return Err(zbus::fdo::Error::Failed(
+                    "catalog scan is incomplete".to_owned(),
+                ));
+            }
+            let root_id = catalog
+                .root_id(&drive_id)
+                .map_err(|_| zbus::fdo::Error::Failed("cannot read drive root".to_owned()))?
+                .ok_or_else(|| {
+                    zbus::fdo::Error::Failed("OneDrive root ID is missing".to_owned())
+                })?;
+            let files = remote_files(
+                &catalog
+                    .items(&drive_id)
+                    .map_err(|_| zbus::fdo::Error::Failed("cannot read catalog".to_owned()))?,
+                &root_id,
+            )
+            .0;
+            let mut sync = self.sync.lock().unwrap();
+            sync.ensure_drive(&drive_id)
+                .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
+            let root = sync
+                .root()
+                .map_err(|_| zbus::fdo::Error::Failed("cannot read sync root".to_owned()))?
+                .ok_or_else(|| {
+                    zbus::fdo::Error::Failed("sync root is not configured".to_owned())
+                })?;
+            let operation = sync
+                .claim_local_rename()
+                .map_err(|_| zbus::fdo::Error::Failed("cannot read rename queue".to_owned()))?
+                .ok_or_else(|| zbus::fdo::Error::Failed("no local rename is pending".to_owned()))?;
+            let valid_remote = files.iter().any(|file| {
+                Some(file.id.as_str()) == operation.remote_id.as_deref()
+                    && file.path == operation.path
+                    && file.etag.as_deref() == operation.expected_etag.as_deref()
+                    && file.etag.as_deref().is_some_and(|etag| !etag.is_empty())
+            });
+            let valid_mapping = sync
+                .baselines()
+                .map_err(|_| zbus::fdo::Error::Failed("cannot read sync baseline".to_owned()))?
+                .iter()
+                .any(|base| {
+                    Some(base.remote_id.as_str()) == operation.remote_id.as_deref()
+                        && Some(base.path.as_str()) == operation.from_path.as_deref()
+                        && base.etag == operation.expected_etag
+                        && Some(base.fingerprint.as_str()) == operation.local_fingerprint.as_deref()
+                });
+            if !valid_remote || !valid_mapping {
+                sync.mark_blocked(operation.id, "rename needs review")
+                    .map_err(|_| {
+                        zbus::fdo::Error::Failed("cannot block stale rename".to_owned())
+                    })?;
+                return Err(zbus::fdo::Error::Failed("rename needs review".to_owned()));
+            }
+            Ok::<_, zbus::fdo::Error>((operation, root))
+        })();
+        let (operation, root) = match prepare {
+            Ok(value) => value,
+            Err(error) => {
+                self.download_in_progress.store(false, Ordering::SeqCst);
+                return Err(error);
+            }
+        };
+        let id = operation.id;
+        let sync = Arc::clone(&self.sync);
+        let state = Arc::clone(&self.state);
+        let in_progress = Arc::clone(&self.download_in_progress);
+        tokio::spawn(async move {
+            *state.lock().unwrap() = EngineState::Transferring;
+            let sync_worker = Arc::clone(&sync);
+            let result = tokio::task::spawn_blocking(move || {
+                let moved = apply_local_rename(&root, &operation);
+                match moved {
+                    Ok(()) => sync_worker
+                        .lock()
+                        .unwrap()
+                        .finish_local_rename(&operation)
+                        .map_err(|_| RenameError::Changed),
+                    Err(error) => Err(error),
+                }
+            })
+            .await;
+            let success = matches!(result, Ok(Ok(())));
+            if !success {
+                let update = match result {
+                    Ok(Err(RenameError::Changed)) => sync
+                        .lock()
+                        .unwrap()
+                        .mark_blocked(id, "local rename needs review"),
+                    _ => sync
+                        .lock()
+                        .unwrap()
+                        .mark_retry(id, "local rename failed; retry is possible"),
+                };
+                if update.is_err() {
+                    eprintln!("cannot update local rename queue status");
+                }
+            }
+            *state.lock().unwrap() = if success {
                 EngineState::Connected
             } else {
                 EngineState::Error
