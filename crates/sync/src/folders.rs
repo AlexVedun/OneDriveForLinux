@@ -52,6 +52,24 @@ pub fn scan_local_directories(root: &Path) -> Result<Vec<String>, SyncError> {
     Ok(paths)
 }
 
+pub fn local_directory_exists(root: &Path, relative: &str) -> Result<bool, SyncError> {
+    let parts: Vec<_> = relative.split('/').collect();
+    if parts.is_empty() || parts.iter().any(|part| !valid_name(part)) {
+        return Ok(false);
+    }
+    let mut directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(root)?;
+    for part in parts {
+        let Some(child) = open_existing(&directory, part)? else {
+            return Ok(false);
+        };
+        directory = child;
+    }
+    Ok(true)
+}
+
 pub fn prepare(
     root: &Path,
     items: &[CatalogItem],
@@ -318,6 +336,9 @@ mod tests {
         fs::create_dir(root.join("Case")).unwrap();
         fs::create_dir(root.join("Taken")).unwrap();
         symlink(&outside, root.join("Linked")).unwrap();
+        assert!(local_directory_exists(&root, "New/Child").unwrap());
+        assert!(!local_directory_exists(&root, "Linked").unwrap());
+        assert!(!local_directory_exists(&root, "New/../outside").unwrap());
         let mut taken = folder("taken", "root", "Taken");
         taken.kind = "file".into();
         let items = [
@@ -338,15 +359,18 @@ mod tests {
         );
         drop(store);
         let mut store = SyncStore::open(&database).unwrap();
-        let first = store.claim_next().unwrap().unwrap();
-        let second = store.claim_next().unwrap().unwrap();
+        store.set_paused(true).unwrap();
+        assert!(store.claim_remote_folder().unwrap().is_none());
+        store.set_paused(false).unwrap();
+        let first = store.claim_remote_folder().unwrap().unwrap();
+        let second = store.claim_remote_folder().unwrap().unwrap();
         let queued = [
             (first.path, first.remote_id),
             (second.path, second.remote_id),
         ];
         assert!(queued.contains(&("New".into(), Some("root".into()))));
         assert!(queued.contains(&("Docs/Ready".into(), Some("docs".into()))));
-        assert!(store.claim_next().unwrap().is_none());
+        assert!(store.claim_remote_folder().unwrap().is_none());
     }
 
     #[cfg(unix)]
