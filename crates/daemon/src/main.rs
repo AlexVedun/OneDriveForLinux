@@ -493,8 +493,25 @@ async fn queue_upload_candidate(
 fn client_id() -> Option<String> {
     std::env::var("ONEDRIVE_CLIENT_ID")
         .ok()
+        .filter(|value| !value.is_empty())
+        .or_else(|| client_id_from_dotenv(&fs::read_to_string(".env").ok()?))
         .or_else(|| option_env!("ONEDRIVE_CLIENT_ID").map(str::to_owned))
         .filter(|value| !value.is_empty())
+}
+
+fn client_id_from_dotenv(contents: &str) -> Option<String> {
+    contents.lines().find_map(|line| {
+        let (key, value) = line.trim().split_once('=')?;
+        if key.trim() != "ONEDRIVE_CLIENT_ID" {
+            return None;
+        }
+        let value = value.trim();
+        let value = value
+            .strip_prefix('"')
+            .and_then(|value| value.strip_suffix('"'))
+            .unwrap_or(value);
+        (!value.is_empty()).then(|| value.to_owned())
+    })
 }
 
 async fn run_login(
@@ -776,4 +793,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("onedrive-daemon listening on {BUS_NAME}");
     tokio::signal::ctrl_c().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::client_id_from_dotenv;
+
+    #[test]
+    fn reads_client_id_without_matching_other_keys_or_empty_values() {
+        let contents = "# registration\nOTHER_CLIENT_ID=wrong\nONEDRIVE_CLIENT_ID=\nONEDRIVE_CLIENT_ID=\"registered-id\"\n";
+        assert_eq!(
+            client_id_from_dotenv(contents).as_deref(),
+            Some("registered-id")
+        );
+    }
 }

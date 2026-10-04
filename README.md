@@ -26,14 +26,27 @@ dbus-run-session -- sh scripts/smoke-dbus.sh
 `http://localhost/callback`. В API permissions добавьте делегированные
 `Files.ReadWrite` и `offline_access`. Клиентский секрет не создавайте.
 
-Укажите полученный Application (client) ID переменной `ONEDRIVE_CLIENT_ID` в
-окружении фонового процесса. Для проверки входа нужен работающий Secret Service
-(например, GNOME Keyring или KWallet). Токены в файлы проекта и журнал не пишутся.
-
-В терминале с пользовательской шиной D-Bus запустите процессы отдельно:
+Создайте файл `.env` в корне проекта и укажите в нём Application (client) ID:
 
 ```sh
-ONEDRIVE_CLIENT_ID=<client-id> cargo run -p onedrive-daemon
+ONEDRIVE_CLIENT_ID=ваш-client-id
+```
+
+Файл `.env` исключён из Git. Демон читает его из текущей директории при
+запуске; переменная окружения `ONEDRIVE_CLIENT_ID`, если задана, имеет
+приоритет. Для проверки входа нужен работающий Secret Service (например,
+GNOME Keyring или KWallet).
+Токены в файлы проекта и журнал не пишутся.
+
+В первом терминале с пользовательской шиной D-Bus запустите демон:
+
+```sh
+cargo run -p onedrive-daemon
+```
+
+Во втором терминале запустите интерфейс:
+
+```sh
 cargo run -p onedrive-desktop
 ```
 
