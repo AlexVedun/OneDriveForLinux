@@ -1544,6 +1544,7 @@ name = "onedrive-daemon"
 version = "0.1.0"
 dependencies = [
  "keyring",
+ "libc",
  "oauth2",
  "onedrive-catalog",
  "onedrive-core",

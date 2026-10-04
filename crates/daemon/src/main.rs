@@ -3,7 +3,7 @@ mod graph;
 mod transfer;
 
 use auth::LoginAttempt;
-use graph::{GraphClient, GraphUpload};
+use graph::{GraphClient, GraphUpload, QueuedDownloadError, QueuedDownloadTarget};
 use keyring::v1::Entry;
 use oauth2::{TokenResponse, basic::BasicTokenResponse};
 use onedrive_catalog::{Catalog, FetchError};
@@ -11,7 +11,7 @@ use onedrive_core::{BUS_NAME, EngineState, OBJECT_PATH};
 use onedrive_sync::{
     Action, SyncStore,
     monitor::LocalMonitor,
-    remote_parent_exists,
+    remote_files, remote_parent_exists,
     upload::{UploadError, UploadStep, upload_queued},
 };
 use std::fs::{self, OpenOptions};
@@ -398,6 +398,168 @@ impl Daemon {
             in_progress.store(false, Ordering::SeqCst);
         });
         Ok(())
+    }
+
+    async fn run_queued_download(&self) -> zbus::fdo::Result<i64> {
+        if std::env::var("ONEDRIVE_EXPERIMENTAL_DOWNLOAD").as_deref() != Ok("1") {
+            return Err(zbus::fdo::Error::Failed(
+                "queued download execution is experimental and disabled".to_owned(),
+            ));
+        }
+        if self.sync_paused()? {
+            return Err(zbus::fdo::Error::Failed("sync is paused".to_owned()));
+        }
+        let client_id = client_id().ok_or_else(|| {
+            zbus::fdo::Error::Failed("ONEDRIVE_CLIENT_ID is not configured".to_owned())
+        })?;
+        if self.scan_in_progress.load(Ordering::SeqCst)
+            || self.upload_in_progress.load(Ordering::SeqCst)
+            || self
+                .download_in_progress
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+        {
+            return Err(zbus::fdo::Error::Failed(
+                "download is already running".to_owned(),
+            ));
+        }
+        let prepare = async {
+            let token = access_token(&client_id)
+                .await
+                .map_err(|_| zbus::fdo::Error::Failed("login is required".to_owned()))?;
+            let catalog = self.catalog.lock().unwrap();
+            let drive_id = catalog
+                .active_drive_id()
+                .map_err(|_| zbus::fdo::Error::Failed("cannot read catalog".to_owned()))?
+                .ok_or_else(|| zbus::fdo::Error::Failed("OneDrive catalog is empty".to_owned()))?;
+            if !catalog
+                .is_complete(&drive_id)
+                .map_err(|_| zbus::fdo::Error::Failed("cannot read catalog cursor".to_owned()))?
+            {
+                return Err(zbus::fdo::Error::Failed(
+                    "catalog scan is incomplete".to_owned(),
+                ));
+            }
+            let (operation, root) = {
+                let mut sync = self.sync.lock().unwrap();
+                sync.ensure_drive(&drive_id)
+                    .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
+                let root = sync
+                    .root()
+                    .map_err(|_| zbus::fdo::Error::Failed("cannot read sync root".to_owned()))?
+                    .ok_or_else(|| {
+                        zbus::fdo::Error::Failed("sync root is not configured".to_owned())
+                    })?;
+                let operation = sync
+                    .claim_download()
+                    .map_err(|_| zbus::fdo::Error::Failed("cannot read download queue".to_owned()))?
+                    .ok_or_else(|| zbus::fdo::Error::Failed("no download is pending".to_owned()))?;
+                (operation, root)
+            };
+            let item = operation
+                .remote_id
+                .as_deref()
+                .and_then(|id| catalog.item(&drive_id, id).ok().flatten());
+            let root_id = catalog
+                .root_id(&drive_id)
+                .map_err(|_| zbus::fdo::Error::Failed("cannot read drive root".to_owned()))?;
+            let remote_path_matches = if let Some(root_id) = root_id {
+                let items = catalog
+                    .items(&drive_id)
+                    .map_err(|_| zbus::fdo::Error::Failed("cannot read catalog".to_owned()))?;
+                remote_files(&items, &root_id).0.iter().any(|file| {
+                    Some(file.id.as_str()) == operation.remote_id.as_deref()
+                        && file.path == operation.path
+                })
+            } else {
+                false
+            };
+            let valid = item.as_ref().is_some_and(|item| {
+                !item.deleted
+                    && item.kind == "file"
+                    && operation
+                        .expected_etag
+                        .as_deref()
+                        .is_some_and(|etag| !etag.is_empty())
+                    && item.etag.as_deref() == operation.expected_etag.as_deref()
+                    && item.size.is_some_and(|size| size >= 0)
+            }) && remote_path_matches;
+            if !valid {
+                self.sync
+                    .lock()
+                    .unwrap()
+                    .mark_blocked(operation.id, "remote file changed")
+                    .map_err(|_| {
+                        zbus::fdo::Error::Failed("cannot block stale download".to_owned())
+                    })?;
+                return Err(zbus::fdo::Error::Failed("remote file changed".to_owned()));
+            }
+            let size = u64::try_from(item.unwrap().size.unwrap())
+                .map_err(|_| zbus::fdo::Error::Failed("invalid catalog size".to_owned()))?;
+            Ok::<_, zbus::fdo::Error>((token, drive_id, operation, root, size))
+        }
+        .await;
+        let (token, drive_id, operation, root, size) = match prepare {
+            Ok(value) => value,
+            Err(error) => {
+                self.download_in_progress.store(false, Ordering::SeqCst);
+                return Err(error);
+            }
+        };
+        let id = operation.id;
+        let sync = Arc::clone(&self.sync);
+        let state = Arc::clone(&self.state);
+        let in_progress = Arc::clone(&self.download_in_progress);
+        tokio::spawn(async move {
+            *state.lock().unwrap() = EngineState::Transferring;
+            let result = async {
+                let graph = GraphClient::new().map_err(|_| QueuedDownloadError::Failed)?;
+                let remote_id = operation
+                    .remote_id
+                    .as_deref()
+                    .ok_or(QueuedDownloadError::Changed)?;
+                let etag = operation
+                    .expected_etag
+                    .as_deref()
+                    .ok_or(QueuedDownloadError::Changed)?;
+                let target = root.join(&operation.path);
+                let destination = QueuedDownloadTarget {
+                    root: &root,
+                    path: &target,
+                    expected_local: operation.local_fingerprint.as_deref(),
+                };
+                let fingerprint = graph
+                    .download_queued(&drive_id, remote_id, &token, destination, etag, size)
+                    .await?;
+                sync.lock()
+                    .unwrap()
+                    .finish_downloaded(&operation, &fingerprint)
+                    .map_err(|_| QueuedDownloadError::Failed)
+            }
+            .await;
+            if let Err(error) = &result {
+                let update = match error {
+                    QueuedDownloadError::Changed => sync
+                        .lock()
+                        .unwrap()
+                        .mark_blocked(id, "download needs review"),
+                    QueuedDownloadError::Failed => sync
+                        .lock()
+                        .unwrap()
+                        .mark_retry(id, "download failed; retry is possible"),
+                };
+                if update.is_err() {
+                    eprintln!("cannot update download queue status");
+                }
+            }
+            *state.lock().unwrap() = if result.is_ok() {
+                EngineState::Connected
+            } else {
+                EngineState::Error
+            };
+            in_progress.store(false, Ordering::SeqCst);
+        });
+        Ok(id)
     }
 
     fn download_item(&self, item_id: &str, target_path: &str) -> zbus::fdo::Result<()> {

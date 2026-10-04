@@ -630,6 +630,40 @@ impl SyncStore {
         Ok(next)
     }
 
+    pub fn claim_download(&mut self) -> Result<Option<QueuedOperation>, SyncError> {
+        let transaction = self.connection.transaction()?;
+        let next: Option<QueuedOperation> = transaction
+            .query_row(
+                "SELECT id, kind, path, remote_id, expected_etag, attempts, local_fingerprint, from_path
+                 FROM operation WHERE status = 'pending' AND approved = 1
+                   AND kind IN ('DownloadNew', 'DownloadChanged')
+                   AND NOT EXISTS (SELECT 1 FROM sync_control WHERE singleton = 1 AND paused = 1)
+                 ORDER BY id LIMIT 1",
+                [],
+                |row| {
+                    Ok(QueuedOperation {
+                        id: row.get(0)?,
+                        kind: row.get(1)?,
+                        path: row.get(2)?,
+                        remote_id: row.get(3)?,
+                        expected_etag: row.get(4)?,
+                        attempts: row.get::<_, u32>(5)? + 1,
+                        local_fingerprint: row.get(6)?,
+                        from_path: row.get(7)?,
+                    })
+                },
+            )
+            .optional()?;
+        if let Some(operation) = &next {
+            transaction.execute(
+                "UPDATE operation SET status = 'running', attempts = attempts + 1 WHERE id = ?1",
+                [operation.id],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(next)
+    }
+
     pub fn mark_blocked(&self, id: i64, reason: &str) -> Result<(), SyncError> {
         self.connection.execute(
             "UPDATE operation SET status = 'blocked', last_error = ?2 WHERE id = ?1 AND status = 'running'",
@@ -673,6 +707,41 @@ impl SyncStore {
         transaction.execute(
             "DELETE FROM transfer WHERE operation_id = ?1",
             [operation.id],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn finish_downloaded(
+        &mut self,
+        operation: &QueuedOperation,
+        fingerprint: &str,
+    ) -> Result<(), SyncError> {
+        if !matches!(operation.kind.as_str(), "DownloadNew" | "DownloadChanged")
+            || operation.remote_id.as_deref().is_none_or(str::is_empty)
+            || operation.expected_etag.as_deref().is_none_or(str::is_empty)
+            || fingerprint.is_empty()
+        {
+            return Err(SyncError::InvalidCheckpoint);
+        }
+        let transaction = self.connection.transaction()?;
+        let changed = transaction.execute(
+            "UPDATE operation SET status = 'done', last_error = NULL WHERE id = ?1 AND status = 'running'",
+            [operation.id],
+        )?;
+        if changed != 1 {
+            return Err(SyncError::InvalidCheckpoint);
+        }
+        transaction.execute(
+            "INSERT INTO mapping(remote_id, path, etag, fingerprint) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(remote_id) DO UPDATE SET path = excluded.path,
+                 etag = excluded.etag, fingerprint = excluded.fingerprint",
+            params![
+                operation.remote_id,
+                operation.path,
+                operation.expected_etag,
+                fingerprint
+            ],
         )?;
         transaction.commit()?;
         Ok(())
@@ -1974,6 +2043,27 @@ mod tests {
         assert_eq!(store.enqueue_safe_downloads(&items, "root").unwrap(), 2);
         assert_eq!(store.enqueue_safe_downloads(&items, "root").unwrap(), 0);
         assert_eq!(store.pending_count().unwrap(), 2);
+        let first = store.claim_download().unwrap().unwrap();
+        assert_eq!(first.kind, "DownloadChanged");
+        assert_eq!(first.expected_etag.as_deref(), Some("v2"));
+        store.finish_downloaded(&first, "new-hash").unwrap();
+        assert_eq!(
+            store
+                .baselines()
+                .unwrap()
+                .iter()
+                .find(|item| item.remote_id == "changed")
+                .unwrap()
+                .fingerprint,
+            "new-hash"
+        );
+        let second = store.claim_download().unwrap().unwrap();
+        assert_eq!(second.kind, "DownloadNew");
+        store.mark_retry(second.id, "offline").unwrap();
+        store.set_paused(true).unwrap();
+        assert!(store.claim_download().unwrap().is_none());
+        store.set_paused(false).unwrap();
+        assert_eq!(store.claim_download().unwrap().unwrap().id, second.id);
     }
 
     #[cfg(unix)]

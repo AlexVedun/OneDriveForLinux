@@ -46,6 +46,27 @@ struct UploadedItem {
     etag: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct DownloadItemVersion {
+    id: String,
+    #[serde(rename = "eTag")]
+    etag: Option<String>,
+    size: Option<u64>,
+    file: Option<serde_json::Value>,
+}
+
+#[derive(Debug)]
+pub enum QueuedDownloadError {
+    Changed,
+    Failed,
+}
+
+pub struct QueuedDownloadTarget<'a> {
+    pub root: &'a Path,
+    pub path: &'a Path,
+    pub expected_local: Option<&'a str>,
+}
+
 pub struct GraphUpload<'a> {
     pub graph: &'a GraphClient,
     pub drive_id: &'a str,
@@ -207,6 +228,23 @@ fn item_content_url(drive_id: &str, item_id: &str) -> Result<reqwest::Url, Fetch
     Ok(url)
 }
 
+fn item_metadata_url(drive_id: &str, item_id: &str) -> Result<reqwest::Url, FetchError> {
+    let mut url = item_content_url(drive_id, item_id)?;
+    url.path_segments_mut()
+        .map_err(|_| FetchError::Failed)?
+        .pop();
+    url.query_pairs_mut()
+        .append_pair("$select", "id,eTag,size,file");
+    Ok(url)
+}
+
+fn version_matches(item: &DownloadItemVersion, id: &str, etag: &str, size: u64) -> bool {
+    item.id == id
+        && item.etag.as_deref() == Some(etag)
+        && item.size == Some(size)
+        && item.file.is_some()
+}
+
 async fn upload_error(response: reqwest::Response) -> UploadError {
     match response.status() {
         StatusCode::NOT_FOUND => UploadError::Expired,
@@ -351,6 +389,99 @@ impl GraphClient {
         target: &Path,
         expected_size: Option<u64>,
     ) -> Result<(), FetchError> {
+        let mut response = self
+            .content_response(drive_id, item_id, access_token)
+            .await?;
+        let mut transfer = AtomicDownload::new(target).map_err(|_| FetchError::Failed)?;
+        while let Some(chunk) = response.chunk().await.map_err(|_| FetchError::Failed)? {
+            transfer
+                .write_chunk(&chunk)
+                .await
+                .map_err(|_| FetchError::Failed)?;
+        }
+        transfer
+            .finish(target, expected_size)
+            .await
+            .map_err(|_| FetchError::Failed)
+    }
+
+    pub async fn download_queued(
+        &self,
+        drive_id: &str,
+        item_id: &str,
+        access_token: &str,
+        target: QueuedDownloadTarget<'_>,
+        expected_etag: &str,
+        expected_size: u64,
+    ) -> Result<String, QueuedDownloadError> {
+        let before = self
+            .item_version(drive_id, item_id, access_token)
+            .await
+            .map_err(|_| QueuedDownloadError::Failed)?;
+        if !version_matches(&before, item_id, expected_etag, expected_size) {
+            return Err(QueuedDownloadError::Changed);
+        }
+        let mut transfer =
+            AtomicDownload::new_queued(target.root, target.path, target.expected_local.is_some())
+                .map_err(|_| QueuedDownloadError::Changed)?;
+        let mut response = self
+            .content_response(drive_id, item_id, access_token)
+            .await
+            .map_err(|_| QueuedDownloadError::Failed)?;
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|_| QueuedDownloadError::Failed)?
+        {
+            transfer
+                .write_chunk(&chunk)
+                .await
+                .map_err(|_| QueuedDownloadError::Failed)?;
+        }
+        let after = self
+            .item_version(drive_id, item_id, access_token)
+            .await
+            .map_err(|_| QueuedDownloadError::Failed)?;
+        if !version_matches(&after, item_id, expected_etag, expected_size) {
+            return Err(QueuedDownloadError::Changed);
+        }
+        transfer
+            .finish_queued(
+                target.root,
+                target.path,
+                expected_size,
+                target.expected_local,
+            )
+            .await
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    QueuedDownloadError::Changed
+                } else {
+                    QueuedDownloadError::Failed
+                }
+            })
+    }
+
+    async fn item_version(
+        &self,
+        drive_id: &str,
+        item_id: &str,
+        access_token: &str,
+    ) -> Result<DownloadItemVersion, FetchError> {
+        let url = item_metadata_url(drive_id, item_id)?;
+        self.get_with_retry(url.as_str(), access_token)
+            .await?
+            .json()
+            .await
+            .map_err(|_| FetchError::Failed)
+    }
+
+    async fn content_response(
+        &self,
+        drive_id: &str,
+        item_id: &str,
+        access_token: &str,
+    ) -> Result<reqwest::Response, FetchError> {
         let url = item_content_url(drive_id, item_id)?;
         let download_http = Client::builder()
             .redirect(reqwest::redirect::Policy::none())
@@ -385,17 +516,7 @@ impl GraphClient {
         if !response.status().is_success() {
             return Err(FetchError::Failed);
         }
-        let mut transfer = AtomicDownload::new(target).map_err(|_| FetchError::Failed)?;
-        while let Some(chunk) = response.chunk().await.map_err(|_| FetchError::Failed)? {
-            transfer
-                .write_chunk(&chunk)
-                .await
-                .map_err(|_| FetchError::Failed)?;
-        }
-        transfer
-            .finish(target, expected_size)
-            .await
-            .map_err(|_| FetchError::Failed)
+        Ok(response)
     }
 
     async fn get_with_retry(
@@ -442,6 +563,20 @@ mod tests {
     use reqwest::header::AUTHORIZATION;
 
     #[test]
+    fn queued_download_requires_exact_remote_version() {
+        let item = DownloadItemVersion {
+            id: "item".into(),
+            etag: Some("v2".into()),
+            size: Some(4),
+            file: Some(serde_json::json!({})),
+        };
+        assert!(version_matches(&item, "item", "v2", 4));
+        assert!(!version_matches(&item, "other", "v2", 4));
+        assert!(!version_matches(&item, "item", "v1", 4));
+        assert!(!version_matches(&item, "item", "v2", 3));
+    }
+
+    #[test]
     fn session_fragments_never_carry_bearer_token() {
         let graph = GraphClient::new().unwrap();
         let upload = GraphUpload::new(&graph, "drive", "test-token").unwrap();
@@ -480,6 +615,10 @@ mod tests {
         assert_eq!(
             item_content_url("drive", "item").unwrap().path(),
             "/v1.0/drives/drive/items/item/content"
+        );
+        assert_eq!(
+            item_metadata_url("drive", "item").unwrap().path(),
+            "/v1.0/drives/drive/items/item"
         );
     }
 
