@@ -29,6 +29,17 @@ struct UiOperation {
     requires_confirmation: bool,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct UiReviewOperation {
+    id: i64,
+    kind: String,
+    path: String,
+    from_path: Option<String>,
+    remote_id: Option<String>,
+    expected_etag: Option<String>,
+    can_approve: bool,
+}
+
 fn daemon_call<R>(method: &str) -> zbus::Result<R>
 where
     R: for<'de> zbus::zvariant::DynamicDeserialize<'de>,
@@ -64,6 +75,65 @@ fn read_sync_preview() -> Result<UiPreview, String> {
     serde_json::from_str(&json).map_err(|error| error.to_string())
 }
 
+fn read_review_operations() -> Result<Vec<UiReviewOperation>, String> {
+    let json: String = daemon_call("ReviewOperations").map_err(|error| error.to_string())?;
+    serde_json::from_str(&json).map_err(|error| error.to_string())
+}
+
+fn queue_and_read_review() -> Result<(Vec<UiReviewOperation>, Option<String>), String> {
+    let queue_result: zbus::Result<u64> = daemon_call("QueueReviewActions");
+    let operations = read_review_operations()?;
+    Ok((
+        operations,
+        queue_result.err().map(|error| error.to_string()),
+    ))
+}
+
+fn decide_review_operation(id: i64, approve: bool) -> zbus::Result<()> {
+    let connection = zbus::blocking::Connection::session()?;
+    let proxy = zbus::blocking::Proxy::new(&connection, BUS_NAME, OBJECT_PATH, INTERFACE_NAME)?;
+    proxy.call(
+        if approve {
+            "ApproveOperation"
+        } else {
+            "DismissOperation"
+        },
+        &(id),
+    )
+}
+
+fn review_title(operation: &UiReviewOperation) -> String {
+    let action = match operation.kind.as_str() {
+        "DeleteRemote" => "Удалить в OneDrive",
+        "DeleteLocal" => "Убрать локальный файл",
+        "RenameRemote" => "Переименовать в OneDrive",
+        "Conflict" => "Конфликт",
+        _ => "Требует рассмотрения",
+    };
+    let path = operation.from_path.as_ref().map_or_else(
+        || operation.path.clone(),
+        |source| format!("{source} → {}", operation.path),
+    );
+    format!("{action}: {path}")
+}
+
+fn review_details(operation: &UiReviewOperation) -> String {
+    format!(
+        "№{} · ID OneDrive: {} · eTag: {}",
+        operation.id,
+        operation.remote_id.as_deref().unwrap_or("—"),
+        operation.expected_etag.as_deref().unwrap_or("—"),
+    )
+}
+
+fn review_approvable(operation: &UiReviewOperation) -> bool {
+    operation.can_approve
+        && matches!(
+            operation.kind.as_str(),
+            "DeleteRemote" | "DeleteLocal" | "RenameRemote"
+        )
+}
+
 fn preview_text(preview: UiPreview) -> String {
     let mut lines = vec![format!(
         "Операций: {} · пропущено: {}",
@@ -89,6 +159,146 @@ fn preview_text(preview: UiPreview) -> String {
         lines.push(format!("Пропущено: {path}"));
     }
     lines.join("\n")
+}
+
+fn connect_review_decision(
+    button: &gtk::Button,
+    approve: bool,
+    operation_id: i64,
+    row: &gtk::Box,
+    rows: &gtk::Box,
+    status: &gtk::Label,
+    controls: &[gtk::Button],
+) {
+    let row = row.clone();
+    let rows = rows.clone();
+    let status = status.clone();
+    let controls = controls.to_vec();
+    button.connect_clicked(move |_| {
+        for control in &controls {
+            control.set_sensitive(false);
+        }
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(decide_review_operation(operation_id, approve));
+        });
+        let row = row.clone();
+        let rows = rows.clone();
+        let status = status.clone();
+        let controls = controls.clone();
+        gtk::glib::timeout_add_local(Duration::from_millis(100), move || {
+            match receiver.try_recv() {
+                Ok(Ok(())) => {
+                    rows.remove(&row);
+                    status.set_text(if approve {
+                        "Операция подтверждена и остаётся в очереди"
+                    } else {
+                        "Операция отклонена"
+                    });
+                    if rows.first_child().is_none() {
+                        rows.append(&gtk::Label::new(Some("Нет операций на рассмотрении")));
+                    }
+                    gtk::glib::ControlFlow::Break
+                }
+                Ok(Err(error)) => {
+                    status.set_text(&format!("Не удалось сохранить решение: {error}"));
+                    for control in &controls {
+                        control.set_sensitive(true);
+                    }
+                    gtk::glib::ControlFlow::Break
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    status.set_text("Не удалось сохранить решение");
+                    for control in &controls {
+                        control.set_sensitive(true);
+                    }
+                    gtk::glib::ControlFlow::Break
+                }
+            }
+        });
+    });
+}
+
+fn present_review_dialog(
+    parent: &adw::ApplicationWindow,
+    status: &gtk::Label,
+    operations: Vec<UiReviewOperation>,
+) {
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    content.set_margin_start(18);
+    content.set_margin_end(18);
+    content.set_margin_top(18);
+    content.set_margin_bottom(18);
+    let hint = gtk::Label::new(Some(
+        "Подтверждение сохраняет решение. Выполнение операции запускается отдельно.",
+    ));
+    hint.set_wrap(true);
+    hint.set_xalign(0.0);
+    content.append(&hint);
+    let rows = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    if operations.is_empty() {
+        rows.append(&gtk::Label::new(Some("Нет операций на рассмотрении")));
+    }
+    for operation in operations {
+        let approvable = review_approvable(&operation);
+        let row = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        let title = gtk::Label::new(Some(&review_title(&operation)));
+        title.set_xalign(0.0);
+        title.set_wrap(true);
+        title.set_selectable(true);
+        row.append(&title);
+        let details = gtk::Label::new(Some(&review_details(&operation)));
+        details.set_xalign(0.0);
+        details.set_wrap(true);
+        details.set_selectable(true);
+        row.append(&details);
+        let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        let mut controls = Vec::new();
+        if approvable {
+            let approve = gtk::Button::with_label("Подтвердить");
+            buttons.append(&approve);
+            controls.push(approve);
+        } else {
+            let conflict = gtk::Label::new(Some("Нужно отдельное разрешение конфликта"));
+            conflict.set_xalign(0.0);
+            buttons.append(&conflict);
+        }
+        let dismiss = gtk::Button::with_label(if approvable {
+            "Отклонить"
+        } else {
+            "Скрыть"
+        });
+        buttons.append(&dismiss);
+        controls.push(dismiss);
+        row.append(&buttons);
+        rows.append(&row);
+        for (index, control) in controls.iter().enumerate() {
+            connect_review_decision(
+                control,
+                approvable && index == 0,
+                operation.id,
+                &row,
+                &rows,
+                status,
+                &controls,
+            );
+        }
+    }
+    let scroll = gtk::ScrolledWindow::builder()
+        .child(&rows)
+        .vexpand(true)
+        .hexpand(true)
+        .build();
+    content.append(&scroll);
+    let dialog = gtk::Window::builder()
+        .transient_for(parent)
+        .title("Операции на рассмотрении")
+        .default_width(700)
+        .default_height(460)
+        .child(&content)
+        .build();
+    dialog.present();
 }
 
 fn flatten_tree(items: Vec<UiItem>) -> Vec<(usize, UiItem)> {
@@ -244,6 +454,7 @@ fn main() {
         let download = gtk::Button::with_label("Скачать выбранный файл");
         let choose_sync = gtk::Button::with_label("Папка синхронизации");
         let preview_sync = gtk::Button::with_label("План синхронизации");
+        let review = gtk::Button::with_label("Рассмотреть изменения");
         let controls = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         controls.append(&login);
         controls.append(&scan);
@@ -252,6 +463,7 @@ fn main() {
         let sync_controls = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         sync_controls.append(&choose_sync);
         sync_controls.append(&preview_sync);
+        sync_controls.append(&review);
         let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
         content.set_margin_start(18);
         content.set_margin_end(18);
@@ -366,6 +578,46 @@ fn main() {
                 gtk::glib::ControlFlow::Break
             });
         });
+        let window_for_review = window.clone();
+        let status_for_review = status.clone();
+        review.connect_clicked(move |button| {
+            button.set_sensitive(false);
+            status_for_review.set_text("Проверка изменений…");
+            let (sender, receiver) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = sender.send(queue_and_read_review());
+            });
+            let button = button.clone();
+            let parent = window_for_review.clone();
+            let status = status_for_review.clone();
+            gtk::glib::timeout_add_local(Duration::from_millis(100), move || {
+                match receiver.try_recv() {
+                    Ok(Ok((operations, queue_error))) => {
+                        match queue_error {
+                            Some(error) => status.set_text(&format!(
+                                "Не удалось обновить план; показана сохранённая очередь: {error}"
+                            )),
+                            None => status.set_text(&format!(
+                                "Операций на рассмотрении: {}",
+                                operations.len()
+                            )),
+                        }
+                        present_review_dialog(&parent, &status, operations);
+                    }
+                    Ok(Err(error)) => {
+                        status.set_text(&format!("Не удалось прочитать очередь: {error}"));
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        return gtk::glib::ControlFlow::Continue;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        status.set_text("Не удалось прочитать очередь");
+                    }
+                }
+                button.set_sensitive(true);
+                gtk::glib::ControlFlow::Break
+            });
+        });
         refresh_view(&status, &list);
         window.present();
     });
@@ -391,5 +643,28 @@ mod tests {
         assert_eq!(tree[0].1.item_id, "folder");
         assert_eq!(tree[1].1.item_id, "child");
         assert_eq!(tree[1].0, 1);
+    }
+
+    #[test]
+    fn review_queue_preserves_operation_identity_and_blocks_conflict_approval() {
+        let operations: Vec<UiReviewOperation> = serde_json::from_str(
+            r#"[
+              {"id":12,"kind":"RenameRemote","path":"new.txt","from_path":"old.txt","remote_id":"remote-1","expected_etag":"etag-1","can_approve":true},
+              {"id":13,"kind":"Conflict","path":"clash.txt","from_path":null,"remote_id":null,"expected_etag":null,"can_approve":false},
+              {"id":14,"kind":"Conflict","path":"unsafe.txt","from_path":null,"remote_id":null,"expected_etag":null,"can_approve":true}
+            ]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            review_title(&operations[0]),
+            "Переименовать в OneDrive: old.txt → new.txt"
+        );
+        assert_eq!(
+            review_details(&operations[0]),
+            "№12 · ID OneDrive: remote-1 · eTag: etag-1"
+        );
+        assert!(review_approvable(&operations[0]));
+        assert!(!review_approvable(&operations[1]));
+        assert!(!review_approvable(&operations[2]));
     }
 }
