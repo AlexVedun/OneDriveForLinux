@@ -19,6 +19,39 @@ pub struct FolderPreparation {
     pub skipped_item_ids: Vec<String>,
 }
 
+/// Enumerate local directories through directory descriptors. A link that
+/// appears during traversal cannot redirect the scan outside the sync root.
+pub fn scan_local_directories(root: &Path) -> Result<Vec<String>, SyncError> {
+    let root_dir = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(root)?;
+    let mut pending = vec![(root_dir, String::new())];
+    let mut paths = Vec::new();
+    while let Some((directory, prefix)) = pending.pop() {
+        for entry in fs::read_dir(format!("/proc/self/fd/{}", directory.as_raw_fd()))? {
+            let entry = entry?;
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if !valid_name(&name) || !entry.file_type()?.is_dir() {
+                continue;
+            }
+            if let Some(child) = open_existing(&directory, &name)? {
+                let path = if prefix.is_empty() {
+                    name
+                } else {
+                    format!("{prefix}/{name}")
+                };
+                paths.push(path.clone());
+                pending.push((child, path));
+            }
+        }
+    }
+    paths.sort();
+    Ok(paths)
+}
+
 pub fn prepare(
     root: &Path,
     items: &[CatalogItem],
@@ -265,6 +298,55 @@ mod tests {
             ["Docs"]
         );
         assert_eq!(store.enqueue_safe_downloads(&items, "root").unwrap(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn queues_only_directories_with_existing_exact_remote_parent() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("sync");
+        let state = temp.path().join("state");
+        let outside = temp.path().join("outside");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&state).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::create_dir(root.join("New")).unwrap();
+        fs::create_dir(root.join("New/Child")).unwrap();
+        fs::create_dir(root.join("Docs")).unwrap();
+        fs::create_dir(root.join("Docs/Ready")).unwrap();
+        fs::create_dir(root.join("Case")).unwrap();
+        fs::create_dir(root.join("Taken")).unwrap();
+        symlink(&outside, root.join("Linked")).unwrap();
+        let mut taken = folder("taken", "root", "Taken");
+        taken.kind = "file".into();
+        let items = [
+            folder("docs", "root", "Docs"),
+            folder("case", "root", "case"),
+            taken,
+        ];
+        let database = state.join("sync.sqlite3");
+        let mut store = SyncStore::open(&database).unwrap();
+        store.set_root(&root, &state).unwrap();
+        assert_eq!(
+            store.enqueue_safe_remote_folders(&items, "root").unwrap(),
+            2
+        );
+        assert_eq!(
+            store.enqueue_safe_remote_folders(&items, "root").unwrap(),
+            0
+        );
+        drop(store);
+        let mut store = SyncStore::open(&database).unwrap();
+        let first = store.claim_next().unwrap().unwrap();
+        let second = store.claim_next().unwrap().unwrap();
+        let queued = [
+            (first.path, first.remote_id),
+            (second.path, second.remote_id),
+        ];
+        assert!(queued.contains(&("New".into(), Some("root".into()))));
+        assert!(queued.contains(&("Docs/Ready".into(), Some("docs".into()))));
+        assert!(store.claim_next().unwrap().is_none());
     }
 
     #[cfg(unix)]
