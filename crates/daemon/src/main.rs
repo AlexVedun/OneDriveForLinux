@@ -192,6 +192,43 @@ impl Daemon {
         .map_err(|_| zbus::fdo::Error::Failed("queue task failed".to_owned()))?
     }
 
+    async fn queue_safe_downloads(&self) -> zbus::fdo::Result<u64> {
+        let catalog = Arc::clone(&self.catalog);
+        let sync = Arc::clone(&self.sync);
+        tokio::task::spawn_blocking(move || {
+            let catalog = catalog.lock().unwrap();
+            let drive_id = catalog
+                .active_drive_id()
+                .map_err(|_| zbus::fdo::Error::Failed("cannot read catalog".to_owned()))?
+                .ok_or_else(|| zbus::fdo::Error::Failed("OneDrive catalog is empty".to_owned()))?;
+            if !catalog
+                .is_complete(&drive_id)
+                .map_err(|_| zbus::fdo::Error::Failed("cannot read catalog cursor".to_owned()))?
+            {
+                return Err(zbus::fdo::Error::Failed(
+                    "catalog scan is incomplete".to_owned(),
+                ));
+            }
+            let items = catalog
+                .items(&drive_id)
+                .map_err(|_| zbus::fdo::Error::Failed("cannot read catalog".to_owned()))?;
+            let root_id = catalog
+                .root_id(&drive_id)
+                .map_err(|_| zbus::fdo::Error::Failed("cannot read drive root".to_owned()))?
+                .ok_or_else(|| {
+                    zbus::fdo::Error::Failed("OneDrive root ID is missing".to_owned())
+                })?;
+            drop(catalog);
+            let mut sync = sync.lock().unwrap();
+            sync.bind_drive(&drive_id)
+                .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
+            sync.enqueue_safe_downloads(&items, &root_id)
+                .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))
+        })
+        .await
+        .map_err(|_| zbus::fdo::Error::Failed("queue task failed".to_owned()))?
+    }
+
     async fn queue_upload_changed(&self, item_id: &str) -> zbus::fdo::Result<i64> {
         queue_upload_candidate(
             Arc::clone(&self.catalog),
