@@ -11,6 +11,7 @@ use onedrive_core::{BUS_NAME, EngineState, OBJECT_PATH};
 use onedrive_sync::{
     Action, SyncStore,
     monitor::LocalMonitor,
+    remote_parent_exists,
     upload::{UploadError, UploadStep, upload_queued},
 };
 use std::fs::{self, OpenOptions};
@@ -484,7 +485,9 @@ async fn queue_upload_candidate(
                 Action::UploadNew => {
                     operation.action == Action::UploadNew
                         && operation.path == selector
-                        && !selector.contains('/')
+                        && root_id
+                            .as_deref()
+                            .is_some_and(|root_id| remote_parent_exists(&items, root_id, &selector))
                 }
                 _ => false,
             })

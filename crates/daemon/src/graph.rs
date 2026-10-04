@@ -101,24 +101,25 @@ impl<'a> GraphUpload<'a> {
                     .map_err(|_| UploadError::InvalidResponse)
             }
             "UploadNew" => {
-                let name = &operation.path;
+                let parts: Vec<_> = operation.path.split('/').collect();
+                let name = parts.last().ok_or(UploadError::InvalidResponse)?;
                 if operation.remote_id.is_some()
                     || operation.expected_etag.is_some()
-                    || !valid_new_file_name(name)
+                    || parts.iter().any(|part| !valid_new_file_name(part))
                     || size == 0
                 {
                     return Err(UploadError::InvalidResponse);
                 }
-                url.path_segments_mut()
-                    .map_err(|_| UploadError::InvalidResponse)?
+                let mut segments = url
+                    .path_segments_mut()
+                    .map_err(|_| UploadError::InvalidResponse)?;
+                segments
                     .pop_if_empty()
-                    .extend([
-                        "drives",
-                        self.drive_id,
-                        "root:",
-                        &format!("{name}:"),
-                        "createUploadSession",
-                    ]);
+                    .extend(["drives", self.drive_id, "root:"]);
+                segments.extend(parts[..parts.len() - 1].iter().copied());
+                segments.push(&format!("{name}:"));
+                segments.push("createUploadSession");
+                drop(segments);
                 self.graph
                     .http
                     .post(url)
@@ -508,7 +509,15 @@ mod tests {
         assert_eq!(body["item"]["@microsoft.graph.conflictBehavior"], "fail");
         assert_eq!(body["item"]["name"], "new file.txt");
         assert_eq!(body["item"]["fileSize"], 42);
+        operation.path = "Docs/Work/new file.txt".into();
+        let nested = upload.create_session_request(&operation, 42).unwrap();
+        assert_eq!(
+            nested.url().path(),
+            "/v1.0/drives/drive/root:/Docs/Work/new%20file.txt:/createUploadSession"
+        );
         operation.path = "../secret".into();
+        assert!(upload.create_session_request(&operation, 42).is_err());
+        operation.path = "Docs//secret".into();
         assert!(upload.create_session_request(&operation, 42).is_err());
         operation.path = "new.txt".into();
         operation.remote_id = Some("existing".into());
