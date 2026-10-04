@@ -785,6 +785,38 @@ fn valid_name(name: &str) -> bool {
             .any(|character| "\"*:<>?/\\|".contains(character) || character.is_control())
 }
 
+/// Accept an upload path only when every parent is a uniquely identified
+/// folder in the complete remote catalog. Case variants are ambiguous.
+pub fn remote_parent_exists(items: &[CatalogItem], root_id: &str, path: &str) -> bool {
+    let parts: Vec<_> = path.split('/').collect();
+    if parts.is_empty() || parts.iter().any(|part| !valid_name(part)) {
+        return false;
+    }
+    let mut parent_id = root_id;
+    for part in &parts[..parts.len() - 1] {
+        let folded = part.to_lowercase();
+        let mut matching = items.iter().filter(|item| {
+            !item.deleted
+                && item.parent_id.as_deref() == Some(parent_id)
+                && item
+                    .name
+                    .as_ref()
+                    .is_some_and(|name| name.to_lowercase() == folded)
+        });
+        let Some(folder) = matching.next() else {
+            return false;
+        };
+        if matching.next().is_some()
+            || folder.kind != "folder"
+            || folder.name.as_deref() != Some(part)
+        {
+            return false;
+        }
+        parent_id = &folder.item_id;
+    }
+    true
+}
+
 pub fn remote_files(items: &[CatalogItem], root_id: &str) -> (Vec<RemoteFile>, Vec<String>) {
     let by_id: HashMap<&str, &CatalogItem> = items
         .iter()
@@ -1073,6 +1105,45 @@ mod tests {
             etag: Some(etag.into()),
             fingerprint: fingerprint.into(),
         }
+    }
+
+    fn folder(id: &str, parent_id: &str, name: &str) -> CatalogItem {
+        CatalogItem {
+            drive_id: "drive".into(),
+            item_id: id.into(),
+            parent_id: Some(parent_id.into()),
+            name: Some(name.into()),
+            kind: "folder".into(),
+            size: None,
+            etag: None,
+            ctag: None,
+            modified: None,
+            deleted: false,
+        }
+    }
+
+    #[test]
+    fn nested_upload_requires_exact_unambiguous_remote_parent() {
+        let items = [folder("a", "root", "Docs"), folder("b", "a", "Drafts")];
+        assert!(remote_parent_exists(
+            &items,
+            "root",
+            "Docs/Drafts/report.txt"
+        ));
+        assert!(remote_parent_exists(&items, "root", "root.txt"));
+        assert!(!remote_parent_exists(
+            &items,
+            "root",
+            "Docs/Missing/report.txt"
+        ));
+        assert!(!remote_parent_exists(
+            &items,
+            "root",
+            "docs/Drafts/report.txt"
+        ));
+        assert!(!remote_parent_exists(&items, "root", "Docs//report.txt"));
+        let ambiguous = [folder("a", "root", "Docs"), folder("b", "root", "docs")];
+        assert!(!remote_parent_exists(&ambiguous, "root", "Docs/report.txt"));
     }
 
     #[test]
