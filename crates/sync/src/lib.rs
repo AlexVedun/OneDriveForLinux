@@ -1,5 +1,6 @@
 //! Offline sync planning. It never changes local or remote files.
 
+pub mod folders;
 pub mod monitor;
 pub mod upload;
 
@@ -466,6 +467,15 @@ impl SyncStore {
             }
         }
         Ok(self.pending_count()?.saturating_sub(before))
+    }
+
+    pub fn prepare_local_folders(
+        &self,
+        remote_items: &[CatalogItem],
+        root_id: &str,
+    ) -> Result<folders::FolderPreparation, SyncError> {
+        let root = self.root()?.ok_or(SyncError::InvalidRoot)?;
+        folders::prepare(&root, remote_items, root_id)
     }
 
     /// Save a plan before any network work. Actions that need review stay
