@@ -5,7 +5,7 @@ mod transfer;
 use auth::LoginAttempt;
 use graph::{
     FolderCreateError, GraphClient, GraphUpload, QueuedDownloadError, QueuedDownloadTarget,
-    RemoteRenameError, RemoteRenameInput,
+    RemoteDeleteError, RemoteRenameError, RemoteRenameInput,
 };
 use keyring::v1::Entry;
 use oauth2::{TokenResponse, basic::BasicTokenResponse};
@@ -14,7 +14,7 @@ use onedrive_core::{BUS_NAME, EngineState, OBJECT_PATH};
 use onedrive_sync::{
     Action, Baseline, QueuedOperation, SyncStore,
     folders::local_directory_exists,
-    local_rename::{RenameError, apply as apply_local_rename, fingerprint_matches},
+    local_rename::{RenameError, apply as apply_local_rename, fingerprint_matches, path_is_absent},
     monitor::LocalMonitor,
     remote_files, remote_parent_exists, remote_parent_id, scan_local,
     upload::{UploadError, UploadStep, upload_queued},
@@ -717,6 +717,167 @@ impl Daemon {
                 };
                 if update.is_err() {
                     eprintln!("cannot update remote rename queue status");
+                }
+            }
+            *state.lock().unwrap() = if result.is_ok() {
+                EngineState::Connected
+            } else {
+                EngineState::Error
+            };
+            in_progress.store(false, Ordering::SeqCst);
+        });
+        Ok(id)
+    }
+
+    async fn run_queued_remote_delete(&self) -> zbus::fdo::Result<i64> {
+        if std::env::var("ONEDRIVE_EXPERIMENTAL_UPLOAD").as_deref() != Ok("1") {
+            return Err(zbus::fdo::Error::Failed(
+                "remote deletion is experimental and disabled".to_owned(),
+            ));
+        }
+        if self.sync_paused()? {
+            return Err(zbus::fdo::Error::Failed("sync is paused".to_owned()));
+        }
+        let client_id = client_id().ok_or_else(|| {
+            zbus::fdo::Error::Failed("ONEDRIVE_CLIENT_ID is not configured".to_owned())
+        })?;
+        if self.scan_in_progress.load(Ordering::SeqCst)
+            || self.download_in_progress.load(Ordering::SeqCst)
+            || self
+                .upload_in_progress
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+        {
+            return Err(zbus::fdo::Error::Failed(
+                "another transfer is running".to_owned(),
+            ));
+        }
+        let token = match access_token(&client_id).await {
+            Ok(token) => token,
+            Err(_) => {
+                self.upload_in_progress.store(false, Ordering::SeqCst);
+                return Err(zbus::fdo::Error::Failed("login is required".to_owned()));
+            }
+        };
+        let catalog = Arc::clone(&self.catalog);
+        let sync = Arc::clone(&self.sync);
+        let prepare = tokio::task::spawn_blocking(move || {
+            let catalog = catalog.lock().unwrap();
+            let drive_id = catalog
+                .active_drive_id()
+                .map_err(|_| zbus::fdo::Error::Failed("cannot read catalog".to_owned()))?
+                .ok_or_else(|| zbus::fdo::Error::Failed("OneDrive catalog is empty".to_owned()))?;
+            if !catalog
+                .is_complete(&drive_id)
+                .map_err(|_| zbus::fdo::Error::Failed("cannot read catalog cursor".to_owned()))?
+            {
+                return Err(zbus::fdo::Error::Failed(
+                    "catalog scan is incomplete".to_owned(),
+                ));
+            }
+            let root_id = catalog
+                .root_id(&drive_id)
+                .map_err(|_| zbus::fdo::Error::Failed("cannot read drive root".to_owned()))?
+                .ok_or_else(|| {
+                    zbus::fdo::Error::Failed("OneDrive root ID is missing".to_owned())
+                })?;
+            let items = catalog
+                .items(&drive_id)
+                .map_err(|_| zbus::fdo::Error::Failed("cannot read catalog".to_owned()))?;
+            drop(catalog);
+            let (operation, root, baselines) = {
+                let mut store = sync.lock().unwrap();
+                store
+                    .ensure_drive(&drive_id)
+                    .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
+                let root = store
+                    .root()
+                    .map_err(|_| zbus::fdo::Error::Failed("cannot read sync root".to_owned()))?
+                    .ok_or_else(|| {
+                        zbus::fdo::Error::Failed("sync root is not configured".to_owned())
+                    })?;
+                let operation = store
+                    .claim_remote_delete()
+                    .map_err(|_| zbus::fdo::Error::Failed("cannot read delete queue".to_owned()))?
+                    .ok_or_else(|| {
+                        zbus::fdo::Error::Failed(
+                            "no approved remote deletion is pending".to_owned(),
+                        )
+                    })?;
+                let baselines = store.baselines().map_err(|_| {
+                    zbus::fdo::Error::Failed("cannot read sync baseline".to_owned())
+                })?;
+                (operation, root, baselines)
+            };
+            let Some(candidate) =
+                remote_delete_candidate(&items, &root_id, &root, &baselines, &operation)
+            else {
+                sync.lock()
+                    .unwrap()
+                    .mark_blocked(operation.id, "remote deletion needs review")
+                    .map_err(|_| {
+                        zbus::fdo::Error::Failed("cannot block stale deletion".to_owned())
+                    })?;
+                return Err(zbus::fdo::Error::Failed(
+                    "remote deletion needs review".to_owned(),
+                ));
+            };
+            Ok::<_, zbus::fdo::Error>((drive_id, operation, root, candidate))
+        })
+        .await
+        .map_err(|_| zbus::fdo::Error::Failed("delete task failed".to_owned()))?;
+        let (drive_id, operation, root, candidate) = match prepare {
+            Ok(value) => value,
+            Err(error) => {
+                self.upload_in_progress.store(false, Ordering::SeqCst);
+                return Err(error);
+            }
+        };
+        let id = operation.id;
+        let sync = Arc::clone(&self.sync);
+        let state = Arc::clone(&self.state);
+        let in_progress = Arc::clone(&self.upload_in_progress);
+        tokio::spawn(async move {
+            *state.lock().unwrap() = EngineState::Transferring;
+            let result = async {
+                let graph = GraphClient::new().map_err(|_| RemoteDeleteError::Retry)?;
+                graph
+                    .delete_remote_file(
+                        &drive_id,
+                        &candidate.item_id,
+                        &candidate.parent_id,
+                        &candidate.name,
+                        &candidate.etag,
+                        &token,
+                    )
+                    .await?;
+                let local_path = operation.path.clone();
+                let still_absent =
+                    tokio::task::spawn_blocking(move || path_is_absent(&root, &local_path))
+                        .await
+                        .map_err(|_| RemoteDeleteError::NeedsReconcile)?;
+                if !still_absent {
+                    return Err(RemoteDeleteError::NeedsReconcile);
+                }
+                sync.lock()
+                    .unwrap()
+                    .finish_remote_deleted(&operation)
+                    .map_err(|_| RemoteDeleteError::NeedsReconcile)
+            }
+            .await;
+            if let Err(error) = &result {
+                let update = match error {
+                    RemoteDeleteError::Conflict | RemoteDeleteError::NeedsReconcile => sync
+                        .lock()
+                        .unwrap()
+                        .mark_blocked(id, "remote deletion needs reconciliation"),
+                    RemoteDeleteError::Retry => sync
+                        .lock()
+                        .unwrap()
+                        .mark_retry(id, "remote deletion failed; retry is possible"),
+                };
+                if update.is_err() {
+                    eprintln!("cannot update remote deletion queue status");
                 }
             }
             *state.lock().unwrap() = if result.is_ok() {
@@ -1492,6 +1653,52 @@ fn remote_rename_candidate(
     })
 }
 
+struct RemoteDeleteCandidate {
+    item_id: String,
+    parent_id: String,
+    name: String,
+    etag: String,
+}
+
+fn remote_delete_candidate(
+    items: &[CatalogItem],
+    root_id: &str,
+    root: &std::path::Path,
+    baselines: &[Baseline],
+    operation: &QueuedOperation,
+) -> Option<RemoteDeleteCandidate> {
+    if operation.kind != "DeleteRemote" || operation.from_path.is_some() {
+        return None;
+    }
+    let item_id = operation.remote_id.as_deref()?;
+    let etag = operation.expected_etag.as_deref()?;
+    let fingerprint = operation.local_fingerprint.as_deref()?;
+    if item_id.is_empty()
+        || etag.is_empty()
+        || fingerprint.is_empty()
+        || !baselines.iter().any(|base| {
+            base.remote_id == item_id
+                && base.path == operation.path
+                && base.etag.as_deref() == Some(etag)
+                && base.fingerprint == fingerprint
+        })
+        || !remote_files(items, root_id).0.iter().any(|file| {
+            file.id == item_id && file.path == operation.path && file.etag.as_deref() == Some(etag)
+        })
+        || !path_is_absent(root, &operation.path)
+    {
+        return None;
+    }
+    let parent_id = remote_parent_id(items, root_id, &operation.path)?;
+    let name = operation.path.rsplit('/').next()?;
+    Some(RemoteDeleteCandidate {
+        item_id: item_id.to_owned(),
+        parent_id: parent_id.to_owned(),
+        name: name.to_owned(),
+        etag: etag.to_owned(),
+    })
+}
+
 fn watch_local_root(sync: Arc<Mutex<SyncStore>>, epoch: Arc<AtomicU64>) {
     std::thread::spawn(move || {
         let mut watched_root: Option<PathBuf> = None;
@@ -1858,7 +2065,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::{
         Baseline, CatalogItem, QueuedOperation, client_id_from_dotenv, client_id_from_sources,
-        remote_folder_candidate, remote_rename_candidate,
+        remote_delete_candidate, remote_folder_candidate, remote_rename_candidate,
     };
 
     #[test]
@@ -1984,6 +2191,97 @@ mod tests {
         std::fs::write(temp.path().join("moved.txt"), b"changed").unwrap();
         assert!(
             remote_rename_candidate(&[item], "root", temp.path(), &[base], &operation).is_none()
+        );
+    }
+
+    #[test]
+    fn remote_delete_candidate_requires_exact_mapping_remote_and_absence() {
+        let temp = tempfile::tempdir().unwrap();
+        let operation = QueuedOperation {
+            id: 1,
+            kind: "DeleteRemote".into(),
+            path: "gone.txt".into(),
+            from_path: None,
+            remote_id: Some("id".into()),
+            expected_etag: Some("v1".into()),
+            local_fingerprint: Some("hash".into()),
+            attempts: 1,
+        };
+        let base = Baseline {
+            remote_id: "id".into(),
+            path: "gone.txt".into(),
+            etag: Some("v1".into()),
+            fingerprint: "hash".into(),
+        };
+        let item = CatalogItem {
+            drive_id: "drive".into(),
+            item_id: "id".into(),
+            parent_id: Some("root".into()),
+            name: Some("gone.txt".into()),
+            kind: "file".into(),
+            size: Some(4),
+            etag: Some("v1".into()),
+            ctag: None,
+            modified: None,
+            deleted: false,
+        };
+        let candidate = remote_delete_candidate(
+            std::slice::from_ref(&item),
+            "root",
+            temp.path(),
+            std::slice::from_ref(&base),
+            &operation,
+        )
+        .unwrap();
+        assert_eq!(candidate.item_id, "id");
+        assert_eq!(candidate.parent_id, "root");
+        let mut changed = item.clone();
+        changed.etag = Some("v2".into());
+        assert!(
+            remote_delete_candidate(
+                &[changed],
+                "root",
+                temp.path(),
+                std::slice::from_ref(&base),
+                &operation,
+            )
+            .is_none()
+        );
+        std::fs::write(temp.path().join("gone.txt"), b"new").unwrap();
+        assert!(
+            remote_delete_candidate(
+                std::slice::from_ref(&item),
+                "root",
+                temp.path(),
+                std::slice::from_ref(&base),
+                &operation,
+            )
+            .is_none()
+        );
+        std::fs::remove_file(temp.path().join("gone.txt")).unwrap();
+        let mut nested = operation.clone();
+        nested.path = "missing/file.txt".into();
+        assert!(
+            remote_delete_candidate(
+                std::slice::from_ref(&item),
+                "root",
+                temp.path(),
+                std::slice::from_ref(&base),
+                &nested,
+            )
+            .is_none()
+        );
+        let mut wrong_baseline = base.clone();
+        wrong_baseline.fingerprint = "other".into();
+        assert!(
+            remote_delete_candidate(
+                std::slice::from_ref(&item),
+                "root",
+                temp.path(),
+                &[wrong_baseline],
+                &operation,
+            )
+            .is_none()
         );
     }
 
