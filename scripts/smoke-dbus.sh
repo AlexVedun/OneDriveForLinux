@@ -90,6 +90,11 @@ review_items=$(gdbus call --session \
     --object-path /io/github/onedrive_linux/Daemon \
     --method io.github.onedrive_linux.Daemon.ReviewOperations)
 test "$review_items" = "('[]',)"
+history=$(gdbus call --session \
+    --dest io.github.onedrive_linux.Daemon \
+    --object-path /io/github/onedrive_linux/Daemon \
+    --method io.github.onedrive_linux.Daemon.OperationHistory)
+test "$history" = "('{\"total\":0,\"operations\":[]}',)"
 if gdbus call --session \
     --dest io.github.onedrive_linux.Daemon \
     --object-path /io/github/onedrive_linux/Daemon \
