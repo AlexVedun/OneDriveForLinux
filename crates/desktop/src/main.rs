@@ -53,6 +53,28 @@ fn read_status() -> String {
     daemon_call("Status").unwrap_or_else(|_| "daemon-unavailable".to_owned())
 }
 
+fn read_sync_paused() -> zbus::Result<bool> {
+    daemon_call("SyncPaused")
+}
+
+fn toggle_sync_paused() -> zbus::Result<bool> {
+    let paused = read_sync_paused()?;
+    let connection = zbus::blocking::Connection::session()?;
+    let proxy = zbus::blocking::Proxy::new(&connection, BUS_NAME, OBJECT_PATH, INTERFACE_NAME)?;
+    let next = !paused;
+    let _: () = proxy.call("SetSyncPaused", &next)?;
+    read_sync_paused()
+}
+
+fn update_pause_button(button: &gtk::Button, paused: bool) {
+    button.set_label(if paused {
+        "Возобновить синхронизацию"
+    } else {
+        "Приостановить синхронизацию"
+    });
+    button.set_sensitive(true);
+}
+
 fn read_catalog() -> Result<Vec<UiItem>, String> {
     let json: String = daemon_call("CatalogItems").map_err(|error| error.to_string())?;
     serde_json::from_str(&json).map_err(|error| error.to_string())
@@ -401,8 +423,15 @@ fn populate_list(list: &gtk::ListBox, items: Vec<UiItem>) {
     }
 }
 
-fn refresh_view(status: &gtk::Label, list: &gtk::ListBox) {
+fn refresh_view(status: &gtk::Label, list: &gtk::ListBox, pause: &gtk::Button) {
     status.set_text(&format!("Состояние: {}", read_status()));
+    match read_sync_paused() {
+        Ok(paused) => update_pause_button(pause, paused),
+        Err(_) => {
+            pause.set_label("Пауза недоступна");
+            pause.set_sensitive(false);
+        }
+    }
     match read_catalog() {
         Ok(items) => populate_list(list, items),
         Err(_) => status.set_text("Не удалось прочитать каталог"),
@@ -448,9 +477,14 @@ fn main() {
             });
         });
         let reload = gtk::Button::with_label("Обновить список");
+        let pause = gtk::Button::with_label("Пауза недоступна");
+        pause.set_sensitive(false);
         let status_for_reload = status.clone();
         let list_for_reload = list.clone();
-        reload.connect_clicked(move |_| refresh_view(&status_for_reload, &list_for_reload));
+        let pause_for_reload = pause.clone();
+        reload.connect_clicked(move |_| {
+            refresh_view(&status_for_reload, &list_for_reload, &pause_for_reload)
+        });
         let download = gtk::Button::with_label("Скачать выбранный файл");
         let choose_sync = gtk::Button::with_label("Папка синхронизации");
         let preview_sync = gtk::Button::with_label("План синхронизации");
@@ -464,6 +498,7 @@ fn main() {
         sync_controls.append(&choose_sync);
         sync_controls.append(&preview_sync);
         sync_controls.append(&review);
+        sync_controls.append(&pause);
         let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
         content.set_margin_start(18);
         content.set_margin_end(18);
@@ -618,7 +653,41 @@ fn main() {
                 gtk::glib::ControlFlow::Break
             });
         });
-        refresh_view(&status, &list);
+        let status_for_pause = status.clone();
+        pause.connect_clicked(move |button| {
+            button.set_sensitive(false);
+            let (sender, receiver) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = sender.send(toggle_sync_paused());
+            });
+            let button = button.clone();
+            let status = status_for_pause.clone();
+            gtk::glib::timeout_add_local(Duration::from_millis(100), move || {
+                match receiver.try_recv() {
+                    Ok(Ok(paused)) => {
+                        update_pause_button(&button, paused);
+                        status.set_text(if paused {
+                            "Синхронизация приостановлена; текущая операция может завершиться"
+                        } else {
+                            "Синхронизация возобновлена"
+                        });
+                    }
+                    Ok(Err(error)) => {
+                        button.set_sensitive(true);
+                        status.set_text(&format!("Не удалось изменить паузу: {error}"));
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        return gtk::glib::ControlFlow::Continue;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        button.set_sensitive(true);
+                        status.set_text("Не удалось изменить паузу");
+                    }
+                }
+                gtk::glib::ControlFlow::Break
+            });
+        });
+        refresh_view(&status, &list, &pause);
         window.present();
     });
     app.run();
