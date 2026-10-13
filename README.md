@@ -16,6 +16,8 @@ cargo test --workspace
 cargo test -p onedrive-catalog
 cargo build -p onedrive-daemon
 dbus-run-session -- sh scripts/smoke-dbus.sh
+cargo build -p onedrive-desktop
+dbus-run-session -- sh scripts/smoke-tray.sh
 ```
 
 ## Тестовая регистрация Microsoft
@@ -106,6 +108,12 @@ cargo run -p onedrive-desktop
 уведомления о том же состоянии. Закрытие окна скрывает его и оставляет
 приложение работающим для уведомлений; повторный запуск ярлыка открывает окно.
 Кнопка «Выход» завершает только интерфейс, фоновый демон продолжает работу.
+Индикатор StatusNotifierItem показывает состояние, стандартную системную
+иконку и подсказку. Нажатие на него открывает окно; индикатор регистрируется
+у хоста `org.kde` или `org.freedesktop`, если тот доступен. При отсутствии
+хоста приложение остаётся доступным через ярлык. Проверка `smoke-tray.sh`
+запускает интерфейс с пустым временным состоянием и отключённым client ID на
+локальном headless Broadway display; для неё нужен `gtk4-broadwayd`.
 `RunQueuedRemoteRename()` выполняет одно подтверждённое переименование или
 перемещение файла при `ONEDRIVE_EXPERIMENTAL_UPLOAD=1`. Перед запросом метод
 сверяет локальный отпечаток и единственность файла, сохранённую связь по ID,
