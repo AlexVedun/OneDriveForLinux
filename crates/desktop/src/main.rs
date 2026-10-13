@@ -133,10 +133,26 @@ struct StateMonitor {
 impl StateMonitor {
     fn new(app: &adw::Application, label: &gtk::Label, initial: String) -> Self {
         label.set_text(&format!("Состояние: {}", state_label(&initial)));
+        let app_for_menu = app.downgrade();
+        let menu_action = Rc::new(move |action: tray::MenuAction| {
+            let Some(app) = app_for_menu.upgrade() else {
+                return;
+            };
+            let name = match action {
+                tray::MenuAction::Show => "show",
+                tray::MenuAction::History => "history",
+                tray::MenuAction::TogglePause => "toggle-pause",
+                tray::MenuAction::Refresh => "refresh",
+                tray::MenuAction::Quit => "quit",
+            };
+            if let Some(action) = app.lookup_action(name) {
+                action.activate(None);
+            }
+        });
         Self {
             app: app.clone(),
             label: label.clone(),
-            tray: match tray::TrayIndicator::start(app, &initial) {
+            tray: match tray::TrayIndicator::start(app, &initial, menu_action) {
                 Ok(indicator) => Some(Rc::new(indicator)),
                 Err(error) => {
                     eprintln!("status notifier unavailable: {error}");
@@ -170,6 +186,12 @@ impl StateMonitor {
         self.last.replace(current);
     }
 
+    fn update_paused(&self, paused: Option<bool>) {
+        if let Some(tray) = &self.tray {
+            tray.update_paused(paused);
+        }
+    }
+
     fn start(&self) {
         let monitor = self.clone();
         gtk::glib::timeout_add_local(Duration::from_secs(10), move || {
@@ -178,17 +200,21 @@ impl StateMonitor {
             }
             let (sender, receiver) = std::sync::mpsc::channel();
             std::thread::spawn(move || {
-                let _ = sender.send(read_status());
+                let _ = sender.send((read_status(), read_sync_paused().ok()));
             });
             let monitor_for_result = monitor.clone();
             gtk::glib::timeout_add_local(Duration::from_millis(100), move || {
                 match receiver.try_recv() {
-                    Ok(current) => monitor_for_result.observe(current),
+                    Ok((current, paused)) => {
+                        monitor_for_result.observe(current);
+                        monitor_for_result.update_paused(paused);
+                    }
                     Err(std::sync::mpsc::TryRecvError::Empty) => {
                         return gtk::glib::ControlFlow::Continue;
                     }
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                         monitor_for_result.observe("daemon-unavailable".to_owned());
+                        monitor_for_result.update_paused(None);
                     }
                 }
                 monitor_for_result.pending.set(false);
@@ -628,10 +654,14 @@ fn refresh_view(
         monitor.observe(read_status());
     }
     match read_sync_paused() {
-        Ok(paused) => update_pause_button(pause, paused),
+        Ok(paused) => {
+            update_pause_button(pause, paused);
+            monitor.update_paused(Some(paused));
+        }
         Err(_) => {
             pause.set_label("Пауза недоступна");
             pause.set_sensitive(false);
+            monitor.update_paused(None);
         }
     }
     match read_catalog() {
@@ -686,12 +716,27 @@ fn main() {
         });
         let scan = gtk::Button::with_label("Проверить OneDrive");
         let status_after_scan = status.clone();
-        scan.connect_clicked(move |_| {
-            let result: zbus::Result<()> = daemon_call("RefreshCatalog");
-            status_after_scan.set_text(if result.is_ok() {
-                "Проверка каталога запущена"
-            } else {
-                "Не удалось запустить проверку каталога"
+        scan.connect_clicked(move |button| {
+            button.set_sensitive(false);
+            let (sender, receiver) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let result: zbus::Result<()> = daemon_call("RefreshCatalog");
+                let _ = sender.send(result);
+            });
+            let button = button.clone();
+            let status = status_after_scan.clone();
+            gtk::glib::timeout_add_local(Duration::from_millis(100), move || {
+                match receiver.try_recv() {
+                    Ok(Ok(())) => status.set_text("Проверка каталога запущена"),
+                    Ok(Err(_)) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        status.set_text("Не удалось запустить проверку каталога");
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        return gtk::glib::ControlFlow::Continue;
+                    }
+                }
+                button.set_sensitive(true);
+                gtk::glib::ControlFlow::Break
             });
         });
         let reload = gtk::Button::with_label("Обновить список");
@@ -945,6 +990,7 @@ fn main() {
             });
         });
         let status_for_pause = status.clone();
+        let monitor_for_pause = monitor.clone();
         pause.connect_clicked(move |button| {
             button.set_sensitive(false);
             let (sender, receiver) = std::sync::mpsc::channel();
@@ -953,10 +999,12 @@ fn main() {
             });
             let button = button.clone();
             let status = status_for_pause.clone();
+            let monitor = monitor_for_pause.clone();
             gtk::glib::timeout_add_local(Duration::from_millis(100), move || {
                 match receiver.try_recv() {
                     Ok(Ok(paused)) => {
                         update_pause_button(&button, paused);
+                        monitor.update_paused(Some(paused));
                         status.set_text(if paused {
                             "Синхронизация приостановлена; текущая операция может завершиться"
                         } else {
@@ -978,6 +1026,28 @@ fn main() {
                 gtk::glib::ControlFlow::Break
             });
         });
+        for (name, button) in [
+            ("history", &history),
+            ("toggle-pause", &pause),
+            ("refresh", &scan),
+        ] {
+            let action = gio::SimpleAction::new(name, None);
+            let button = button.downgrade();
+            action.connect_activate(move |_, _| {
+                if let Some(button) = button.upgrade() {
+                    button.emit_clicked();
+                }
+            });
+            app.add_action(&action);
+        }
+        let quit_action = gio::SimpleAction::new("quit", None);
+        let app_for_quit = app.downgrade();
+        quit_action.connect_activate(move |_, _| {
+            if let Some(app) = app_for_quit.upgrade() {
+                app.quit();
+            }
+        });
+        app.add_action(&quit_action);
         refresh_view(&monitor, &status, &list, &pause);
         monitor.start();
         window.present();
