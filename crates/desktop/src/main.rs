@@ -1,3 +1,5 @@
+mod tray;
+
 use adw::{gio, gtk, prelude::*};
 use onedrive_core::{BUS_NAME, INTERFACE_NAME, OBJECT_PATH};
 use serde::Deserialize;
@@ -125,6 +127,7 @@ struct StateMonitor {
     label: gtk::Label,
     last: Rc<RefCell<String>>,
     pending: Rc<Cell<bool>>,
+    tray: Option<Rc<tray::TrayIndicator>>,
 }
 
 impl StateMonitor {
@@ -133,6 +136,13 @@ impl StateMonitor {
         Self {
             app: app.clone(),
             label: label.clone(),
+            tray: match tray::TrayIndicator::start(app, &initial) {
+                Ok(indicator) => Some(Rc::new(indicator)),
+                Err(error) => {
+                    eprintln!("status notifier unavailable: {error}");
+                    None
+                }
+            },
             last: Rc::new(RefCell::new(initial)),
             pending: Rc::new(Cell::new(false)),
         }
@@ -141,6 +151,9 @@ impl StateMonitor {
     fn observe(&self, current: String) {
         let previous = self.last.borrow();
         if previous.as_str() != current {
+            if let Some(tray) = &self.tray {
+                tray.update(&current);
+            }
             if let Some((title, body)) = attention_notification(Some(previous.as_str()), &current) {
                 let notification = gio::Notification::new(title);
                 notification.set_body(Some(body));
