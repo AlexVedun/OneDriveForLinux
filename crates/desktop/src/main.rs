@@ -1,7 +1,9 @@
 use adw::{gio, gtk, prelude::*};
 use onedrive_core::{BUS_NAME, INTERFACE_NAME, OBJECT_PATH};
 use serde::Deserialize;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use std::time::Duration;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -69,6 +71,119 @@ where
 
 fn read_status() -> String {
     daemon_call("Status").unwrap_or_else(|_| "daemon-unavailable".to_owned())
+}
+
+fn state_label(state: &str) -> &str {
+    match state {
+        "needs-login" => "Требуется вход в Microsoft",
+        "error" => "Ошибка синхронизации",
+        "reconciliation-needed" => "Нужна сверка каталога",
+        "offline" => "Нет соединения",
+        "paused" => "Синхронизация приостановлена",
+        "transferring" => "Передача файлов",
+        "checking" => "Проверка изменений",
+        "connected" => "Подключено",
+        "synced" => "Синхронизировано",
+        "daemon-unavailable" => "Фоновый процесс недоступен",
+        _ => state,
+    }
+}
+
+fn attention_notification(
+    previous: Option<&str>,
+    current: &str,
+) -> Option<(&'static str, &'static str)> {
+    let previous = previous?;
+    if previous == current {
+        return None;
+    }
+    match current {
+        "needs-login" => Some((
+            "Требуется вход в OneDrive",
+            "Откройте приложение и войдите в аккаунт Microsoft.",
+        )),
+        "error" => Some((
+            "Ошибка синхронизации",
+            "Откройте очередь и историю, чтобы увидеть причину.",
+        )),
+        "reconciliation-needed" => Some((
+            "Нужна сверка OneDrive",
+            "Откройте приложение и проверьте каталог OneDrive.",
+        )),
+        "offline" => Some(("OneDrive недоступен", "Проверьте соединение с сетью.")),
+        "daemon-unavailable" => Some((
+            "Фоновый процесс недоступен",
+            "Запустите демон OneDrive для Linux.",
+        )),
+        _ => None,
+    }
+}
+
+#[derive(Clone)]
+struct StateMonitor {
+    app: adw::Application,
+    label: gtk::Label,
+    last: Rc<RefCell<String>>,
+    pending: Rc<Cell<bool>>,
+}
+
+impl StateMonitor {
+    fn new(app: &adw::Application, label: &gtk::Label, initial: String) -> Self {
+        label.set_text(&format!("Состояние: {}", state_label(&initial)));
+        Self {
+            app: app.clone(),
+            label: label.clone(),
+            last: Rc::new(RefCell::new(initial)),
+            pending: Rc::new(Cell::new(false)),
+        }
+    }
+
+    fn observe(&self, current: String) {
+        let previous = self.last.borrow();
+        if previous.as_str() != current {
+            if let Some((title, body)) = attention_notification(Some(previous.as_str()), &current) {
+                let notification = gio::Notification::new(title);
+                notification.set_body(Some(body));
+                notification.set_default_action("app.show");
+                self.app
+                    .send_notification(Some("sync-status"), &notification);
+            } else {
+                self.app.withdraw_notification("sync-status");
+            }
+        }
+        drop(previous);
+        self.label
+            .set_text(&format!("Состояние: {}", state_label(&current)));
+        self.last.replace(current);
+    }
+
+    fn start(&self) {
+        let monitor = self.clone();
+        gtk::glib::timeout_add_local(Duration::from_secs(10), move || {
+            if monitor.pending.replace(true) {
+                return gtk::glib::ControlFlow::Continue;
+            }
+            let (sender, receiver) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = sender.send(read_status());
+            });
+            let monitor_for_result = monitor.clone();
+            gtk::glib::timeout_add_local(Duration::from_millis(100), move || {
+                match receiver.try_recv() {
+                    Ok(current) => monitor_for_result.observe(current),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        return gtk::glib::ControlFlow::Continue;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        monitor_for_result.observe("daemon-unavailable".to_owned());
+                    }
+                }
+                monitor_for_result.pending.set(false);
+                gtk::glib::ControlFlow::Break
+            });
+            gtk::glib::ControlFlow::Continue
+        });
+    }
 }
 
 fn read_sync_paused() -> zbus::Result<bool> {
@@ -490,8 +605,15 @@ fn populate_list(list: &gtk::ListBox, items: Vec<UiItem>) {
     }
 }
 
-fn refresh_view(status: &gtk::Label, list: &gtk::ListBox, pause: &gtk::Button) {
-    status.set_text(&format!("Состояние: {}", read_status()));
+fn refresh_view(
+    monitor: &StateMonitor,
+    status: &gtk::Label,
+    list: &gtk::ListBox,
+    pause: &gtk::Button,
+) {
+    if !monitor.pending.get() {
+        monitor.observe(read_status());
+    }
     match read_sync_paused() {
         Ok(paused) => update_pause_button(pause, paused),
         Err(_) => {
@@ -509,9 +631,25 @@ fn main() {
     let app = adw::Application::builder()
         .application_id("io.github.onedrive_linux.Desktop")
         .build();
+    let show_action = gio::SimpleAction::new("show", None);
+    let app_for_show = app.downgrade();
+    show_action.connect_activate(move |_, _| {
+        if let Some(app) = app_for_show.upgrade() {
+            app.activate();
+        }
+    });
+    app.add_action(&show_action);
     app.connect_activate(|app| {
+        if let Some(window) = app.windows().into_iter().next() {
+            window.present();
+            return;
+        }
+        let engine_status = gtk::Label::new(None);
+        engine_status.set_xalign(0.0);
+        let monitor = StateMonitor::new(app, &engine_status, read_status());
         let status = gtk::Label::new(None);
         status.set_xalign(0.0);
+        status.set_wrap(true);
         let list = gtk::ListBox::new();
         list.set_selection_mode(gtk::SelectionMode::Single);
         let scroll = gtk::ScrolledWindow::builder()
@@ -549,14 +687,21 @@ fn main() {
         let status_for_reload = status.clone();
         let list_for_reload = list.clone();
         let pause_for_reload = pause.clone();
+        let monitor_for_reload = monitor.clone();
         reload.connect_clicked(move |_| {
-            refresh_view(&status_for_reload, &list_for_reload, &pause_for_reload)
+            refresh_view(
+                &monitor_for_reload,
+                &status_for_reload,
+                &list_for_reload,
+                &pause_for_reload,
+            )
         });
         let download = gtk::Button::with_label("Скачать выбранный файл");
         let choose_sync = gtk::Button::with_label("Папка синхронизации");
         let preview_sync = gtk::Button::with_label("План синхронизации");
         let review = gtk::Button::with_label("Рассмотреть изменения");
         let history = gtk::Button::with_label("Очередь и история");
+        let exit = gtk::Button::with_label("Выход");
         let controls = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         controls.append(&login);
         controls.append(&scan);
@@ -566,6 +711,7 @@ fn main() {
         let sync_setup = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         sync_setup.append(&choose_sync);
         sync_setup.append(&preview_sync);
+        sync_setup.append(&exit);
         let sync_actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         sync_actions.append(&review);
         sync_actions.append(&history);
@@ -577,6 +723,7 @@ fn main() {
         content.set_margin_end(18);
         content.set_margin_top(18);
         content.set_margin_bottom(18);
+        content.append(&engine_status);
         content.append(&status);
         content.append(&controls);
         content.append(&sync_controls);
@@ -588,6 +735,18 @@ fn main() {
             .default_height(540)
             .content(&content)
             .build();
+        let hold = app.hold();
+        window.connect_close_request(move |window| {
+            let _keep_app_running = &hold;
+            window.set_visible(false);
+            gtk::glib::Propagation::Stop
+        });
+        let app_for_exit = app.downgrade();
+        exit.connect_clicked(move |_| {
+            if let Some(app) = app_for_exit.upgrade() {
+                app.quit();
+            }
+        });
         let list_for_download = list.clone();
         let status_for_download = status.clone();
         let window_for_download = window.clone();
@@ -806,7 +965,8 @@ fn main() {
                 gtk::glib::ControlFlow::Break
             });
         });
-        refresh_view(&status, &list, &pause);
+        refresh_view(&monitor, &status, &list, &pause);
+        monitor.start();
         window.present();
     });
     app.run();
@@ -872,5 +1032,19 @@ mod tests {
         assert!(text.contains(
             "[ожидает подтверждения] №7 · Переименование в OneDrive: old-name.txt → new-name.txt"
         ));
+    }
+
+    #[test]
+    fn notifications_only_follow_new_attention_states() {
+        assert!(attention_notification(None, "error").is_none());
+        assert!(attention_notification(Some("error"), "error").is_none());
+        assert!(attention_notification(Some("connected"), "offline").is_some());
+        assert!(attention_notification(Some("offline"), "connected").is_none());
+        assert!(attention_notification(Some("connected"), "paused").is_none());
+        assert!(attention_notification(Some("paused"), "reconciliation-needed").is_some());
+        assert_eq!(
+            state_label("daemon-unavailable"),
+            "Фоновый процесс недоступен"
+        );
     }
 }
