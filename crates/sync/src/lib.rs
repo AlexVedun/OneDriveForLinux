@@ -151,6 +151,24 @@ pub struct ReviewOperation {
     pub can_approve: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct OperationSummary {
+    pub id: i64,
+    pub kind: String,
+    pub path: String,
+    pub from_path: Option<String>,
+    pub status: String,
+    pub approved: bool,
+    pub attempts: u32,
+    pub last_error: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct OperationHistory {
+    pub total: u64,
+    pub operations: Vec<OperationSummary>,
+}
+
 /// The upload URL is a preauthenticated secret. Never include it in logs.
 pub struct UploadCheckpoint {
     pub operation_id: i64,
@@ -719,6 +737,40 @@ impl SyncStore {
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Show unresolved work first, then the newest completed or dismissed
+    /// operations. Transfer checkpoints and local fingerprints stay private.
+    pub fn operation_history(&self) -> Result<OperationHistory, SyncError> {
+        let total: i64 =
+            self.connection
+                .query_row("SELECT count(*) FROM operation", [], |row| row.get(0))?;
+        let mut statement = self.connection.prepare(
+            "SELECT id, kind, path, from_path, status, approved, attempts, last_error
+             FROM operation
+             ORDER BY CASE status
+                 WHEN 'blocked' THEN 0
+                 WHEN 'pending' THEN 1
+                 WHEN 'running' THEN 2
+                 ELSE 3 END, id DESC
+             LIMIT 200",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(OperationSummary {
+                id: row.get(0)?,
+                kind: row.get(1)?,
+                path: row.get(2)?,
+                from_path: row.get(3)?,
+                status: row.get(4)?,
+                approved: row.get(5)?,
+                attempts: row.get(6)?,
+                last_error: row.get(7)?,
+            })
+        })?;
+        Ok(OperationHistory {
+            total: u64::try_from(total).unwrap_or(0),
+            operations: rows.collect::<Result<Vec<_>, _>>()?,
+        })
     }
 
     pub fn dismiss_operation(&self, id: i64) -> Result<(), SyncError> {
@@ -2706,6 +2758,51 @@ mod tests {
         store.set_paused(false).unwrap();
         assert!(!store.is_paused().unwrap());
         assert!(store.claim_upload().unwrap().is_some());
+    }
+
+    #[test]
+    fn operation_history_prioritizes_blocked_work_and_excludes_transfer_secrets() {
+        let mut store = SyncStore::in_memory().unwrap();
+        for number in 0..205 {
+            store
+                .enqueue(&PlannedOperation {
+                    action: Action::UploadNew,
+                    path: format!("file-{number}.txt"),
+                    from_path: None,
+                    remote_id: None,
+                    expected_etag: None,
+                    local_fingerprint: Some("private-fingerprint".into()),
+                    requires_confirmation: false,
+                })
+                .unwrap();
+        }
+        let claimed = store.claim_upload().unwrap().unwrap();
+        store
+            .save_upload_checkpoint(&UploadCheckpoint {
+                operation_id: claimed.id,
+                upload_url: "https://upload.example/private-session".into(),
+                total_size: 100,
+                fingerprint: "private-fingerprint".into(),
+                next_offset: 0,
+            })
+            .unwrap();
+        store.mark_blocked(claimed.id, "needs review").unwrap();
+
+        let history = store.operation_history().unwrap();
+        assert_eq!(history.total, 205);
+        assert_eq!(history.operations.len(), 200);
+        assert_eq!(history.operations[0].id, claimed.id);
+        assert_eq!(history.operations[0].status, "blocked");
+        assert_eq!(history.operations[0].attempts, 1);
+        assert_eq!(
+            history.operations[0].last_error.as_deref(),
+            Some("needs review")
+        );
+        assert_eq!(history.operations[1].path, "file-204.txt");
+        let json = serde_json::to_string(&history).unwrap();
+        assert!(!json.contains("private-session"));
+        assert!(!json.contains("private-fingerprint"));
+        assert!(!json.contains("upload_url"));
     }
 
     #[test]

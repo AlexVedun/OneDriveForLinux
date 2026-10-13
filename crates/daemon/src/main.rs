@@ -101,6 +101,15 @@ impl Daemon {
             .map_err(|_| zbus::fdo::Error::Failed("cannot encode review queue".to_owned()))
     }
 
+    fn operation_history(&self) -> zbus::fdo::Result<String> {
+        let history =
+            self.sync.lock().unwrap().operation_history().map_err(|_| {
+                zbus::fdo::Error::Failed("cannot read operation history".to_owned())
+            })?;
+        serde_json::to_string(&history)
+            .map_err(|_| zbus::fdo::Error::Failed("cannot encode operation history".to_owned()))
+    }
+
     fn approve_operation(&self, id: i64) -> zbus::fdo::Result<()> {
         self.sync
             .lock()

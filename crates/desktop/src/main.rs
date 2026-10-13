@@ -40,6 +40,24 @@ struct UiReviewOperation {
     can_approve: bool,
 }
 
+#[derive(Deserialize)]
+struct UiOperationHistory {
+    total: u64,
+    operations: Vec<UiOperationSummary>,
+}
+
+#[derive(Deserialize)]
+struct UiOperationSummary {
+    id: i64,
+    kind: String,
+    path: String,
+    from_path: Option<String>,
+    status: String,
+    approved: bool,
+    attempts: u32,
+    last_error: Option<String>,
+}
+
 fn daemon_call<R>(method: &str) -> zbus::Result<R>
 where
     R: for<'de> zbus::zvariant::DynamicDeserialize<'de>,
@@ -102,6 +120,11 @@ fn read_review_operations() -> Result<Vec<UiReviewOperation>, String> {
     serde_json::from_str(&json).map_err(|error| error.to_string())
 }
 
+fn read_operation_history() -> Result<UiOperationHistory, String> {
+    let json: String = daemon_call("OperationHistory").map_err(|error| error.to_string())?;
+    serde_json::from_str(&json).map_err(|error| error.to_string())
+}
+
 fn queue_and_read_review() -> Result<(Vec<UiReviewOperation>, Option<String>), String> {
     let queue_result: zbus::Result<u64> = daemon_call("QueueReviewActions");
     let operations = read_review_operations()?;
@@ -154,6 +177,50 @@ fn review_approvable(operation: &UiReviewOperation) -> bool {
             operation.kind.as_str(),
             "DeleteRemote" | "DeleteLocal" | "RenameRemote"
         )
+}
+
+fn history_text(history: UiOperationHistory) -> String {
+    let mut lines = vec![format!(
+        "Операций всего: {} · показано: {}",
+        history.total,
+        history.operations.len()
+    )];
+    for operation in history.operations {
+        let state = match (operation.status.as_str(), operation.approved) {
+            ("pending", false) => "ожидает подтверждения",
+            ("pending", true) => "ожидает выполнения",
+            ("running", _) => "выполняется",
+            ("blocked", _) => "заблокирована",
+            ("done", _) => "завершена",
+            ("dismissed", _) => "отклонена",
+            _ => operation.status.as_str(),
+        };
+        let action = match operation.kind.as_str() {
+            "UploadNew" => "Загрузка нового файла",
+            "UploadChanged" => "Загрузка изменений",
+            "DownloadNew" => "Скачивание нового файла",
+            "DownloadChanged" => "Скачивание изменений",
+            "CreateRemoteFolder" => "Создание папки в OneDrive",
+            "RenameRemote" => "Переименование в OneDrive",
+            "RenameLocal" => "Локальное переименование",
+            "DeleteRemote" => "Удаление в OneDrive",
+            "DeleteLocal" => "Локальное удаление",
+            "Conflict" => "Конфликт",
+            _ => operation.kind.as_str(),
+        };
+        let path = operation.from_path.as_ref().map_or_else(
+            || operation.path.clone(),
+            |source| format!("{source} → {}", operation.path),
+        );
+        lines.push(format!(
+            "[{state}] №{} · {action}: {path} · попыток: {}",
+            operation.id, operation.attempts
+        ));
+        if let Some(error) = operation.last_error {
+            lines.push(format!("    Причина: {error}"));
+        }
+    }
+    lines.join("\n")
 }
 
 fn preview_text(preview: UiPreview) -> String {
@@ -489,16 +556,22 @@ fn main() {
         let choose_sync = gtk::Button::with_label("Папка синхронизации");
         let preview_sync = gtk::Button::with_label("План синхронизации");
         let review = gtk::Button::with_label("Рассмотреть изменения");
+        let history = gtk::Button::with_label("Очередь и история");
         let controls = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         controls.append(&login);
         controls.append(&scan);
         controls.append(&reload);
         controls.append(&download);
-        let sync_controls = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-        sync_controls.append(&choose_sync);
-        sync_controls.append(&preview_sync);
-        sync_controls.append(&review);
-        sync_controls.append(&pause);
+        let sync_controls = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        let sync_setup = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        sync_setup.append(&choose_sync);
+        sync_setup.append(&preview_sync);
+        let sync_actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        sync_actions.append(&review);
+        sync_actions.append(&history);
+        sync_actions.append(&pause);
+        sync_controls.append(&sync_setup);
+        sync_controls.append(&sync_actions);
         let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
         content.set_margin_start(18);
         content.set_margin_end(18);
@@ -653,6 +726,52 @@ fn main() {
                 gtk::glib::ControlFlow::Break
             });
         });
+        let window_for_history = window.clone();
+        let status_for_history = status.clone();
+        history.connect_clicked(move |button| {
+            button.set_sensitive(false);
+            let (sender, receiver) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = sender.send(read_operation_history());
+            });
+            let button = button.clone();
+            let parent = window_for_history.clone();
+            let status = status_for_history.clone();
+            gtk::glib::timeout_add_local(Duration::from_millis(100), move || {
+                match receiver.try_recv() {
+                    Ok(Ok(history)) => {
+                        let text = gtk::TextView::new();
+                        text.set_editable(false);
+                        text.set_monospace(true);
+                        text.buffer().set_text(&history_text(history));
+                        let scroll = gtk::ScrolledWindow::builder()
+                            .child(&text)
+                            .vexpand(true)
+                            .hexpand(true)
+                            .build();
+                        let dialog = gtk::Window::builder()
+                            .transient_for(&parent)
+                            .title("Очередь и история")
+                            .default_width(750)
+                            .default_height(500)
+                            .child(&scroll)
+                            .build();
+                        dialog.present();
+                    }
+                    Ok(Err(error)) => {
+                        status.set_text(&format!("Не удалось прочитать очередь: {error}"));
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        return gtk::glib::ControlFlow::Continue;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        status.set_text("Не удалось прочитать очередь");
+                    }
+                }
+                button.set_sensitive(true);
+                gtk::glib::ControlFlow::Break
+            });
+        });
         let status_for_pause = status.clone();
         pause.connect_clicked(move |button| {
             button.set_sensitive(false);
@@ -735,5 +854,23 @@ mod tests {
         assert!(review_approvable(&operations[0]));
         assert!(!review_approvable(&operations[1]));
         assert!(!review_approvable(&operations[2]));
+    }
+
+    #[test]
+    fn operation_history_shows_blocked_reason_and_pending_review() {
+        let history: UiOperationHistory = serde_json::from_str(
+            r#"{"total":3,"operations":[
+              {"id":8,"kind":"DownloadChanged","path":"new.txt","from_path":null,"status":"blocked","approved":true,"attempts":2,"last_error":"remote file changed"},
+              {"id":7,"kind":"RenameRemote","path":"new-name.txt","from_path":"old-name.txt","status":"pending","approved":false,"attempts":0,"last_error":null}
+            ]}"#,
+        )
+        .unwrap();
+        let text = history_text(history);
+        assert!(text.contains("Операций всего: 3 · показано: 2"));
+        assert!(text.contains("[заблокирована] №8 · Скачивание изменений: new.txt · попыток: 2"));
+        assert!(text.contains("Причина: remote file changed"));
+        assert!(text.contains(
+            "[ожидает подтверждения] №7 · Переименование в OneDrive: old-name.txt → new-name.txt"
+        ));
     }
 }
