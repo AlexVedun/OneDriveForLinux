@@ -2,6 +2,7 @@
 //! bearer token; preauthenticated transfer URLs never receive one.
 
 use onedrive_catalog::{DeltaPage, FetchError, validate_graph_url};
+use onedrive_mount::DownloadRequest;
 use onedrive_sync::QueuedOperation;
 use onedrive_sync::upload::{UploadError, UploadStep, UploadTransport};
 use reqwest::{
@@ -797,6 +798,48 @@ impl GraphClient {
                     QueuedDownloadError::Failed
                 }
             })
+    }
+
+    /// Fetch a whole file for the virtual drive, refusing to publish changed content.
+    pub async fn download_cache_item(
+        &self,
+        request: &DownloadRequest,
+        access_token: &str,
+        target: &Path,
+    ) -> Result<(), QueuedDownloadError> {
+        let before = self
+            .item_version(&request.drive_id, &request.item_id, access_token)
+            .await
+            .map_err(|_| QueuedDownloadError::Failed)?;
+        if !version_matches(&before, &request.item_id, &request.etag, request.size) {
+            return Err(QueuedDownloadError::Changed);
+        }
+        let mut transfer = AtomicDownload::new(target).map_err(|_| QueuedDownloadError::Failed)?;
+        let mut response = self
+            .content_response(&request.drive_id, &request.item_id, access_token)
+            .await
+            .map_err(|_| QueuedDownloadError::Failed)?;
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|_| QueuedDownloadError::Failed)?
+        {
+            transfer
+                .write_chunk(&chunk)
+                .await
+                .map_err(|_| QueuedDownloadError::Failed)?;
+        }
+        let after = self
+            .item_version(&request.drive_id, &request.item_id, access_token)
+            .await
+            .map_err(|_| QueuedDownloadError::Failed)?;
+        if !version_matches(&after, &request.item_id, &request.etag, request.size) {
+            return Err(QueuedDownloadError::Changed);
+        }
+        transfer
+            .finish(target, Some(request.size))
+            .await
+            .map_err(|_| QueuedDownloadError::Failed)
     }
 
     async fn item_version(

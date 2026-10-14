@@ -164,7 +164,22 @@ pub struct VirtualTree {
 }
 
 impl VirtualTree {
-    pub fn open_cached(&self, inode: u64, cache: &mut CacheStore) -> Result<FileHandle, OpenError> {
+    pub fn request_for_item(&self, item_id: &str) -> Result<DownloadRequest, OpenError> {
+        let inode = if self.nodes[&ROOT_INODE].item_id == item_id {
+            ROOT_INODE
+        } else {
+            stable_inode(&self.drive_id, item_id)
+        };
+        if self
+            .getattr(inode)
+            .is_none_or(|node| node.item_id != item_id)
+        {
+            return Err(OpenError::MissingFile);
+        }
+        self.request_for_inode(inode)
+    }
+
+    fn request_for_inode(&self, inode: u64) -> Result<DownloadRequest, OpenError> {
         let node = self.getattr(inode).ok_or(OpenError::MissingFile)?;
         if node.kind != NodeKind::File {
             return Err(OpenError::IsDirectory);
@@ -174,24 +189,26 @@ impl VirtualTree {
             .as_deref()
             .filter(|etag| !etag.is_empty())
             .ok_or(OpenError::MissingVersion)?;
-        let request = DownloadRequest {
+        Ok(DownloadRequest {
             drive_id: self.drive_id.clone(),
             item_id: node.item_id.clone(),
             etag: etag.to_owned(),
             size: node.size,
-        };
+        })
+    }
+
+    pub fn open_cached(&self, inode: u64, cache: &mut CacheStore) -> Result<FileHandle, OpenError> {
+        let request = self.request_for_inode(inode)?;
+        let size = request.size;
         let key = request.cache_key();
         let file = cache
             .get(&key)
             .map_err(OpenError::Cache)?
             .ok_or(OpenError::NotCached(request))?;
-        if file.metadata().map_err(OpenError::Io)?.len() != node.size {
+        if file.metadata().map_err(OpenError::Io)?.len() != size {
             return Err(OpenError::SizeMismatch);
         }
-        Ok(FileHandle {
-            file,
-            size: node.size,
-        })
+        Ok(FileHandle { file, size })
     }
 
     /// Takes one validated snapshot. The caller must rebuild it after catalog changes.
@@ -587,6 +604,11 @@ mod tests {
         assert!(matches!(
             tree.open_cached(ROOT_INODE, &mut cache),
             Err(OpenError::IsDirectory)
+        ));
+        assert_eq!(tree.request_for_item("file").unwrap().etag, "v2");
+        assert!(matches!(
+            tree.request_for_item("missing"),
+            Err(OpenError::MissingFile)
         ));
     }
 }

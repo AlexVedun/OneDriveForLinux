@@ -9,8 +9,10 @@ use graph::{
 };
 use keyring::v1::Entry;
 use oauth2::{TokenResponse, basic::BasicTokenResponse};
+use onedrive_cache::{CacheError, CacheStore};
 use onedrive_catalog::{Catalog, CatalogItem, FetchError};
 use onedrive_core::{BUS_NAME, EngineState, OBJECT_PATH};
+use onedrive_mount::{DownloadRequest, VirtualTree};
 use onedrive_sync::{
     Action, Baseline, QueuedOperation, SyncStore,
     folders::local_directory_exists,
@@ -36,6 +38,52 @@ use zbus::connection::Builder;
 
 const KEYRING_SERVICE: &str = "io.github.onedrive_linux";
 const KEYRING_USER: &str = "personal";
+const VIRTUAL_CACHE_BYTES: u64 = 1024 * 1024 * 1024;
+
+struct DownloadGuard(Arc<AtomicBool>);
+
+impl Drop for DownloadGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+struct TransferStateGuard {
+    state: Arc<Mutex<EngineState>>,
+    complete: bool,
+}
+
+impl TransferStateGuard {
+    fn start(state: &Arc<Mutex<EngineState>>) -> Self {
+        *state.lock().unwrap() = EngineState::Transferring;
+        Self {
+            state: Arc::clone(state),
+            complete: false,
+        }
+    }
+
+    fn finish(&mut self) {
+        *self.state.lock().unwrap() = EngineState::Connected;
+        self.complete = true;
+    }
+}
+
+impl Drop for TransferStateGuard {
+    fn drop(&mut self) {
+        if !self.complete {
+            *self.state.lock().unwrap() = EngineState::Error;
+        }
+    }
+}
+
+fn publish_virtual_file(
+    cache_root: &std::path::Path,
+    request: &DownloadRequest,
+    downloaded: &std::path::Path,
+) -> Result<(), CacheError> {
+    let mut cache = CacheStore::open(cache_root, VIRTUAL_CACHE_BYTES)?;
+    cache.put(&request.cache_key(), downloaded, request.size)
+}
 
 struct Daemon {
     state: Arc<Mutex<EngineState>>,
@@ -50,6 +98,82 @@ struct Daemon {
 
 #[zbus::interface(name = "io.github.onedrive_linux.Daemon")]
 impl Daemon {
+    /// Fetch a file into the virtual-drive cache on demand. Returns "cached" or "downloaded".
+    async fn prepare_virtual_file(&self, item_id: &str) -> zbus::fdo::Result<String> {
+        if self.upload_in_progress.load(Ordering::SeqCst) {
+            return Err(zbus::fdo::Error::Failed("upload is running".to_owned()));
+        }
+        let request = {
+            let catalog = self.catalog.lock().unwrap();
+            let (_, tree) = VirtualTree::from_catalog(&catalog)
+                .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
+            tree.request_for_item(item_id)
+                .map_err(|error| zbus::fdo::Error::InvalidArgs(error.to_string()))?
+        };
+        if request.size > VIRTUAL_CACHE_BYTES {
+            return Err(zbus::fdo::Error::Failed(
+                "file exceeds virtual cache limit".to_owned(),
+            ));
+        }
+        if self
+            .download_in_progress
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Err(zbus::fdo::Error::Failed(
+                "download is already running".to_owned(),
+            ));
+        }
+        let _guard = DownloadGuard(Arc::clone(&self.download_in_progress));
+        let state_root = state_directory()
+            .map_err(|_| zbus::fdo::Error::Failed("cannot access state directory".to_owned()))?;
+        let cache_root = state_root.join("virtual-cache");
+        let key = request.cache_key();
+        let expected_size = request.size;
+        let cache_root_for_check = cache_root.clone();
+        let already_cached = tokio::task::spawn_blocking(move || {
+            let mut cache = CacheStore::open(&cache_root_for_check, VIRTUAL_CACHE_BYTES)?;
+            match cache.get(&key)? {
+                Some(file) => Ok::<_, CacheError>(file.metadata()?.len() == expected_size),
+                None => Ok(false),
+            }
+        })
+        .await
+        .map_err(|_| zbus::fdo::Error::Failed("cache check failed".to_owned()))?
+        .map_err(|_| zbus::fdo::Error::Failed("cannot read virtual cache".to_owned()))?;
+        if already_cached {
+            return Ok("cached".to_owned());
+        }
+        let client_id = client_id().ok_or_else(|| {
+            zbus::fdo::Error::Failed("ONEDRIVE_CLIENT_ID is not configured".to_owned())
+        })?;
+        let token = access_token(&client_id)
+            .await
+            .map_err(|_| zbus::fdo::Error::Failed("sign-in is required".to_owned()))?;
+        let staging = tempfile::tempdir_in(&state_root)
+            .map_err(|_| zbus::fdo::Error::Failed("cannot stage virtual file".to_owned()))?;
+        let target = staging.path().join("content");
+        let graph = GraphClient::new()
+            .map_err(|_| zbus::fdo::Error::Failed("cannot create Graph client".to_owned()))?;
+        let mut transfer_state = TransferStateGuard::start(&self.state);
+        graph
+            .download_cache_item(&request, &token, &target)
+            .await
+            .map_err(|_| {
+                zbus::fdo::Error::Failed("virtual file changed or download failed".to_owned())
+            })?;
+        let cache_root_for_put = cache_root;
+        let stored = tokio::task::spawn_blocking(move || {
+            publish_virtual_file(&cache_root_for_put, &request, &target)
+        })
+        .await
+        .map_err(|_| zbus::fdo::Error::Failed("cache write failed".to_owned()))?
+        .map_err(|_| zbus::fdo::Error::Failed("cannot publish virtual file".to_owned()));
+        stored?;
+        transfer_state.finish();
+        Ok("downloaded".to_owned())
+    }
+
     fn status(&self) -> String {
         let state = *self.state.lock().unwrap();
         if state == EngineState::Connected {
@@ -2264,10 +2388,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Baseline, CatalogItem, QueuedOperation, client_id_from_dotenv, client_id_from_sources,
-        local_delete_candidate, remote_delete_candidate, remote_folder_candidate,
-        remote_rename_candidate,
+        Baseline, CatalogItem, QueuedOperation, VIRTUAL_CACHE_BYTES, client_id_from_dotenv,
+        client_id_from_sources, local_delete_candidate, publish_virtual_file,
+        remote_delete_candidate, remote_folder_candidate, remote_rename_candidate,
     };
+    use onedrive_cache::{CacheError, CacheStore};
+    use onedrive_mount::DownloadRequest;
+    use std::fs;
 
     #[test]
     fn queued_folder_is_rechecked_before_graph_write() {
@@ -2582,5 +2709,36 @@ mod tests {
                 .as_deref(),
             Some("registered")
         );
+    }
+
+    #[test]
+    fn virtual_cache_publishes_only_complete_versioned_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache_root = directory.path().join("cache");
+        let source = directory.path().join("source");
+        let request = DownloadRequest {
+            drive_id: "drive".into(),
+            item_id: "remote-id".into(),
+            etag: "v1".into(),
+            size: 5,
+        };
+        fs::write(&source, b"short").unwrap();
+        publish_virtual_file(&cache_root, &request, &source).unwrap();
+        let mut cache = CacheStore::open(&cache_root, VIRTUAL_CACHE_BYTES).unwrap();
+        assert!(cache.get(&request.cache_key()).unwrap().is_some());
+        drop(cache);
+
+        let changed = DownloadRequest {
+            etag: "v2".into(),
+            size: 6,
+            ..request.clone()
+        };
+        assert!(matches!(
+            publish_virtual_file(&cache_root, &changed, &source),
+            Err(CacheError::SizeMismatch)
+        ));
+        let mut cache = CacheStore::open(&cache_root, VIRTUAL_CACHE_BYTES).unwrap();
+        assert!(cache.get(&request.cache_key()).unwrap().is_some());
+        assert!(cache.get(&changed.cache_key()).unwrap().is_none());
     }
 }

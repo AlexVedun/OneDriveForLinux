@@ -42,6 +42,16 @@ items=$(gdbus call --session \
     --method io.github.onedrive_linux.Daemon.CatalogItems)
 test "$items" = "('[]',)"
 
+gdbus introspect --session \
+    --dest io.github.onedrive_linux.Daemon \
+    --object-path /io/github/onedrive_linux/Daemon | grep -q PrepareVirtualFile
+if gdbus call --session \
+    --dest io.github.onedrive_linux.Daemon \
+    --object-path /io/github/onedrive_linux/Daemon \
+    --method io.github.onedrive_linux.Daemon.PrepareVirtualFile missing >/dev/null 2>&1; then
+    exit 1
+fi
+
 root=$(gdbus call --session \
     --dest io.github.onedrive_linux.Daemon \
     --object-path /io/github/onedrive_linux/Daemon \
