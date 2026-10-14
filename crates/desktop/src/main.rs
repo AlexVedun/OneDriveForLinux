@@ -200,6 +200,12 @@ impl StateMonitor {
         }
     }
 
+    fn update_outstanding(&self, count: Option<u64>) {
+        if let Some(tray) = &self.tray {
+            tray.update_outstanding(count);
+        }
+    }
+
     fn start(&self) {
         let monitor = self.clone();
         gtk::glib::timeout_add_local(Duration::from_secs(10), move || {
@@ -212,15 +218,17 @@ impl StateMonitor {
                     read_status(),
                     read_sync_paused().ok(),
                     read_sync_root().ok().flatten().is_some(),
+                    read_outstanding_count().ok(),
                 ));
             });
             let monitor_for_result = monitor.clone();
             gtk::glib::timeout_add_local(Duration::from_millis(100), move || {
                 match receiver.try_recv() {
-                    Ok((current, paused, root_available)) => {
+                    Ok((current, paused, root_available, outstanding)) => {
                         monitor_for_result.observe(current);
                         monitor_for_result.update_paused(paused);
                         monitor_for_result.update_root_available(root_available);
+                        monitor_for_result.update_outstanding(outstanding);
                     }
                     Err(std::sync::mpsc::TryRecvError::Empty) => {
                         return gtk::glib::ControlFlow::Continue;
@@ -229,6 +237,7 @@ impl StateMonitor {
                         monitor_for_result.observe("daemon-unavailable".to_owned());
                         monitor_for_result.update_paused(None);
                         monitor_for_result.update_root_available(false);
+                        monitor_for_result.update_outstanding(None);
                     }
                 }
                 monitor_for_result.pending.set(false);
@@ -241,6 +250,10 @@ impl StateMonitor {
 
 fn read_sync_paused() -> zbus::Result<bool> {
     daemon_call("SyncPaused")
+}
+
+fn read_outstanding_count() -> zbus::Result<u64> {
+    daemon_call("SyncOutstandingCount")
 }
 
 fn toggle_sync_paused() -> zbus::Result<bool> {
@@ -695,6 +708,7 @@ fn refresh_view(
         }
     }
     monitor.update_root_available(read_sync_root().ok().flatten().is_some());
+    monitor.update_outstanding(read_outstanding_count().ok());
     match read_catalog() {
         Ok(items) => populate_list(list, items),
         Err(_) => status.set_text("Не удалось прочитать каталог"),

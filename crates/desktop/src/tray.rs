@@ -40,6 +40,7 @@ const MENU_ITEMS: [(i32, &str, MenuAction); 6] = [
 struct MenuState {
     paused: Option<bool>,
     root_available: bool,
+    outstanding: Option<u64>,
 }
 
 const MENU_XML: &str = r#"<node><interface name="com.canonical.dbusmenu">
@@ -92,6 +93,14 @@ fn menu_properties(id: i32, names: &[String], state: MenuState) -> HashMap<Strin
             "Возобновить синхронизацию"
         } else {
             label
+        };
+        let label = if id == 2 {
+            match state.outstanding {
+                Some(count) if count > 0 => format!("{label} ({count})"),
+                _ => label.to_owned(),
+            }
+        } else {
+            label.to_owned()
         };
         properties.insert("label".to_owned(), label.to_variant());
     }
@@ -337,6 +346,7 @@ impl TrayIndicator {
             menu_state: Rc::new(Cell::new(MenuState {
                 paused: None,
                 root_available: false,
+                outstanding: None,
             })),
         };
         tray.registrations.push(register_menu(
@@ -454,6 +464,16 @@ impl TrayIndicator {
         self.emit_item_properties(6, available);
     }
 
+    pub fn update_outstanding(&self, count: Option<u64>) {
+        let mut state = self.menu_state.get();
+        if state.outstanding == count {
+            return;
+        }
+        state.outstanding = count;
+        self.menu_state.set(state);
+        self.emit_item_properties(2, false);
+    }
+
     fn emit_item_properties(&self, id: i32, enabled: bool) {
         let updated = vec![(id, menu_properties(id, &[], self.menu_state.get()))];
         let removed: Vec<(i32, Vec<String>)> = if enabled {
@@ -514,6 +534,7 @@ mod tests {
         let state = MenuState {
             paused: Some(false),
             root_available: false,
+            outstanding: None,
         };
         let layout = menu_layout(0, -1, &[], state);
         assert_eq!(layout.type_().as_str(), "(ia{sv}av)");
@@ -550,5 +571,23 @@ mod tests {
             },
         );
         assert!(!configured_root.contains_key("enabled"));
+        let counted = menu_properties(
+            2,
+            &[],
+            MenuState {
+                outstanding: Some(42),
+                ..state
+            },
+        );
+        assert_eq!(counted["label"].str(), Some("Очередь и история (42)"));
+        let empty = menu_properties(
+            2,
+            &[],
+            MenuState {
+                outstanding: Some(0),
+                ..state
+            },
+        );
+        assert_eq!(empty["label"].str(), Some("Очередь и история"));
     }
 }
