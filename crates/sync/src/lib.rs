@@ -706,6 +706,15 @@ impl SyncStore {
         Ok(u64::try_from(count).unwrap_or(0))
     }
 
+    pub fn outstanding_count(&self) -> Result<u64, SyncError> {
+        let count: i64 = self.connection.query_row(
+            "SELECT count(*) FROM operation WHERE status IN ('pending', 'running', 'blocked')",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(u64::try_from(count).unwrap_or(0))
+    }
+
     pub fn review_count(&self) -> Result<u64, SyncError> {
         let count: i64 = self.connection.query_row(
             "SELECT count(*) FROM operation WHERE status = 'pending' AND approved = 0",
@@ -2803,6 +2812,46 @@ mod tests {
         assert!(!json.contains("private-session"));
         assert!(!json.contains("private-fingerprint"));
         assert!(!json.contains("upload_url"));
+    }
+
+    #[test]
+    fn outstanding_count_includes_unresolved_work_only() {
+        let mut store = SyncStore::in_memory().unwrap();
+        for number in 0..3 {
+            store
+                .enqueue(&PlannedOperation {
+                    action: Action::UploadNew,
+                    path: format!("file-{number}.txt"),
+                    from_path: None,
+                    remote_id: None,
+                    expected_etag: None,
+                    local_fingerprint: Some("hash".into()),
+                    requires_confirmation: false,
+                })
+                .unwrap();
+        }
+        assert_eq!(store.outstanding_count().unwrap(), 3);
+        let done = store.claim_upload().unwrap().unwrap();
+        assert_eq!(store.outstanding_count().unwrap(), 3);
+        store.mark_done(done.id).unwrap();
+        assert_eq!(store.outstanding_count().unwrap(), 2);
+        let blocked = store.claim_upload().unwrap().unwrap();
+        store.mark_blocked(blocked.id, "retry later").unwrap();
+        assert_eq!(store.outstanding_count().unwrap(), 2);
+        let conflict = store
+            .enqueue(&PlannedOperation {
+                action: Action::Conflict,
+                path: "conflict.txt".into(),
+                from_path: None,
+                remote_id: None,
+                expected_etag: None,
+                local_fingerprint: None,
+                requires_confirmation: true,
+            })
+            .unwrap();
+        assert_eq!(store.outstanding_count().unwrap(), 3);
+        store.dismiss_operation(conflict).unwrap();
+        assert_eq!(store.outstanding_count().unwrap(), 2);
     }
 
     #[test]

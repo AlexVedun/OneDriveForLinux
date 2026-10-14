@@ -90,6 +90,14 @@ impl Daemon {
             .map_err(|_| zbus::fdo::Error::Failed("cannot read sync review count".to_owned()))
     }
 
+    fn sync_outstanding_count(&self) -> zbus::fdo::Result<u64> {
+        self.sync
+            .lock()
+            .unwrap()
+            .outstanding_count()
+            .map_err(|_| zbus::fdo::Error::Failed("cannot read outstanding count".to_owned()))
+    }
+
     fn review_operations(&self) -> zbus::fdo::Result<String> {
         let operations = self
             .sync

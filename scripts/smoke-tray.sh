@@ -68,6 +68,9 @@ for interface in org.kde.StatusNotifierItem org.freedesktop.StatusNotifierItem; 
     folder_enabled=$(gdbus call --session --dest "$service" \
         --object-path /Menu --method com.canonical.dbusmenu.GetProperty 6 enabled)
     test "$folder_enabled" = '(<false>,)'
+    queue_label=$(gdbus call --session --dest "$service" \
+        --object-path /Menu --method com.canonical.dbusmenu.GetProperty 2 label)
+    test "$queue_label" = "(<'Очередь и история'>,)"
     gdbus call --session --dest "$service" \
         --object-path /Menu --method com.canonical.dbusmenu.AboutToShow 0 >/dev/null
     gdbus call --session --dest "$service" \
