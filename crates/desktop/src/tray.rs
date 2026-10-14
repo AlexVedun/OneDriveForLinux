@@ -20,19 +20,27 @@ const INTERFACES: [(&str, &str); 2] = [
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MenuAction {
     Show,
+    OpenFolder,
     History,
     TogglePause,
     Refresh,
     Quit,
 }
 
-const MENU_ITEMS: [(i32, &str, MenuAction); 5] = [
+const MENU_ITEMS: [(i32, &str, MenuAction); 6] = [
     (1, "Открыть окно", MenuAction::Show),
+    (6, "Открыть папку синхронизации", MenuAction::OpenFolder),
     (2, "Очередь и история", MenuAction::History),
     (3, "Приостановить синхронизацию", MenuAction::TogglePause),
     (4, "Проверить OneDrive", MenuAction::Refresh),
     (5, "Выход", MenuAction::Quit),
 ];
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct MenuState {
+    paused: Option<bool>,
+    root_available: bool,
+}
 
 const MENU_XML: &str = r#"<node><interface name="com.canonical.dbusmenu">
     <method name="GetLayout">
@@ -64,11 +72,7 @@ fn menu_action(id: i32) -> Option<MenuAction> {
         .map(|item| item.2)
 }
 
-fn menu_properties(
-    id: i32,
-    names: &[String],
-    paused: Option<bool>,
-) -> HashMap<String, glib::Variant> {
+fn menu_properties(id: i32, names: &[String], state: MenuState) -> HashMap<String, glib::Variant> {
     let mut properties = HashMap::new();
     let label = if id == 0 {
         None
@@ -84,15 +88,14 @@ fn menu_properties(
     if let Some(label) = label
         && (names.is_empty() || names.iter().any(|name| name == "label"))
     {
-        let label = if id == 3 && paused == Some(true) {
+        let label = if id == 3 && state.paused == Some(true) {
             "Возобновить синхронизацию"
         } else {
             label
         };
         properties.insert("label".to_owned(), label.to_variant());
     }
-    if id == 3
-        && paused.is_none()
+    if ((id == 3 && state.paused.is_none()) || (id == 6 && !state.root_available))
         && (names.is_empty() || names.iter().any(|name| name == "enabled"))
     {
         properties.insert("enabled".to_owned(), false.to_variant());
@@ -100,18 +103,18 @@ fn menu_properties(
     properties
 }
 
-fn menu_layout(id: i32, depth: i32, names: &[String], paused: Option<bool>) -> glib::Variant {
+fn menu_layout(id: i32, depth: i32, names: &[String], state: MenuState) -> glib::Variant {
     let children: Vec<glib::Variant> = if id == 0 && depth != 0 {
         MENU_ITEMS
             .iter()
-            .map(|(child_id, _, _)| menu_layout(*child_id, depth - 1, names, paused))
+            .map(|(child_id, _, _)| menu_layout(*child_id, depth - 1, names, state))
             .collect()
     } else {
         Vec::new()
     };
     glib::Variant::tuple_from_iter([
         id.to_variant(),
-        menu_properties(id, names, paused).to_variant(),
+        menu_properties(id, names, state).to_variant(),
         children.to_variant(),
     ])
 }
@@ -119,7 +122,7 @@ fn menu_layout(id: i32, depth: i32, names: &[String], paused: Option<bool>) -> g
 fn register_menu(
     connection: &gio::DBusConnection,
     action: Rc<dyn Fn(MenuAction)>,
-    paused: Rc<Cell<Option<bool>>>,
+    state: Rc<Cell<MenuState>>,
 ) -> Result<gio::RegistrationId, String> {
     let node = gio::DBusNodeInfo::for_xml(MENU_XML).map_err(|error| error.to_string())?;
     let info = node
@@ -133,7 +136,7 @@ fn register_menu(
                     if let Some((id, depth, names)) = parameters.get::<(i32, i32, Vec<String>)>()
                         && (id == 0 || menu_action(id).is_some())
                     {
-                        let layout = menu_layout(id, depth, &names, paused.get());
+                        let layout = menu_layout(id, depth, &names, state.get());
                         invocation.return_value(Some(&glib::Variant::tuple_from_iter([
                             1_u32.to_variant(),
                             layout,
@@ -157,7 +160,7 @@ fn register_menu(
                         let properties: Vec<(i32, HashMap<String, glib::Variant>)> = ids
                             .into_iter()
                             .filter(|id| *id == 0 || menu_action(*id).is_some())
-                            .map(|id| (id, menu_properties(id, &names, paused.get())))
+                            .map(|id| (id, menu_properties(id, &names, state.get())))
                             .collect();
                         invocation.return_value(Some(&(properties,).to_variant()));
                     } else {
@@ -169,7 +172,7 @@ fn register_menu(
                 }
                 "GetProperty" => {
                     if let Some((id, name)) = parameters.get::<(i32, String)>() {
-                        if let Some(value) = menu_properties(id, &[], paused.get()).get(&name) {
+                        if let Some(value) = menu_properties(id, &[], state.get()).get(&name) {
                             invocation.return_value(Some(&(value.clone(),).to_variant()));
                         } else {
                             invocation.return_dbus_error(
@@ -314,7 +317,7 @@ pub struct TrayIndicator {
     owners: Vec<gio::OwnerId>,
     watcher_cleanup: Vec<Box<dyn FnOnce()>>,
     state: Rc<RefCell<String>>,
-    paused: Rc<Cell<Option<bool>>>,
+    menu_state: Rc<Cell<MenuState>>,
 }
 
 impl TrayIndicator {
@@ -331,12 +334,15 @@ impl TrayIndicator {
             owners: Vec::new(),
             watcher_cleanup: Vec::new(),
             state: Rc::new(RefCell::new(initial.to_owned())),
-            paused: Rc::new(Cell::new(None)),
+            menu_state: Rc::new(Cell::new(MenuState {
+                paused: None,
+                root_available: false,
+            })),
         };
         tray.registrations.push(register_menu(
             &tray.connection,
             action,
-            tray.paused.clone(),
+            tray.menu_state.clone(),
         )?);
         for (interface, watcher) in INTERFACES {
             tray.register_interface(app, interface, watcher)?;
@@ -429,12 +435,29 @@ impl TrayIndicator {
     }
 
     pub fn update_paused(&self, paused: Option<bool>) {
-        if self.paused.replace(paused) == paused {
+        let mut state = self.menu_state.get();
+        if state.paused == paused {
             return;
         }
-        let updated = vec![(3_i32, menu_properties(3, &[], paused))];
-        let removed: Vec<(i32, Vec<String>)> = if paused.is_some() {
-            vec![(3, vec!["enabled".to_owned()])]
+        state.paused = paused;
+        self.menu_state.set(state);
+        self.emit_item_properties(3, paused.is_some());
+    }
+
+    pub fn update_root_available(&self, available: bool) {
+        let mut state = self.menu_state.get();
+        if state.root_available == available {
+            return;
+        }
+        state.root_available = available;
+        self.menu_state.set(state);
+        self.emit_item_properties(6, available);
+    }
+
+    fn emit_item_properties(&self, id: i32, enabled: bool) {
+        let updated = vec![(id, menu_properties(id, &[], self.menu_state.get()))];
+        let removed: Vec<(i32, Vec<String>)> = if enabled {
+            vec![(id, vec!["enabled".to_owned()])]
         } else {
             Vec::new()
         };
@@ -488,14 +511,44 @@ mod tests {
     fn dbus_menu_layout_and_actions_match() {
         let node = gio::DBusNodeInfo::for_xml(MENU_XML).unwrap();
         assert!(node.lookup_interface("com.canonical.dbusmenu").is_some());
-        let layout = menu_layout(0, -1, &[], Some(false));
+        let state = MenuState {
+            paused: Some(false),
+            root_available: false,
+        };
+        let layout = menu_layout(0, -1, &[], state);
         assert_eq!(layout.type_().as_str(), "(ia{sv}av)");
         assert_eq!(layout.child_value(2).n_children(), MENU_ITEMS.len());
         assert_eq!(menu_action(3), Some(MenuAction::TogglePause));
+        assert_eq!(menu_action(6), Some(MenuAction::OpenFolder));
         assert_eq!(menu_action(99), None);
-        let paused = menu_properties(3, &[], Some(true));
+        let paused = menu_properties(
+            3,
+            &[],
+            MenuState {
+                paused: Some(true),
+                ..state
+            },
+        );
         assert_eq!(paused["label"].str(), Some("Возобновить синхронизацию"));
-        let unavailable = menu_properties(3, &[], None);
+        let unavailable = menu_properties(
+            3,
+            &[],
+            MenuState {
+                paused: None,
+                ..state
+            },
+        );
         assert_eq!(unavailable["enabled"].get::<bool>(), Some(false));
+        let missing_root = menu_properties(6, &[], state);
+        assert_eq!(missing_root["enabled"].get::<bool>(), Some(false));
+        let configured_root = menu_properties(
+            6,
+            &[],
+            MenuState {
+                root_available: true,
+                ..state
+            },
+        );
+        assert!(!configured_root.contains_key("enabled"));
     }
 }
