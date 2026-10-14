@@ -6,6 +6,13 @@
 сканирование и предварительный план по трём состояниям. Обычный режим пока
 только показывает план и не выполняет двустороннюю синхронизацию.
 
+Для будущего виртуального диска добавлен `onedrive-cache`: он сохраняет целый
+файл по ID диска, ID файла и версии, проверяет ожидаемый размер, атомарно
+публикует копию и ограничивает объём, вытесняя давно не использованные файлы.
+Закреплённые копии сохраняются при очистке; после прерывания записи кэш
+удаляет незарегистрированные временные файлы при следующем открытии. Модуль
+пока не подключён к FUSE и не скачивает данные из OneDrive сам.
+
 ## Разработка на Fedora 44
 
 ```sh
@@ -14,6 +21,7 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 cargo test -p onedrive-catalog
+cargo test -p onedrive-cache
 cargo build -p onedrive-daemon
 dbus-run-session -- sh scripts/smoke-dbus.sh
 cargo build -p onedrive-desktop
