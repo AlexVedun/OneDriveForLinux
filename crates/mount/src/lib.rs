@@ -1,5 +1,7 @@
 //! Read-only metadata view for a future FUSE adapter. No network calls or mounts happen here.
 
+pub mod preflight;
+
 use onedrive_cache::{CacheError, CacheKey, CacheStore};
 use onedrive_catalog::{Catalog, CatalogError, CatalogItem};
 use sha2::{Digest, Sha256};
