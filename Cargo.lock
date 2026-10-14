@@ -1586,8 +1586,11 @@ dependencies = [
 name = "onedrive-mount"
 version = "0.1.0"
 dependencies = [
+ "onedrive-cache",
  "onedrive-catalog",
+ "serde_json",
  "sha2 0.10.9",
+ "tempfile",
 ]
 
 [[package]]
