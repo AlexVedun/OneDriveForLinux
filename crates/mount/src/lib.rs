@@ -1,10 +1,90 @@
 //! Read-only metadata view for a future FUSE adapter. No network calls or mounts happen here.
 
+use onedrive_cache::{CacheError, CacheKey, CacheStore};
 use onedrive_catalog::{Catalog, CatalogError, CatalogItem};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::fs::File;
+use std::io;
+use std::os::unix::fs::FileExt;
 
 pub const ROOT_INODE: u64 = 1;
+pub const MAX_READ_BYTES: u32 = 16 * 1024 * 1024;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DownloadRequest {
+    pub drive_id: String,
+    pub item_id: String,
+    pub etag: String,
+    pub size: u64,
+}
+
+impl DownloadRequest {
+    pub fn cache_key(&self) -> CacheKey {
+        CacheKey::new(&self.drive_id, &self.item_id, &self.etag)
+            .expect("validated download request")
+    }
+}
+
+#[derive(Debug)]
+pub enum OpenError {
+    MissingFile,
+    IsDirectory,
+    MissingVersion,
+    NotCached(DownloadRequest),
+    Cache(CacheError),
+    SizeMismatch,
+    Io(io::Error),
+}
+
+impl std::fmt::Display for OpenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingFile => write!(f, "file is not in the virtual tree"),
+            Self::IsDirectory => write!(f, "cannot open a directory as a file"),
+            Self::MissingVersion => write!(f, "file has no eTag in the catalog"),
+            Self::NotCached(_) => write!(f, "file version is not cached"),
+            Self::Cache(error) => write!(f, "cache error: {error}"),
+            Self::SizeMismatch => write!(f, "cached file size differs from catalog"),
+            Self::Io(error) => write!(f, "cached file I/O error: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for OpenError {}
+
+pub struct FileHandle {
+    file: File,
+    size: u64,
+}
+
+impl FileHandle {
+    pub fn read(&self, offset: u64, size: u32) -> io::Result<Vec<u8>> {
+        if size > MAX_READ_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "read exceeds limit",
+            ));
+        }
+        let count = usize::try_from(self.size.saturating_sub(offset).min(u64::from(size)))
+            .expect("bounded by MAX_READ_BYTES");
+        let mut bytes = vec![0; count];
+        let mut position = 0;
+        while position < count {
+            let read = self
+                .file
+                .read_at(&mut bytes[position..], offset + position as u64)?;
+            if read == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "cached file was truncated",
+                ));
+            }
+            position += read;
+        }
+        Ok(bytes)
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NodeKind {
@@ -76,11 +156,42 @@ impl From<CatalogError> for SnapshotError {
 }
 
 pub struct VirtualTree {
+    drive_id: String,
     nodes: HashMap<u64, Node>,
     children: HashMap<u64, BTreeMap<String, u64>>,
 }
 
 impl VirtualTree {
+    pub fn open_cached(&self, inode: u64, cache: &mut CacheStore) -> Result<FileHandle, OpenError> {
+        let node = self.getattr(inode).ok_or(OpenError::MissingFile)?;
+        if node.kind != NodeKind::File {
+            return Err(OpenError::IsDirectory);
+        }
+        let etag = node
+            .etag
+            .as_deref()
+            .filter(|etag| !etag.is_empty())
+            .ok_or(OpenError::MissingVersion)?;
+        let request = DownloadRequest {
+            drive_id: self.drive_id.clone(),
+            item_id: node.item_id.clone(),
+            etag: etag.to_owned(),
+            size: node.size,
+        };
+        let key = request.cache_key();
+        let file = cache
+            .get(&key)
+            .map_err(OpenError::Cache)?
+            .ok_or(OpenError::NotCached(request))?;
+        if file.metadata().map_err(OpenError::Io)?.len() != node.size {
+            return Err(OpenError::SizeMismatch);
+        }
+        Ok(FileHandle {
+            file,
+            size: node.size,
+        })
+    }
+
     /// Takes one validated snapshot. The caller must rebuild it after catalog changes.
     pub fn from_catalog(catalog: &Catalog) -> Result<(String, Self), SnapshotError> {
         let drive_id = catalog
@@ -146,6 +257,7 @@ impl VirtualTree {
             ctag: None,
         };
         let mut tree = Self {
+            drive_id: drive_id.to_owned(),
             nodes: HashMap::from([(ROOT_INODE, root)]),
             children: HashMap::new(),
         };
@@ -266,6 +378,7 @@ fn stable_inode(drive_id: &str, item_id: &str) -> u64 {
 mod tests {
     use super::*;
     use onedrive_catalog::DeltaPage;
+    use std::fs;
 
     fn item(id: &str, parent: &str, name: &str, kind: &str) -> CatalogItem {
         CatalogItem {
@@ -434,6 +547,44 @@ mod tests {
         assert!(matches!(
             VirtualTree::from_catalog(&catalog),
             Err(SnapshotError::IncompleteCatalog)
+        ));
+    }
+
+    #[test]
+    fn cached_file_reads_at_offsets_and_requires_matching_version() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source");
+        fs::write(&source, b"hello").unwrap();
+        let mut cache = CacheStore::open(&directory.path().join("cache"), 20).unwrap();
+        let key = CacheKey::new("drive", "file", "v1").unwrap();
+        cache.put(&key, &source, 5).unwrap();
+        let tree =
+            VirtualTree::from_items("drive", "root", [item("file", "root", "hello", "file")])
+                .unwrap();
+        let inode = tree.lookup(ROOT_INODE, "hello").unwrap().inode;
+        let handle = tree.open_cached(inode, &mut cache).unwrap();
+        assert_eq!(handle.read(1, 3).unwrap(), b"ell");
+        assert_eq!(handle.read(4, 20).unwrap(), b"o");
+        assert!(handle.read(5, 1).unwrap().is_empty());
+        assert_eq!(
+            handle.read(0, MAX_READ_BYTES + 1).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+
+        let mut changed = item("file", "root", "hello", "file");
+        changed.etag = Some("v2".into());
+        let tree = VirtualTree::from_items("drive", "root", [changed]).unwrap();
+        match tree.open_cached(inode, &mut cache) {
+            Err(OpenError::NotCached(request)) => {
+                assert_eq!(request.item_id, "file");
+                assert_eq!(request.etag, "v2");
+                assert_eq!(request.size, 5);
+            }
+            _ => panic!("changed version must miss the cache"),
+        }
+        assert!(matches!(
+            tree.open_cached(ROOT_INODE, &mut cache),
+            Err(OpenError::IsDirectory)
         ));
     }
 }
