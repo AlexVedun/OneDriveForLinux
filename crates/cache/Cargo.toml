@@ -1,0 +1,11 @@
+[package]
+name = "onedrive-cache"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+libc = "0.2"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+sha2 = "0.10"
+tempfile = "3.27"
