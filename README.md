@@ -13,6 +13,11 @@
 удаляет незарегистрированные временные файлы при следующем открытии. Модуль
 пока не подключён к FUSE и не скачивает данные из OneDrive сам.
 
+`onedrive-mount` строит из локального каталога дерево для чтения: проверяет
+родительские связи, имена и размеры, предоставляет `lookup`, `getattr` и
+`readdir`, сохраняет inode при переименовании файла. FUSE-адаптер и загрузка
+содержимого при `open` ещё не подключены.
+
 ## Разработка на Fedora 44
 
 ```sh
@@ -22,6 +27,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 cargo test -p onedrive-catalog
 cargo test -p onedrive-cache
+cargo test -p onedrive-mount
 cargo build -p onedrive-daemon
 dbus-run-session -- sh scripts/smoke-dbus.sh
 cargo build -p onedrive-desktop

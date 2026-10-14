@@ -1583,6 +1583,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "onedrive-mount"
+version = "0.1.0"
+dependencies = [
+ "onedrive-catalog",
+ "sha2 0.10.9",
+]
+
+[[package]]
 name = "onedrive-sync"
 version = "0.1.0"
 dependencies = [
