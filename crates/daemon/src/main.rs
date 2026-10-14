@@ -157,6 +157,18 @@ impl Daemon {
         Ok(path.to_string_lossy().into_owned())
     }
 
+    fn sync_root(&self) -> zbus::fdo::Result<String> {
+        self.sync
+            .lock()
+            .unwrap()
+            .root()
+            .map(|root| {
+                root.map(|path| path.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            })
+            .map_err(|_| zbus::fdo::Error::Failed("cannot read sync root".to_owned()))
+    }
+
     async fn preview_sync(&self) -> zbus::fdo::Result<String> {
         let catalog = Arc::clone(&self.catalog);
         let sync = Arc::clone(&self.sync);

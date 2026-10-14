@@ -5,6 +5,7 @@ use onedrive_core::{BUS_NAME, INTERFACE_NAME, OBJECT_PATH};
 use serde::Deserialize;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -140,6 +141,7 @@ impl StateMonitor {
             };
             let name = match action {
                 tray::MenuAction::Show => "show",
+                tray::MenuAction::OpenFolder => "open-sync-folder",
                 tray::MenuAction::History => "history",
                 tray::MenuAction::TogglePause => "toggle-pause",
                 tray::MenuAction::Refresh => "refresh",
@@ -192,6 +194,12 @@ impl StateMonitor {
         }
     }
 
+    fn update_root_available(&self, available: bool) {
+        if let Some(tray) = &self.tray {
+            tray.update_root_available(available);
+        }
+    }
+
     fn start(&self) {
         let monitor = self.clone();
         gtk::glib::timeout_add_local(Duration::from_secs(10), move || {
@@ -200,14 +208,19 @@ impl StateMonitor {
             }
             let (sender, receiver) = std::sync::mpsc::channel();
             std::thread::spawn(move || {
-                let _ = sender.send((read_status(), read_sync_paused().ok()));
+                let _ = sender.send((
+                    read_status(),
+                    read_sync_paused().ok(),
+                    read_sync_root().ok().flatten().is_some(),
+                ));
             });
             let monitor_for_result = monitor.clone();
             gtk::glib::timeout_add_local(Duration::from_millis(100), move || {
                 match receiver.try_recv() {
-                    Ok((current, paused)) => {
+                    Ok((current, paused, root_available)) => {
                         monitor_for_result.observe(current);
                         monitor_for_result.update_paused(paused);
+                        monitor_for_result.update_root_available(root_available);
                     }
                     Err(std::sync::mpsc::TryRecvError::Empty) => {
                         return gtk::glib::ControlFlow::Continue;
@@ -215,6 +228,7 @@ impl StateMonitor {
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                         monitor_for_result.observe("daemon-unavailable".to_owned());
                         monitor_for_result.update_paused(None);
+                        monitor_for_result.update_root_available(false);
                     }
                 }
                 monitor_for_result.pending.set(false);
@@ -262,6 +276,22 @@ fn set_sync_root(path: &str) -> zbus::Result<String> {
     let connection = zbus::blocking::Connection::session()?;
     let proxy = zbus::blocking::Proxy::new(&connection, BUS_NAME, OBJECT_PATH, INTERFACE_NAME)?;
     proxy.call("SetSyncRoot", &(path))
+}
+
+fn validated_sync_root(root: &str) -> Result<Option<PathBuf>, String> {
+    if root.is_empty() {
+        return Ok(None);
+    }
+    let path = PathBuf::from(root);
+    if !path.is_absolute() || !path.is_dir() || path.canonicalize().ok().as_ref() != Some(&path) {
+        return Err("Папка синхронизации недоступна или изменила путь".to_owned());
+    }
+    Ok(Some(path))
+}
+
+fn read_sync_root() -> Result<Option<PathBuf>, String> {
+    let root: String = daemon_call("SyncRoot").map_err(|error| error.to_string())?;
+    validated_sync_root(&root)
 }
 
 fn read_sync_preview() -> Result<UiPreview, String> {
@@ -664,6 +694,7 @@ fn refresh_view(
             monitor.update_paused(None);
         }
     }
+    monitor.update_root_available(read_sync_root().ok().flatten().is_some());
     match read_catalog() {
         Ok(items) => populate_list(list, items),
         Err(_) => status.set_text("Не удалось прочитать каталог"),
@@ -840,10 +871,12 @@ fn main() {
         });
         let window_for_folder = window.clone();
         let status_for_folder = status.clone();
+        let monitor_for_folder = monitor.clone();
         choose_sync.connect_clicked(move |_| {
             let dialog = gtk::FileDialog::new();
             dialog.set_title("Выберите папку синхронизации");
             let status_after_dialog = status_for_folder.clone();
+            let monitor_after_dialog = monitor_for_folder.clone();
             dialog.select_folder(
                 Some(&window_for_folder),
                 None::<&gio::Cancellable>,
@@ -853,13 +886,16 @@ fn main() {
                         status_after_dialog.set_text("Нужна локальная папка");
                         return;
                     };
-                    status_after_dialog.set_text(
-                        if set_sync_root(&path.to_string_lossy()).is_ok() {
-                            "Папка сохранена. Проверьте план синхронизации"
-                        } else {
-                            "Не удалось сохранить папку синхронизации"
-                        },
-                    );
+                    match set_sync_root(&path.to_string_lossy()) {
+                        Ok(_) => {
+                            monitor_after_dialog.update_root_available(true);
+                            status_after_dialog
+                                .set_text("Папка сохранена. Проверьте план синхронизации");
+                        }
+                        Err(_) => {
+                            status_after_dialog.set_text("Не удалось сохранить папку синхронизации")
+                        }
+                    }
                 },
             );
         });
@@ -1040,6 +1076,48 @@ fn main() {
             });
             app.add_action(&action);
         }
+        let open_folder_action = gio::SimpleAction::new("open-sync-folder", None);
+        let window_for_open = window.downgrade();
+        let status_for_open = status.downgrade();
+        open_folder_action.connect_activate(move |_, _| {
+            let (sender, receiver) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = sender.send(read_sync_root());
+            });
+            let window = window_for_open.clone();
+            let status = status_for_open.clone();
+            gtk::glib::timeout_add_local(Duration::from_millis(100), move || {
+                let result = match receiver.try_recv() {
+                    Ok(result) => result,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        return gtk::glib::ControlFlow::Continue;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        Err("Не удалось прочитать папку синхронизации".to_owned())
+                    }
+                };
+                let message = match result {
+                    Ok(Some(root)) => {
+                        let uri = gio::File::for_path(&root).uri();
+                        gio::AppInfo::launch_default_for_uri(&uri, None::<&gio::AppLaunchContext>)
+                            .err()
+                            .map(|_| "Не удалось открыть папку синхронизации".to_owned())
+                    }
+                    Ok(None) => Some("Сначала выберите папку синхронизации".to_owned()),
+                    Err(error) => Some(error),
+                };
+                if let Some(message) = message {
+                    if let Some(status) = status.upgrade() {
+                        status.set_text(&message);
+                    }
+                    if let Some(window) = window.upgrade() {
+                        window.present();
+                    }
+                }
+                gtk::glib::ControlFlow::Break
+            });
+        });
+        app.add_action(&open_folder_action);
         let quit_action = gio::SimpleAction::new("quit", None);
         let app_for_quit = app.downgrade();
         quit_action.connect_activate(move |_, _| {
@@ -1058,6 +1136,22 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sync_folder_opening_requires_configured_canonical_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let folder = temp.path().join("folder");
+        std::fs::create_dir(&folder).unwrap();
+        assert_eq!(validated_sync_root("").unwrap(), None);
+        assert_eq!(
+            validated_sync_root(&folder.to_string_lossy()).unwrap(),
+            Some(folder.clone())
+        );
+        assert!(validated_sync_root(&folder.join("missing").to_string_lossy()).is_err());
+        let link = temp.path().join("link");
+        std::os::unix::fs::symlink(&folder, &link).unwrap();
+        assert!(validated_sync_root(&link.to_string_lossy()).is_err());
+    }
 
     #[test]
     fn tree_uses_ids_for_parenting_and_skips_deleted_items() {

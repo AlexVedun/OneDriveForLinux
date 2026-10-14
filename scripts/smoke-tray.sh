@@ -56,7 +56,7 @@ for interface in org.kde.StatusNotifierItem org.freedesktop.StatusNotifierItem; 
     test "$menu" = "(<objectpath '/Menu'>,)"
     layout=$(gdbus call --session --dest "$service" \
         --object-path /Menu --method com.canonical.dbusmenu.GetLayout -- 0 -1 "[]")
-    for label in 'Открыть окно' 'Очередь и история' 'Приостановить синхронизацию' 'Проверить OneDrive' 'Выход'; do
+    for label in 'Открыть окно' 'Открыть папку синхронизации' 'Очередь и история' 'Приостановить синхронизацию' 'Проверить OneDrive' 'Выход'; do
         case "$layout" in
             *"$label"*) ;;
             *) exit 1 ;;
@@ -65,6 +65,9 @@ for interface in org.kde.StatusNotifierItem org.freedesktop.StatusNotifierItem; 
     pause_enabled=$(gdbus call --session --dest "$service" \
         --object-path /Menu --method com.canonical.dbusmenu.GetProperty 3 enabled)
     test "$pause_enabled" = '(<false>,)'
+    folder_enabled=$(gdbus call --session --dest "$service" \
+        --object-path /Menu --method com.canonical.dbusmenu.GetProperty 6 enabled)
+    test "$folder_enabled" = '(<false>,)'
     gdbus call --session --dest "$service" \
         --object-path /Menu --method com.canonical.dbusmenu.AboutToShow 0 >/dev/null
     gdbus call --session --dest "$service" \
@@ -87,11 +90,29 @@ while [ "$attempt" -lt 10 ]; do
 done
 test "$attempt" -lt 10
 
+mkdir "$test_state/sync"
+root=$(gdbus call --session --dest io.github.onedrive_linux.Daemon \
+    --object-path /io/github/onedrive_linux/Daemon \
+    --method io.github.onedrive_linux.Daemon.SetSyncRoot "$test_state/sync")
+test "$root" = "('$test_state/sync',)"
+
 attempt=0
 while [ "$attempt" -lt 15 ]; do
     pause_enabled=$(gdbus call --session --dest "$service" \
         --object-path /Menu --method com.canonical.dbusmenu.GetProperty 3 enabled 2>/dev/null || true)
     if [ -z "$pause_enabled" ]; then
+        break
+    fi
+    attempt=$((attempt + 1))
+    sleep 1
+done
+test "$attempt" -lt 15
+
+attempt=0
+while [ "$attempt" -lt 15 ]; do
+    folder_enabled=$(gdbus call --session --dest "$service" \
+        --object-path /Menu --method com.canonical.dbusmenu.GetProperty 6 enabled 2>/dev/null || true)
+    if [ -z "$folder_enabled" ]; then
         break
     fi
     attempt=$((attempt + 1))

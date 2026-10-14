@@ -42,12 +42,23 @@ items=$(gdbus call --session \
     --method io.github.onedrive_linux.Daemon.CatalogItems)
 test "$items" = "('[]',)"
 
+root=$(gdbus call --session \
+    --dest io.github.onedrive_linux.Daemon \
+    --object-path /io/github/onedrive_linux/Daemon \
+    --method io.github.onedrive_linux.Daemon.SyncRoot)
+test "$root" = "('',)"
+
 mkdir "$test_state/sync"
 root=$(gdbus call --session \
     --dest io.github.onedrive_linux.Daemon \
     --object-path /io/github/onedrive_linux/Daemon \
     --method io.github.onedrive_linux.Daemon.SetSyncRoot "$test_state/sync")
 test "$root" = "('$test_state/sync',)"
+saved_root=$(gdbus call --session \
+    --dest io.github.onedrive_linux.Daemon \
+    --object-path /io/github/onedrive_linux/Daemon \
+    --method io.github.onedrive_linux.Daemon.SyncRoot)
+test "$saved_root" = "$root"
 attempt=0
 while [ "$attempt" -lt 10 ]; do
     epoch=$(gdbus call --session \
