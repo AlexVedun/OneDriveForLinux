@@ -1,6 +1,6 @@
 //! Read-only metadata view for a future FUSE adapter. No network calls or mounts happen here.
 
-use onedrive_catalog::CatalogItem;
+use onedrive_catalog::{Catalog, CatalogError, CatalogItem};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
@@ -46,12 +46,56 @@ impl std::fmt::Display for TreeError {
 
 impl std::error::Error for TreeError {}
 
+#[derive(Debug)]
+pub enum SnapshotError {
+    Catalog(CatalogError),
+    NoActiveDrive,
+    IncompleteCatalog,
+    NoRoot,
+    InvalidTree(TreeError),
+}
+
+impl std::fmt::Display for SnapshotError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Catalog(error) => write!(f, "cannot read catalog: {error}"),
+            Self::NoActiveDrive => write!(f, "no active drive is selected"),
+            Self::IncompleteCatalog => write!(f, "catalog enumeration is incomplete"),
+            Self::NoRoot => write!(f, "active drive has no root item"),
+            Self::InvalidTree(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for SnapshotError {}
+
+impl From<CatalogError> for SnapshotError {
+    fn from(error: CatalogError) -> Self {
+        Self::Catalog(error)
+    }
+}
+
 pub struct VirtualTree {
     nodes: HashMap<u64, Node>,
     children: HashMap<u64, BTreeMap<String, u64>>,
 }
 
 impl VirtualTree {
+    /// Takes one validated snapshot. The caller must rebuild it after catalog changes.
+    pub fn from_catalog(catalog: &Catalog) -> Result<(String, Self), SnapshotError> {
+        let drive_id = catalog
+            .active_drive_id()?
+            .ok_or(SnapshotError::NoActiveDrive)?;
+        if !catalog.is_complete(&drive_id)? {
+            return Err(SnapshotError::IncompleteCatalog);
+        }
+        let root_id = catalog.root_id(&drive_id)?.ok_or(SnapshotError::NoRoot)?;
+        let items = catalog.items(&drive_id)?;
+        let tree =
+            Self::from_items(&drive_id, &root_id, items).map_err(SnapshotError::InvalidTree)?;
+        Ok((drive_id, tree))
+    }
+
     pub fn from_items(
         drive_id: &str,
         root_id: &str,
@@ -221,6 +265,7 @@ fn stable_inode(drive_id: &str, item_id: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use onedrive_catalog::DeltaPage;
 
     fn item(id: &str, parent: &str, name: &str, kind: &str) -> CatalogItem {
         CatalogItem {
@@ -359,5 +404,36 @@ mod tests {
             VirtualTree::from_items("drive", "root", [other_drive]).err(),
             Some(TreeError::WrongDrive("foreign".into()))
         );
+    }
+
+    #[test]
+    fn snapshot_requires_complete_catalog_and_root() {
+        let mut catalog = Catalog::in_memory().unwrap();
+        assert!(matches!(
+            VirtualTree::from_catalog(&catalog),
+            Err(SnapshotError::NoActiveDrive)
+        ));
+        catalog.set_active_drive_id("drive").unwrap();
+        assert!(matches!(
+            VirtualTree::from_catalog(&catalog),
+            Err(SnapshotError::IncompleteCatalog)
+        ));
+        let page: DeltaPage = serde_json::from_str(
+            r#"{"value":[{"id":"file","parentReference":{"id":"root"},"name":"file.txt","file":{},"size":5,"eTag":"v1"}],"@odata.deltaLink":"https://graph.microsoft.com/v1.0/me/drive/root/delta?token=done"}"#,
+        ).unwrap();
+        catalog.apply_page("drive", &page).unwrap();
+        assert!(matches!(
+            VirtualTree::from_catalog(&catalog),
+            Err(SnapshotError::NoRoot)
+        ));
+        catalog.set_root_id("drive", "root").unwrap();
+        let (drive, tree) = VirtualTree::from_catalog(&catalog).unwrap();
+        assert_eq!(drive, "drive");
+        assert_eq!(tree.lookup(ROOT_INODE, "file.txt").unwrap().size, 5);
+        catalog.reset_expired_cursor("drive").unwrap();
+        assert!(matches!(
+            VirtualTree::from_catalog(&catalog),
+            Err(SnapshotError::IncompleteCatalog)
+        ));
     }
 }
