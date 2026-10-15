@@ -318,6 +318,22 @@ impl CacheStore {
         Ok(())
     }
 
+    /// Returns None when the requested version has no complete local copy.
+    pub fn cached_pin_state(&mut self, key: &CacheKey) -> Result<Option<bool>, CacheError> {
+        if self.get(key)?.is_none() {
+            return Ok(None);
+        }
+        self.connection
+            .query_row(
+                "SELECT pinned FROM entry
+                 WHERE drive_id = ?1 AND item_id = ?2 AND version = ?3",
+                params![key.drive_id, key.item_id, key.version],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     pub fn set_limit(&mut self, max_bytes: u64) -> Result<(), CacheError> {
         let pinned: i64 = self.connection.query_row(
             "SELECT COALESCE(SUM(size), 0) FROM entry WHERE pinned = 1",
@@ -450,6 +466,17 @@ mod tests {
             cache.put(&key("too-large", "v1"), &source, 7),
             Err(CacheError::LimitExceeded)
         ));
+        assert_eq!(
+            cache.cached_pin_state(&key("one", "v1")).unwrap(),
+            Some(true)
+        );
+        assert_eq!(cache.cached_pin_state(&key("two", "v1")).unwrap(), None);
+        assert_eq!(cache.cached_pin_state(&key("one", "v2")).unwrap(), None);
+        cache.set_pinned(&key("one", "v1"), false).unwrap();
+        assert_eq!(
+            cache.cached_pin_state(&key("one", "v1")).unwrap(),
+            Some(false)
+        );
     }
 
     #[test]

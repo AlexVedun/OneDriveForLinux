@@ -48,6 +48,9 @@ gdbus introspect --session \
 gdbus introspect --session \
     --dest io.github.onedrive_linux.Daemon \
     --object-path /io/github/onedrive_linux/Daemon | grep -q MountVirtualDrive
+gdbus introspect --session \
+    --dest io.github.onedrive_linux.Daemon \
+    --object-path /io/github/onedrive_linux/Daemon | grep -q SetVirtualFilePinned
 mount_path=$(gdbus call --session \
     --dest io.github.onedrive_linux.Daemon \
     --object-path /io/github/onedrive_linux/Daemon \
@@ -74,6 +77,18 @@ if gdbus call --session \
     --dest io.github.onedrive_linux.Daemon \
     --object-path /io/github/onedrive_linux/Daemon \
     --method io.github.onedrive_linux.Daemon.PrepareVirtualFile missing >/dev/null 2>&1; then
+    exit 1
+fi
+if gdbus call --session \
+    --dest io.github.onedrive_linux.Daemon \
+    --object-path /io/github/onedrive_linux/Daemon \
+    --method io.github.onedrive_linux.Daemon.VirtualFileCacheStatus missing >/dev/null 2>&1; then
+    exit 1
+fi
+if gdbus call --session \
+    --dest io.github.onedrive_linux.Daemon \
+    --object-path /io/github/onedrive_linux/Daemon \
+    --method io.github.onedrive_linux.Daemon.SetVirtualFilePinned missing false >/dev/null 2>&1; then
     exit 1
 fi
 

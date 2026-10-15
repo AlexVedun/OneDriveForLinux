@@ -208,6 +208,17 @@ async fn prepare_virtual_request(
     Ok("downloaded".to_owned())
 }
 
+fn virtual_request_for_item(
+    catalog: &Arc<Mutex<Catalog>>,
+    item_id: &str,
+) -> zbus::fdo::Result<DownloadRequest> {
+    let catalog = catalog.lock().unwrap();
+    let (_, tree) = VirtualTree::from_catalog(&catalog)
+        .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
+    tree.request_for_item(item_id)
+        .map_err(|error| zbus::fdo::Error::InvalidArgs(error.to_string()))
+}
+
 #[zbus::interface(name = "io.github.onedrive_linux.Daemon")]
 impl Daemon {
     fn virtual_mount_path(&self) -> String {
@@ -310,15 +321,62 @@ impl Daemon {
 
     /// Fetch a file into the virtual-drive cache on demand. Returns "cached" or "downloaded".
     async fn prepare_virtual_file(&self, item_id: &str) -> zbus::fdo::Result<String> {
-        let request = {
-            let catalog = self.catalog.lock().unwrap();
-            let (_, tree) = VirtualTree::from_catalog(&catalog)
-                .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
-            tree.request_for_item(item_id)
-                .map_err(|error| zbus::fdo::Error::InvalidArgs(error.to_string()))?
-        };
+        let request = virtual_request_for_item(&self.catalog, item_id)?;
         let context = VirtualDownloadContext::from(self);
         prepare_virtual_request(&context, request).await
+    }
+
+    /// "missing", "cached" or "pinned" for the current catalog version.
+    async fn virtual_file_cache_status(&self, item_id: &str) -> zbus::fdo::Result<String> {
+        let request = virtual_request_for_item(&self.catalog, item_id)?;
+        let root = state_directory()
+            .map_err(|_| zbus::fdo::Error::Failed("cannot access state directory".to_owned()))?
+            .join("virtual-cache");
+        let state = tokio::task::spawn_blocking(move || {
+            let mut cache = CacheStore::open(&root, VIRTUAL_CACHE_BYTES)?;
+            cache.cached_pin_state(&request.cache_key())
+        })
+        .await
+        .map_err(|_| zbus::fdo::Error::Failed("cache status task failed".to_owned()))?
+        .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
+        Ok(match state {
+            None => "missing",
+            Some(false) => "cached",
+            Some(true) => "pinned",
+        }
+        .to_owned())
+    }
+
+    /// Download the current version before pinning; unpinning never makes a network request.
+    async fn set_virtual_file_pinned(
+        &self,
+        item_id: &str,
+        pinned: bool,
+    ) -> zbus::fdo::Result<String> {
+        let request = virtual_request_for_item(&self.catalog, item_id)?;
+        if pinned {
+            let context = VirtualDownloadContext::from(self);
+            prepare_virtual_request(&context, request.clone()).await?;
+            if virtual_request_for_item(&self.catalog, item_id)? != request {
+                return Err(zbus::fdo::Error::Failed(
+                    "virtual file version changed before pinning".to_owned(),
+                ));
+            }
+        }
+        let root = state_directory()
+            .map_err(|_| zbus::fdo::Error::Failed("cannot access state directory".to_owned()))?
+            .join("virtual-cache");
+        tokio::task::spawn_blocking(move || {
+            let mut cache = CacheStore::open(&root, VIRTUAL_CACHE_BYTES)?;
+            if cache.cached_pin_state(&request.cache_key())?.is_none() {
+                return Err(CacheError::MissingEntry);
+            }
+            cache.set_pinned(&request.cache_key(), pinned)
+        })
+        .await
+        .map_err(|_| zbus::fdo::Error::Failed("cache pin task failed".to_owned()))?
+        .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
+        Ok(if pinned { "pinned" } else { "cached" }.to_owned())
     }
 
     fn status(&self) -> String {
