@@ -140,6 +140,30 @@ pub enum QueuedDownloadError {
     Failed,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum VirtualDownloadError {
+    Changed,
+    Offline,
+    Failed,
+}
+
+impl From<FetchError> for VirtualDownloadError {
+    fn from(error: FetchError) -> Self {
+        match error {
+            FetchError::Offline => Self::Offline,
+            _ => Self::Failed,
+        }
+    }
+}
+
+fn transport_fetch_error(error: reqwest::Error) -> FetchError {
+    if error.is_connect() || error.is_timeout() || error.is_body() {
+        FetchError::Offline
+    } else {
+        FetchError::Failed
+    }
+}
+
 pub struct QueuedDownloadTarget<'a> {
     pub root: &'a Path,
     pub path: &'a Path,
@@ -806,40 +830,40 @@ impl GraphClient {
         request: &DownloadRequest,
         access_token: &str,
         target: &Path,
-    ) -> Result<(), QueuedDownloadError> {
+    ) -> Result<(), VirtualDownloadError> {
         let before = self
             .item_version(&request.drive_id, &request.item_id, access_token)
             .await
-            .map_err(|_| QueuedDownloadError::Failed)?;
+            .map_err(VirtualDownloadError::from)?;
         if !version_matches(&before, &request.item_id, &request.etag, request.size) {
-            return Err(QueuedDownloadError::Changed);
+            return Err(VirtualDownloadError::Changed);
         }
-        let mut transfer = AtomicDownload::new(target).map_err(|_| QueuedDownloadError::Failed)?;
+        let mut transfer = AtomicDownload::new(target).map_err(|_| VirtualDownloadError::Failed)?;
         let mut response = self
             .content_response(&request.drive_id, &request.item_id, access_token)
             .await
-            .map_err(|_| QueuedDownloadError::Failed)?;
+            .map_err(VirtualDownloadError::from)?;
         while let Some(chunk) = response
             .chunk()
             .await
-            .map_err(|_| QueuedDownloadError::Failed)?
+            .map_err(|error| VirtualDownloadError::from(transport_fetch_error(error)))?
         {
             transfer
                 .write_chunk(&chunk)
                 .await
-                .map_err(|_| QueuedDownloadError::Failed)?;
+                .map_err(|_| VirtualDownloadError::Failed)?;
         }
         let after = self
             .item_version(&request.drive_id, &request.item_id, access_token)
             .await
-            .map_err(|_| QueuedDownloadError::Failed)?;
+            .map_err(VirtualDownloadError::from)?;
         if !version_matches(&after, &request.item_id, &request.etag, request.size) {
-            return Err(QueuedDownloadError::Changed);
+            return Err(VirtualDownloadError::Changed);
         }
         transfer
             .finish(target, Some(request.size))
             .await
-            .map_err(|_| QueuedDownloadError::Failed)
+            .map_err(|_| VirtualDownloadError::Failed)
     }
 
     async fn item_version(
@@ -853,7 +877,7 @@ impl GraphClient {
             .await?
             .json()
             .await
-            .map_err(|_| FetchError::Failed)
+            .map_err(transport_fetch_error)
     }
 
     async fn content_response(
@@ -873,7 +897,7 @@ impl GraphClient {
             .bearer_auth(access_token)
             .send()
             .await
-            .map_err(|_| FetchError::Failed)?;
+            .map_err(transport_fetch_error)?;
         for _ in 0..4 {
             if !response.status().is_redirection() {
                 break;
@@ -891,7 +915,7 @@ impl GraphClient {
                 .get(url)
                 .send()
                 .await
-                .map_err(|_| FetchError::Failed)?;
+                .map_err(transport_fetch_error)?;
         }
         if !response.status().is_success() {
             return Err(FetchError::Failed);
@@ -911,7 +935,7 @@ impl GraphClient {
                 .bearer_auth(access_token)
                 .send()
                 .await
-                .map_err(|_| FetchError::Failed)?;
+                .map_err(transport_fetch_error)?;
             if response.status() == StatusCode::GONE {
                 return Err(FetchError::Gone);
             }
@@ -941,6 +965,18 @@ impl GraphClient {
 mod tests {
     use super::*;
     use reqwest::header::AUTHORIZATION;
+
+    #[test]
+    fn virtual_download_preserves_offline_and_version_failures() {
+        assert_eq!(
+            VirtualDownloadError::from(FetchError::Offline),
+            VirtualDownloadError::Offline
+        );
+        assert_eq!(
+            VirtualDownloadError::from(FetchError::Gone),
+            VirtualDownloadError::Failed
+        );
+    }
 
     #[test]
     fn remote_rename_uses_id_parent_and_if_match() {
