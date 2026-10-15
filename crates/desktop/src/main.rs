@@ -311,6 +311,16 @@ fn read_virtual_mount_path() -> zbus::Result<String> {
     daemon_call("VirtualMountPath")
 }
 
+fn read_virtual_mount_recovery_path() -> zbus::Result<String> {
+    daemon_call("VirtualMountRecoveryPath")
+}
+
+fn virtual_mount_paths() -> zbus::Result<(String, String)> {
+    let current = read_virtual_mount_path()?;
+    let recovery = read_virtual_mount_recovery_path()?;
+    Ok((current, recovery))
+}
+
 fn mount_virtual_drive(path: &str) -> zbus::Result<String> {
     let connection = zbus::blocking::Connection::session()?;
     let proxy = zbus::blocking::Proxy::new(&connection, BUS_NAME, OBJECT_PATH, INTERFACE_NAME)?;
@@ -626,14 +636,19 @@ impl VirtualMountControls {
         }
     }
 
-    fn show_path(&self, path: Option<&str>) {
-        match path {
-            Some("") => {
+    fn show_path(&self, paths: Option<(&str, &str)>) {
+        match paths {
+            Some(("", "")) => {
                 self.label.set_text("Виртуальный диск не подключён");
                 self.mount.set_sensitive(true);
                 self.unmount.set_sensitive(false);
             }
-            Some(path) => {
+            Some(("", recovery)) => {
+                self.label.set_text(&format!("Прежняя точка монтирования занята: {recovery}. Проверьте её и отключите через fusermount3 -u"));
+                self.mount.set_sensitive(false);
+                self.unmount.set_sensitive(false);
+            }
+            Some((path, _)) => {
                 self.label.set_text(&format!("Виртуальный диск: {path}"));
                 self.mount.set_sensitive(false);
                 self.unmount.set_sensitive(true);
@@ -652,7 +667,7 @@ impl VirtualMountControls {
         }
         let (sender, receiver) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let _ = sender.send(read_virtual_mount_path());
+            let _ = sender.send(virtual_mount_paths());
         });
         let controls = self.clone();
         gtk::glib::timeout_add_local(Duration::from_millis(100), move || {
@@ -667,7 +682,12 @@ impl VirtualMountControls {
                     return gtk::glib::ControlFlow::Break;
                 }
             };
-            controls.show_path(result.ok().as_deref());
+            controls.show_path(
+                result
+                    .as_ref()
+                    .ok()
+                    .map(|(current, recovery)| (current.as_str(), recovery.as_str())),
+            );
             controls.busy.set(false);
             gtk::glib::ControlFlow::Break
         });
@@ -690,7 +710,7 @@ impl VirtualMountControls {
                 Some(path) => mount_virtual_drive(&path).map(|_| "Виртуальный диск подключён"),
                 None => unmount_virtual_drive().map(|()| "Виртуальный диск отключён"),
             };
-            let path = read_virtual_mount_path();
+            let path = virtual_mount_paths();
             let _ = sender.send((result, path));
         });
         let controls = self.clone();
@@ -708,7 +728,13 @@ impl VirtualMountControls {
                     return gtk::glib::ControlFlow::Break;
                 }
             };
-            controls.show_path(result.1.ok().as_deref());
+            controls.show_path(
+                result
+                    .1
+                    .as_ref()
+                    .ok()
+                    .map(|(current, recovery)| (current.as_str(), recovery.as_str())),
+            );
             match result.0 {
                 Ok(message) => status.set_text(message),
                 Err(error) => status.set_text(&format!("Виртуальный диск: {error}")),

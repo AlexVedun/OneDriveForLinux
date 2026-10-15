@@ -1,5 +1,6 @@
 mod auth;
 mod graph;
+mod mount_record;
 mod transfer;
 
 use auth::LoginAttempt;
@@ -266,6 +267,22 @@ impl Daemon {
             .unwrap_or_default()
     }
 
+    fn virtual_mount_recovery_path(&self) -> zbus::fdo::Result<String> {
+        if self.virtual_mount.lock().unwrap().is_some()
+            || self.mount_in_progress.load(Ordering::SeqCst)
+        {
+            return Ok(String::new());
+        }
+        let root =
+            state_directory().map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
+        mount_record::pending(&root)
+            .map(|path| {
+                path.map(|path| path.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            })
+            .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))
+    }
+
     async fn mount_virtual_drive(&self, mount_path: &str) -> zbus::fdo::Result<String> {
         let mount_path = PathBuf::from(mount_path);
         if !mount_path.is_absolute() {
@@ -296,6 +313,14 @@ impl Daemon {
             .map_err(|_| zbus::fdo::Error::Failed("cannot read sync root".to_owned()))?;
         let state_root = state_directory()
             .map_err(|_| zbus::fdo::Error::Failed("cannot access state directory".to_owned()))?;
+        if let Some(previous) = mount_record::pending(&state_root)
+            .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?
+        {
+            return Err(zbus::fdo::Error::Failed(format!(
+                "previous virtual mount remains occupied: {}",
+                previous.display()
+            )));
+        }
         let cache_root = state_root.join("virtual-cache");
         let mount_path =
             preflight::validate_mount_paths(&mount_path, sync_root.as_deref(), &cache_root)
@@ -321,13 +346,22 @@ impl Daemon {
                 })
         });
         let fuse = ReadOnlyFuse::new(tree, cache_root, VIRTUAL_CACHE_BYTES, loader);
+        mount_record::write(&state_root, &mount_path).map_err(|error| {
+            zbus::fdo::Error::Failed(format!("cannot record mount path: {error}"))
+        })?;
         let path_for_mount = mount_path.clone();
-        let session = tokio::task::spawn_blocking(move || fuse.mount(&path_for_mount))
-            .await
-            .map_err(|_| zbus::fdo::Error::Failed("FUSE mount task failed".to_owned()))?
-            .map_err(|error| {
-                zbus::fdo::Error::Failed(format!("cannot mount virtual drive: {error}"))
-            })?;
+        let mounted = tokio::task::spawn_blocking(move || fuse.mount(&path_for_mount)).await;
+        let session = match mounted {
+            Ok(Ok(session)) => session,
+            other => {
+                let _ = mount_record::pending(&state_root);
+                return Err(zbus::fdo::Error::Failed(match other {
+                    Ok(Err(error)) => format!("cannot mount virtual drive: {error}"),
+                    Err(error) => format!("FUSE mount task failed: {error}"),
+                    Ok(Ok(_)) => unreachable!(),
+                }));
+            }
+        };
         *self.virtual_mount.lock().unwrap() = Some(MountedVirtualDrive {
             path: mount_path.clone(),
             session,
@@ -355,7 +389,10 @@ impl Daemon {
             .map_err(|_| zbus::fdo::Error::Failed("FUSE unmount task failed".to_owned()))?
             .map_err(|error| {
                 zbus::fdo::Error::Failed(format!("cannot unmount virtual drive: {error}"))
-            })
+            })?;
+        let root =
+            state_directory().map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
+        mount_record::clear(&root).map_err(|error| zbus::fdo::Error::Failed(error.to_string()))
     }
 
     /// Fetch a file into the virtual-drive cache on demand. Returns "cached" or "downloaded".
@@ -2690,6 +2727,14 @@ fn state_database_path(
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = Arc::new(Mutex::new(EngineState::NeedsLogin));
     let state_path = state_directory()?;
+    match mount_record::pending(&state_path) {
+        Ok(Some(path)) => eprintln!(
+            "previous virtual mount is still occupied: {}",
+            path.display()
+        ),
+        Err(error) => eprintln!("cannot inspect previous virtual mount: {error}"),
+        Ok(None) => {}
+    }
     let catalog = Arc::new(Mutex::new(Catalog::open(&state_database_path(
         &state_path,
         "catalog.sqlite3",
@@ -2741,6 +2786,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mounted = virtual_mount.lock().unwrap().take();
     if let Some(mounted) = mounted {
         tokio::task::spawn_blocking(move || mounted.session.umount_and_join()).await??;
+        mount_record::clear(&state_path)?;
     }
     Ok(())
 }
