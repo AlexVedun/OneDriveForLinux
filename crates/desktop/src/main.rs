@@ -321,6 +321,166 @@ fn unmount_virtual_drive() -> zbus::Result<()> {
     daemon_call("UnmountVirtualDrive")
 }
 
+fn read_virtual_file_cache_status(item_id: &str) -> zbus::Result<String> {
+    let connection = zbus::blocking::Connection::session()?;
+    let proxy = zbus::blocking::Proxy::new(&connection, BUS_NAME, OBJECT_PATH, INTERFACE_NAME)?;
+    proxy.call("VirtualFileCacheStatus", &(item_id))
+}
+
+fn set_virtual_file_pinned(item_id: &str, pinned: bool) -> zbus::Result<String> {
+    let connection = zbus::blocking::Connection::session()?;
+    let proxy = zbus::blocking::Proxy::new(&connection, BUS_NAME, OBJECT_PATH, INTERFACE_NAME)?;
+    proxy.call("SetVirtualFilePinned", &(item_id, pinned))
+}
+
+#[derive(Clone)]
+struct OfflineControls {
+    label: gtk::Label,
+    button: gtk::Button,
+    selected: Rc<RefCell<Option<String>>>,
+    state: Rc<RefCell<Option<String>>>,
+    generation: Rc<Cell<u64>>,
+    busy: Rc<Cell<bool>>,
+}
+
+impl OfflineControls {
+    fn new(label: &gtk::Label, button: &gtk::Button) -> Self {
+        Self {
+            label: label.clone(),
+            button: button.clone(),
+            selected: Rc::new(RefCell::new(None)),
+            state: Rc::new(RefCell::new(None)),
+            generation: Rc::new(Cell::new(0)),
+            busy: Rc::new(Cell::new(false)),
+        }
+    }
+
+    fn show_state(&self, state: &str) {
+        self.state.replace(Some(state.to_owned()));
+        self.label.set_text(match state {
+            "missing" => "Выбранный файл: ещё не сохранён локально",
+            "cached" => "Выбранный файл: в кэше, может быть удалён при очистке",
+            "pinned" => "Выбранный файл: доступен офлайн",
+            _ => "Не удалось определить состояние файла",
+        });
+        self.button.set_label(if state == "pinned" {
+            "Снять закрепление"
+        } else {
+            "Сохранить выбранный файл офлайн"
+        });
+        self.button
+            .set_sensitive(matches!(state, "missing" | "cached" | "pinned"));
+    }
+
+    fn set_selected(&self, item_id: Option<String>) {
+        self.selected.replace(item_id);
+        self.state.replace(None);
+        self.generation.set(self.generation.get().wrapping_add(1));
+        self.button.set_sensitive(false);
+        self.label.set_text(if self.selected.borrow().is_some() {
+            "Выбранный файл: проверка кэша…"
+        } else {
+            "Выберите файл для доступа офлайн"
+        });
+        self.refresh();
+    }
+
+    fn refresh(&self) {
+        if self.busy.get() {
+            return;
+        }
+        let Some(item_id) = self.selected.borrow().clone() else {
+            return;
+        };
+        let generation = self.generation.get();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(read_virtual_file_cache_status(&item_id));
+        });
+        let controls = self.clone();
+        gtk::glib::timeout_add_local(Duration::from_millis(100), move || {
+            let result = match receiver.try_recv() {
+                Ok(result) => result,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    return gtk::glib::ControlFlow::Continue;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    if controls.generation.get() == generation {
+                        controls.label.set_text("Не удалось проверить кэш");
+                    }
+                    return gtk::glib::ControlFlow::Break;
+                }
+            };
+            if controls.generation.get() == generation {
+                match result {
+                    Ok(state) => controls.show_state(&state),
+                    Err(error) => controls.label.set_text(&format!("Кэш недоступен: {error}")),
+                }
+            }
+            gtk::glib::ControlFlow::Break
+        });
+    }
+
+    fn toggle(&self, status: &gtk::Label) {
+        if self.busy.replace(true) {
+            return;
+        }
+        let Some(item_id) = self.selected.borrow().clone() else {
+            self.busy.set(false);
+            return;
+        };
+        let pinned = self.state.borrow().as_deref() != Some("pinned");
+        self.generation.set(self.generation.get().wrapping_add(1));
+        self.button.set_sensitive(false);
+        status.set_text(if pinned {
+            "Сохранение файла для доступа офлайн…"
+        } else {
+            "Снятие закрепления файла…"
+        });
+        let selected_id = item_id.clone();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(set_virtual_file_pinned(&item_id, pinned));
+        });
+        let controls = self.clone();
+        let status = status.clone();
+        gtk::glib::timeout_add_local(Duration::from_millis(100), move || {
+            let result = match receiver.try_recv() {
+                Ok(result) => result,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    return gtk::glib::ControlFlow::Continue;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    controls.busy.set(false);
+                    controls.refresh();
+                    status.set_text("Не удалось изменить доступность файла офлайн");
+                    return gtk::glib::ControlFlow::Break;
+                }
+            };
+            controls.busy.set(false);
+            match result {
+                Ok(state) => {
+                    if controls.selected.borrow().as_deref() == Some(selected_id.as_str()) {
+                        controls.show_state(&state);
+                    } else {
+                        controls.refresh();
+                    }
+                    status.set_text(if pinned {
+                        "Файл сохранён для доступа офлайн"
+                    } else {
+                        "Закрепление файла снято"
+                    });
+                }
+                Err(error) => {
+                    controls.refresh();
+                    status.set_text(&format!("Не удалось изменить доступность офлайн: {error}"));
+                }
+            }
+            gtk::glib::ControlFlow::Break
+        });
+    }
+}
+
 #[derive(Clone)]
 struct VirtualMountControls {
     label: gtk::Label,
@@ -938,6 +1098,16 @@ fn main() {
         mount_label.set_wrap(true);
         mount_label.set_selectable(true);
         let mount_controls = VirtualMountControls::new(&mount_label, &mount, &unmount);
+        let offline_label = gtk::Label::new(Some("Выберите файл для доступа офлайн"));
+        offline_label.set_xalign(0.0);
+        offline_label.set_wrap(true);
+        let offline_button = gtk::Button::with_label("Сохранить выбранный файл офлайн");
+        offline_button.set_sensitive(false);
+        let offline_controls = OfflineControls::new(&offline_label, &offline_button);
+        let offline_for_selection = offline_controls.clone();
+        list.connect_row_selected(move |_, row| {
+            offline_for_selection.set_selected(row.map(|row| row.widget_name().to_string()));
+        });
         let exit = gtk::Button::with_label("Выход");
         let controls = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         controls.append(&login);
@@ -961,6 +1131,8 @@ fn main() {
         virtual_actions.append(&mount);
         virtual_actions.append(&unmount);
         virtual_controls.append(&virtual_actions);
+        virtual_controls.append(&offline_label);
+        virtual_controls.append(&offline_button);
         let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
         content.set_margin_start(18);
         content.set_margin_end(18);
@@ -1079,6 +1251,10 @@ fn main() {
         let controls_for_unmount = mount_controls.clone();
         unmount.connect_clicked(move |_| {
             controls_for_unmount.run(None, &status_for_unmount);
+        });
+        let status_for_offline = status.clone();
+        offline_button.connect_clicked(move |_| {
+            offline_controls.toggle(&status_for_offline);
         });
         let window_for_preview = window.clone();
         let status_for_preview = status.clone();
