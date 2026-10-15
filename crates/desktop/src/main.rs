@@ -315,6 +315,27 @@ fn read_virtual_mount_recovery_path() -> zbus::Result<String> {
     daemon_call("VirtualMountRecoveryPath")
 }
 
+fn read_virtual_fuse_diagnostics() -> zbus::Result<(String, bool)> {
+    daemon_call("VirtualFuseDiagnostics")
+}
+
+fn fuse_diagnostics_label(device: &str, helper: bool) -> &'static str {
+    match (device, helper) {
+        ("device-missing", _) => {
+            "FUSE: отсутствует /dev/fuse. Проверьте модуль ядра и доступность устройства."
+        }
+        ("device-permission", _) => {
+            "FUSE: нет доступа к /dev/fuse. Проверьте разрешения устройства."
+        }
+        ("device-error", _) => "FUSE: не удалось проверить /dev/fuse.",
+        ("ready", false) => {
+            "FUSE: устройство доступно. Помощник fusermount3 не найден; он может потребоваться для подключения."
+        }
+        ("ready", true) => "FUSE: устройство и помощник монтирования доступны.",
+        _ => "FUSE: неизвестное состояние устройства.",
+    }
+}
+
 fn virtual_mount_paths() -> zbus::Result<(String, String)> {
     let current = read_virtual_mount_path()?;
     let recovery = read_virtual_mount_recovery_path()?;
@@ -621,18 +642,42 @@ impl OfflineControls {
 #[derive(Clone)]
 struct VirtualMountControls {
     label: gtk::Label,
+    diagnostics: gtk::Label,
     mount: gtk::Button,
     unmount: gtk::Button,
     busy: Rc<Cell<bool>>,
 }
 
 impl VirtualMountControls {
-    fn new(label: &gtk::Label, mount: &gtk::Button, unmount: &gtk::Button) -> Self {
+    fn new(
+        label: &gtk::Label,
+        diagnostics: &gtk::Label,
+        mount: &gtk::Button,
+        unmount: &gtk::Button,
+    ) -> Self {
         Self {
             label: label.clone(),
+            diagnostics: diagnostics.clone(),
             mount: mount.clone(),
             unmount: unmount.clone(),
             busy: Rc::new(Cell::new(false)),
+        }
+    }
+
+    fn show_diagnostics(&self, result: zbus::Result<(String, bool)>) {
+        match result {
+            Ok((device, helper)) => {
+                self.diagnostics
+                    .set_text(fuse_diagnostics_label(&device, helper));
+                if device != "ready" {
+                    self.mount.set_sensitive(false);
+                }
+            }
+            Err(_) => {
+                self.diagnostics
+                    .set_text("FUSE: диагностика демона недоступна");
+                self.mount.set_sensitive(false);
+            }
         }
     }
 
@@ -667,7 +712,7 @@ impl VirtualMountControls {
         }
         let (sender, receiver) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let _ = sender.send(virtual_mount_paths());
+            let _ = sender.send((virtual_mount_paths(), read_virtual_fuse_diagnostics()));
         });
         let controls = self.clone();
         gtk::glib::timeout_add_local(Duration::from_millis(100), move || {
@@ -684,10 +729,12 @@ impl VirtualMountControls {
             };
             controls.show_path(
                 result
+                    .0
                     .as_ref()
                     .ok()
                     .map(|(current, recovery)| (current.as_str(), recovery.as_str())),
             );
+            controls.show_diagnostics(result.1);
             controls.busy.set(false);
             gtk::glib::ControlFlow::Break
         });
@@ -711,7 +758,8 @@ impl VirtualMountControls {
                 None => unmount_virtual_drive().map(|()| "Виртуальный диск отключён"),
             };
             let path = virtual_mount_paths();
-            let _ = sender.send((result, path));
+            let diagnostics = read_virtual_fuse_diagnostics();
+            let _ = sender.send((result, path, diagnostics));
         });
         let controls = self.clone();
         let status = status.clone();
@@ -735,6 +783,7 @@ impl VirtualMountControls {
                     .ok()
                     .map(|(current, recovery)| (current.as_str(), recovery.as_str())),
             );
+            controls.show_diagnostics(result.2);
             match result.0 {
                 Ok(message) => status.set_text(message),
                 Err(error) => status.set_text(&format!("Виртуальный диск: {error}")),
@@ -1250,7 +1299,10 @@ fn main() {
         mount_label.set_xalign(0.0);
         mount_label.set_wrap(true);
         mount_label.set_selectable(true);
-        let mount_controls = VirtualMountControls::new(&mount_label, &mount, &unmount);
+        let fuse_label = gtk::Label::new(Some("FUSE: проверка состояния…"));
+        fuse_label.set_xalign(0.0);
+        fuse_label.set_wrap(true);
+        let mount_controls = VirtualMountControls::new(&mount_label, &fuse_label, &mount, &unmount);
         let offline_label = gtk::Label::new(Some("Выберите файл для доступа офлайн"));
         offline_label.set_xalign(0.0);
         offline_label.set_wrap(true);
@@ -1288,6 +1340,7 @@ fn main() {
         sync_controls.append(&sync_actions);
         let virtual_controls = gtk::Box::new(gtk::Orientation::Vertical, 6);
         virtual_controls.append(&mount_label);
+        virtual_controls.append(&fuse_label);
         let virtual_actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         virtual_actions.append(&mount);
         virtual_actions.append(&unmount);
@@ -1762,5 +1815,12 @@ mod tests {
             state_label("daemon-unavailable"),
             "Фоновый процесс недоступен"
         );
+    }
+
+    #[test]
+    fn fuse_diagnostics_identifies_missing_device_and_helper() {
+        assert!(fuse_diagnostics_label("device-missing", true).contains("/dev/fuse"));
+        assert!(fuse_diagnostics_label("device-permission", true).contains("нет доступа"));
+        assert!(fuse_diagnostics_label("ready", false).contains("fusermount3"));
     }
 }

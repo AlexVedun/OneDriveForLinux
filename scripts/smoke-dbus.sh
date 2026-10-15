@@ -82,6 +82,14 @@ recovery_path=$(gdbus call --session \
     --object-path /io/github/onedrive_linux/Daemon \
     --method io.github.onedrive_linux.Daemon.VirtualMountRecoveryPath)
 test "$recovery_path" = "('',)"
+fuse_diagnostics=$(gdbus call --session \
+    --dest io.github.onedrive_linux.Daemon \
+    --object-path /io/github/onedrive_linux/Daemon \
+    --method io.github.onedrive_linux.Daemon.VirtualFuseDiagnostics)
+case "$fuse_diagnostics" in
+    "('ready', true)"|"('ready', false)"|"('device-missing', true)"|"('device-missing', false)"|"('device-permission', true)"|"('device-permission', false)"|"('device-error', true)"|"('device-error', false)") ;;
+    *) exit 1 ;;
+esac
 if gdbus call --session \
     --dest io.github.onedrive_linux.Daemon \
     --object-path /io/github/onedrive_linux/Daemon \
