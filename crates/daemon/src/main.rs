@@ -90,6 +90,18 @@ fn publish_virtual_file(
     cache.put(&request.cache_key(), downloaded, request.size)
 }
 
+fn inspect_virtual_cache(
+    cache_root: &std::path::Path,
+    request: &DownloadRequest,
+) -> Result<(bool, u64), CacheError> {
+    let mut cache = CacheStore::open(cache_root, VIRTUAL_CACHE_BYTES)?;
+    let cached = match cache.get(&request.cache_key())? {
+        Some(file) => file.metadata()?.len() == request.size,
+        None => false,
+    };
+    Ok((cached, cache.limit_bytes()))
+}
+
 struct Daemon {
     state: Arc<Mutex<EngineState>>,
     login_in_progress: Arc<AtomicBool>,
@@ -146,11 +158,6 @@ async fn prepare_virtual_request(
             "virtual file version changed".to_owned(),
         ));
     }
-    if request.size > VIRTUAL_CACHE_BYTES {
-        return Err(zbus::fdo::Error::Failed(
-            "file exceeds virtual cache limit".to_owned(),
-        ));
-    }
     if context
         .download_in_progress
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -164,21 +171,21 @@ async fn prepare_virtual_request(
     let state_root = state_directory()
         .map_err(|_| zbus::fdo::Error::Failed("cannot access state directory".to_owned()))?;
     let cache_root = state_root.join("virtual-cache");
-    let key = request.cache_key();
-    let expected_size = request.size;
+    let request_for_check = request.clone();
     let cache_root_for_check = cache_root.clone();
-    let already_cached = tokio::task::spawn_blocking(move || {
-        let mut cache = CacheStore::open(&cache_root_for_check, VIRTUAL_CACHE_BYTES)?;
-        match cache.get(&key)? {
-            Some(file) => Ok::<_, CacheError>(file.metadata()?.len() == expected_size),
-            None => Ok(false),
-        }
+    let (already_cached, cache_limit) = tokio::task::spawn_blocking(move || {
+        inspect_virtual_cache(&cache_root_for_check, &request_for_check)
     })
     .await
     .map_err(|_| zbus::fdo::Error::Failed("cache check failed".to_owned()))?
     .map_err(|_| zbus::fdo::Error::Failed("cannot read virtual cache".to_owned()))?;
     if already_cached {
         return Ok("cached".to_owned());
+    }
+    if request.size > cache_limit {
+        return Err(zbus::fdo::Error::Failed(
+            "file exceeds virtual cache limit".to_owned(),
+        ));
     }
     let client_id = client_id().ok_or_else(|| {
         zbus::fdo::Error::Failed("ONEDRIVE_CLIENT_ID is not configured".to_owned())
@@ -2641,9 +2648,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::{
         Baseline, CatalogItem, QueuedOperation, VIRTUAL_CACHE_BYTES, VirtualDownloadContext,
-        client_id_from_dotenv, client_id_from_sources, local_delete_candidate,
-        prepare_virtual_request, publish_virtual_file, remote_delete_candidate,
-        remote_folder_candidate, remote_rename_candidate,
+        client_id_from_dotenv, client_id_from_sources, inspect_virtual_cache,
+        local_delete_candidate, prepare_virtual_request, publish_virtual_file,
+        remote_delete_candidate, remote_folder_candidate, remote_rename_candidate,
     };
     use onedrive_cache::{CacheError, CacheStore};
     use onedrive_catalog::{Catalog, DeltaPage};
@@ -2996,6 +3003,32 @@ mod tests {
         let mut cache = CacheStore::open(&cache_root, VIRTUAL_CACHE_BYTES).unwrap();
         assert!(cache.get(&request.cache_key()).unwrap().is_some());
         assert!(cache.get(&changed.cache_key()).unwrap().is_none());
+    }
+
+    #[test]
+    fn virtual_download_uses_persisted_cache_limit() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("cache");
+        let mut cache = CacheStore::open(&root, VIRTUAL_CACHE_BYTES).unwrap();
+        cache.set_limit(VIRTUAL_CACHE_BYTES * 2).unwrap();
+        drop(cache);
+        let request = DownloadRequest {
+            drive_id: "drive".into(),
+            item_id: "large-file".into(),
+            etag: "v1".into(),
+            size: VIRTUAL_CACHE_BYTES + 1,
+        };
+        assert_eq!(
+            inspect_virtual_cache(&root, &request).unwrap(),
+            (false, VIRTUAL_CACHE_BYTES * 2)
+        );
+        let mut cache = CacheStore::open(&root, VIRTUAL_CACHE_BYTES).unwrap();
+        cache.set_limit(VIRTUAL_CACHE_BYTES / 4).unwrap();
+        drop(cache);
+        assert_eq!(
+            inspect_virtual_cache(&root, &request).unwrap(),
+            (false, VIRTUAL_CACHE_BYTES / 4)
+        );
     }
 
     #[tokio::test]
