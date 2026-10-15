@@ -313,4 +313,65 @@ mod tests {
         fuse.open_file(inode, OpenFlags(libc::O_RDONLY)).unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
+
+    #[test]
+    fn mounted_tree_reads_cached_file_without_network() {
+        if std::env::var_os("ONEDRIVE_FUSE_SMOKE").is_none() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mountpoint = dir.path().join("mount");
+        let cache_root = dir.path().join("cache");
+        let source = dir.path().join("source");
+        fs::create_dir(&mountpoint).unwrap();
+        fs::write(&source, b"hello").unwrap();
+        let item = file_item();
+        let mut on_demand = file_item();
+        on_demand.item_id = "second".into();
+        on_demand.name = Some("по-запросу.txt".into());
+        let tree = VirtualTree::from_items("drive", "root", [item, on_demand]).unwrap();
+        let request = tree.request_for_item("file").unwrap();
+        let mut cache = CacheStore::open(&cache_root, 10).unwrap();
+        cache.put(&request.cache_key(), &source, 5).unwrap();
+        drop(cache);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_loader = Arc::clone(&calls);
+        let cache_for_loader = cache_root.clone();
+        let loader: Arc<ContentLoader> = Arc::new(move |request| {
+            assert_eq!(request.item_id, "second");
+            calls_for_loader.fetch_add(1, Ordering::SeqCst);
+            let mut cache = CacheStore::open(&cache_for_loader, 10).map_err(io::Error::other)?;
+            cache
+                .put(&request.cache_key(), &source, request.size)
+                .map_err(io::Error::other)
+        });
+        let session = ReadOnlyFuse::new(tree, cache_root, 10, loader)
+            .mount(&mountpoint)
+            .unwrap();
+        let mut entries = fs::read_dir(&mountpoint)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        entries.sort();
+        assert_eq!(
+            entries,
+            [
+                std::ffi::OsString::from("по-запросу.txt"),
+                std::ffi::OsString::from("текст.txt")
+            ]
+        );
+        assert_eq!(fs::read(mountpoint.join("текст.txt")).unwrap(), b"hello");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            fs::read(mountpoint.join("по-запросу.txt")).unwrap(),
+            b"hello"
+        );
+        assert_eq!(
+            fs::read(mountpoint.join("по-запросу.txt")).unwrap(),
+            b"hello"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(fs::write(mountpoint.join("new.txt"), b"no").is_err());
+        session.umount_and_join().unwrap();
+    }
 }
