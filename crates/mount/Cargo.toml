@@ -5,6 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+fuser = "=0.18.0"
+libc = "0.2"
 onedrive-catalog = { path = "../catalog" }
 onedrive-cache = { path = "../cache" }
 onedrive-core = { path = "../core" }
