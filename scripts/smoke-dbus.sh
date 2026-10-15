@@ -48,6 +48,27 @@ gdbus introspect --session \
 gdbus introspect --session \
     --dest io.github.onedrive_linux.Daemon \
     --object-path /io/github/onedrive_linux/Daemon | grep -q MountVirtualDrive
+cache_stats=$(gdbus call --session \
+    --dest io.github.onedrive_linux.Daemon \
+    --object-path /io/github/onedrive_linux/Daemon \
+    --method io.github.onedrive_linux.Daemon.VirtualCacheStats)
+test "$cache_stats" = "(uint64 0, uint64 1073741824)"
+cache_stats=$(gdbus call --session \
+    --dest io.github.onedrive_linux.Daemon \
+    --object-path /io/github/onedrive_linux/Daemon \
+    --method io.github.onedrive_linux.Daemon.SetVirtualCacheLimit 268435456)
+test "$cache_stats" = "(uint64 0, uint64 268435456)"
+cache_stats=$(gdbus call --session \
+    --dest io.github.onedrive_linux.Daemon \
+    --object-path /io/github/onedrive_linux/Daemon \
+    --method io.github.onedrive_linux.Daemon.VirtualCacheStats)
+test "$cache_stats" = "(uint64 0, uint64 268435456)"
+if gdbus call --session \
+    --dest io.github.onedrive_linux.Daemon \
+    --object-path /io/github/onedrive_linux/Daemon \
+    --method io.github.onedrive_linux.Daemon.SetVirtualCacheLimit 1048576 >/dev/null 2>&1; then
+    exit 1
+fi
 gdbus introspect --session \
     --dest io.github.onedrive_linux.Daemon \
     --object-path /io/github/onedrive_linux/Daemon | grep -q SetVirtualFilePinned
