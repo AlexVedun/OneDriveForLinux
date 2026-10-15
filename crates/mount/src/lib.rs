@@ -1,5 +1,6 @@
 //! Read-only metadata view for a future FUSE adapter. No network calls or mounts happen here.
 
+pub mod fuse;
 pub mod preflight;
 
 use onedrive_cache::{CacheError, CacheKey, CacheStore};
