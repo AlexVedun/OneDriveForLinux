@@ -14,7 +14,7 @@ use onedrive_cache::{CacheError, CacheStore};
 use onedrive_catalog::{Catalog, CatalogItem, FetchError};
 use onedrive_core::{BUS_NAME, EngineState, OBJECT_PATH};
 use onedrive_mount::{DownloadRequest, VirtualTree};
-use onedrive_mount::{fuse::ReadOnlyFuse, preflight};
+use onedrive_mount::{draft::DraftStore, fuse::VirtualFuse, preflight};
 use onedrive_sync::{
     Action, Baseline, QueuedOperation, SyncStore,
     folders::local_directory_exists,
@@ -258,6 +258,17 @@ fn virtual_request_for_item(
 
 #[zbus::interface(name = "io.github.onedrive_linux.Daemon")]
 impl Daemon {
+    fn virtual_draft_count(&self) -> zbus::fdo::Result<u64> {
+        let root = state_directory()
+            .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?
+            .join("virtual-drafts");
+        let count = DraftStore::open(&root)
+            .and_then(|store| store.list())
+            .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?
+            .len();
+        u64::try_from(count).map_err(|error| zbus::fdo::Error::Failed(error.to_string()))
+    }
+
     /// Device status and optional unprivileged mount helper status.
     fn virtual_fuse_diagnostics(&self) -> (String, bool) {
         let device = match preflight::check_fuse_device() {
@@ -333,9 +344,12 @@ impl Daemon {
             )));
         }
         let cache_root = state_root.join("virtual-cache");
+        let draft_root = state_root.join("virtual-drafts");
         let mount_path =
             preflight::validate_mount_paths(&mount_path, sync_root.as_deref(), &cache_root)
                 .map_err(|error| zbus::fdo::Error::InvalidArgs(error.to_string()))?;
+        onedrive_core::validate_distinct_paths(&[&mount_path, &draft_root])
+            .map_err(|error| zbus::fdo::Error::InvalidArgs(error.to_string()))?;
         preflight::check_fuse_device()
             .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
         let tree = {
@@ -356,7 +370,8 @@ impl Daemon {
                     other => io::Error::other(other),
                 })
         });
-        let fuse = ReadOnlyFuse::new(tree, cache_root, VIRTUAL_CACHE_BYTES, loader);
+        let fuse =
+            VirtualFuse::new_writable(tree, cache_root, draft_root, VIRTUAL_CACHE_BYTES, loader);
         mount_record::write(&state_root, &mount_path).map_err(|error| {
             zbus::fdo::Error::Failed(format!("cannot record mount path: {error}"))
         })?;

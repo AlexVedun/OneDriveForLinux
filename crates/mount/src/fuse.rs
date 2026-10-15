@@ -1,10 +1,14 @@
-//! Read-only FUSE adapter around a validated catalog snapshot and versioned cache.
+//! FUSE adapter around a validated catalog snapshot, versioned cache and local drafts.
 
-use crate::{DownloadRequest, FileHandle as CachedHandle, Node, NodeKind, OpenError, VirtualTree};
+use crate::draft::{DraftFile, DraftIdentity, DraftStore};
+use crate::{
+    DownloadRequest, FileHandle as CachedHandle, MAX_READ_BYTES, Node, NodeKind, OpenError,
+    VirtualTree,
+};
 use fuser::{
     BackgroundSession, Config, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags,
     Generation, INodeNo, MountOption, OpenAccMode, OpenFlags, ReplyAttr, ReplyData, ReplyDirectory,
-    ReplyEmpty, ReplyEntry, ReplyOpen, Request,
+    ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request,
 };
 use onedrive_cache::CacheStore;
 use std::collections::HashMap;
@@ -23,12 +27,20 @@ pub type ContentLoader = dyn Fn(&DownloadRequest) -> io::Result<()> + Send + Syn
 
 struct OpenFile {
     inode: u64,
-    handle: CachedHandle,
+    handle: OpenHandle,
+    writable: bool,
 }
 
-pub struct ReadOnlyFuse {
+enum OpenHandle {
+    Cached(CachedHandle),
+    Draft(DraftFile),
+    Pending(DraftIdentity),
+}
+
+pub struct VirtualFuse {
     tree: VirtualTree,
     cache_root: PathBuf,
+    draft_root: Option<PathBuf>,
     cache_limit: u64,
     loader: Arc<ContentLoader>,
     open_lock: Mutex<()>,
@@ -38,7 +50,7 @@ pub struct ReadOnlyFuse {
     gid: u32,
 }
 
-impl ReadOnlyFuse {
+impl VirtualFuse {
     pub fn new(
         tree: VirtualTree,
         cache_root: PathBuf,
@@ -48,6 +60,7 @@ impl ReadOnlyFuse {
         Self {
             tree,
             cache_root,
+            draft_root: None,
             cache_limit,
             loader,
             open_lock: Mutex::new(()),
@@ -58,25 +71,47 @@ impl ReadOnlyFuse {
         }
     }
 
+    pub fn new_writable(
+        tree: VirtualTree,
+        cache_root: PathBuf,
+        draft_root: PathBuf,
+        cache_limit: u64,
+        loader: Arc<ContentLoader>,
+    ) -> Self {
+        let mut fuse = Self::new(tree, cache_root, cache_limit, loader);
+        fuse.draft_root = Some(draft_root);
+        fuse
+    }
+
     pub fn mount(self, mountpoint: &Path) -> io::Result<BackgroundSession> {
         let mut options = Config::default();
         options.mount_options = vec![
-            MountOption::RO,
             MountOption::DefaultPermissions,
             MountOption::NoDev,
             MountOption::NoSuid,
             MountOption::FSName("onedrive-linux".into()),
         ];
+        if self.draft_root.is_none() {
+            options.mount_options.push(MountOption::RO);
+        }
         options.n_threads = Some(1);
         fuser::spawn_mount(self, mountpoint, &options)
     }
 
-    fn attr(&self, node: &Node) -> FileAttr {
+    fn attr(&self, node: &Node) -> Result<FileAttr, Errno> {
         let directory = node.kind == NodeKind::Directory;
-        FileAttr {
+        let draft_size = if directory {
+            None
+        } else {
+            self.draft_for_node(node)?
+                .map(|draft| draft.len().map_err(|_| Errno::EIO))
+                .transpose()?
+        };
+        let size = draft_size.unwrap_or(node.size);
+        Ok(FileAttr {
             ino: INodeNo(node.inode),
-            size: node.size,
-            blocks: node.size.saturating_add(511) / 512,
+            size,
+            blocks: size.saturating_add(511) / 512,
             atime: UNIX_EPOCH,
             mtime: UNIX_EPOCH,
             ctime: UNIX_EPOCH,
@@ -86,14 +121,29 @@ impl ReadOnlyFuse {
             } else {
                 FileType::RegularFile
             },
-            perm: if directory { 0o500 } else { 0o400 },
+            perm: if directory {
+                0o500
+            } else if self.draft_root.is_some() {
+                0o600
+            } else {
+                0o400
+            },
             nlink: if directory { 2 } else { 1 },
             uid: self.uid,
             gid: self.gid,
             rdev: 0,
             blksize: 4096,
             flags: 0,
-        }
+        })
+    }
+
+    fn draft_for_node(&self, node: &Node) -> Result<Option<DraftFile>, Errno> {
+        let Some(root) = &self.draft_root else {
+            return Ok(None);
+        };
+        DraftStore::open(root)
+            .and_then(|store| store.recover_item(self.tree.drive_id(), &node.item_id))
+            .map_err(|_| Errno::EIO)
     }
 
     fn directory_entries(&self, inode: u64) -> Option<Vec<(u64, FileType, String)>> {
@@ -118,10 +168,57 @@ impl ReadOnlyFuse {
     }
 
     fn open_file(&self, inode: u64, flags: OpenFlags) -> Result<u64, Errno> {
-        if flags.acc_mode() != OpenAccMode::O_RDONLY || flags.0 & libc::O_TRUNC != 0 {
+        let writable = flags.acc_mode() != OpenAccMode::O_RDONLY;
+        if (writable && self.draft_root.is_none()) || (!writable && flags.0 & libc::O_TRUNC != 0) {
             return Err(Errno::EROFS);
         }
         let _serialized = self.open_lock.lock().unwrap();
+        let node = self.tree.getattr(inode).ok_or(Errno::ENOENT)?;
+        if node.kind != NodeKind::File {
+            return Err(Errno::EISDIR);
+        }
+        if let Some(draft) = self.draft_for_node(node)? {
+            if writable && flags.0 & libc::O_TRUNC != 0 {
+                draft.set_len(0).map_err(map_draft_error)?;
+            }
+            return Ok(self.insert_open(inode, OpenHandle::Draft(draft), writable));
+        }
+        if writable && flags.0 & libc::O_TRUNC != 0 {
+            let request = self
+                .tree
+                .request_for_item(&node.item_id)
+                .map_err(map_open_error)?;
+            let store =
+                DraftStore::open(self.draft_root.as_ref().unwrap()).map_err(map_draft_error)?;
+            let draft = store
+                .begin_empty(DraftIdentity {
+                    drive_id: request.drive_id,
+                    item_id: request.item_id,
+                    base_etag: request.etag,
+                })
+                .map_err(map_draft_error)?;
+            return Ok(self.insert_open(inode, OpenHandle::Draft(draft), true));
+        }
+        if writable {
+            let request = self
+                .tree
+                .request_for_item(&node.item_id)
+                .map_err(map_open_error)?;
+            return Ok(self.insert_open(
+                inode,
+                OpenHandle::Pending(DraftIdentity {
+                    drive_id: request.drive_id,
+                    item_id: request.item_id,
+                    base_etag: request.etag,
+                }),
+                true,
+            ));
+        }
+        let opened = self.open_cached(inode)?;
+        Ok(self.insert_open(inode, OpenHandle::Cached(opened), false))
+    }
+
+    fn open_cached(&self, inode: u64) -> Result<CachedHandle, Errno> {
         let mut cache =
             CacheStore::open(&self.cache_root, self.cache_limit).map_err(|_| Errno::EIO)?;
         let opened = match self.tree.open_cached(inode, &mut cache) {
@@ -137,15 +234,20 @@ impl ReadOnlyFuse {
             }
             Err(error) => return Err(map_open_error(error)),
         };
-        let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
+        Ok(opened)
+    }
+
+    fn insert_open(&self, inode: u64, handle: OpenHandle, writable: bool) -> u64 {
+        let id = self.next_handle.fetch_add(1, Ordering::Relaxed);
         self.files.lock().unwrap().insert(
-            handle,
+            id,
             OpenFile {
                 inode,
-                handle: opened,
+                handle,
+                writable,
             },
         );
-        Ok(handle)
+        id
     }
 
     fn read_file(&self, inode: u64, handle: u64, offset: u64, size: u32) -> Result<Vec<u8>, Errno> {
@@ -154,14 +256,115 @@ impl ReadOnlyFuse {
             .get(&handle)
             .filter(|open| open.inode == inode)
             .ok_or(Errno::EBADF)?;
-        open.handle.read(offset, size).map_err(|_| Errno::EIO)
+        if self.draft_root.is_some() {
+            let node = self.tree.getattr(inode).ok_or(Errno::ENOENT)?;
+            if let Some(draft) = self.draft_for_node(node)? {
+                return read_draft(&draft, offset, size);
+            }
+        }
+        match &open.handle {
+            OpenHandle::Cached(handle) => handle.read(offset, size).map_err(|_| Errno::EIO),
+            OpenHandle::Draft(handle) => read_draft(handle, offset, size),
+            OpenHandle::Pending(_) => self
+                .open_cached(inode)?
+                .read(offset, size)
+                .map_err(|_| Errno::EIO),
+        }
     }
+
+    fn write_file(&self, inode: u64, handle: u64, offset: u64, data: &[u8]) -> Result<u32, Errno> {
+        let mut files = self.files.lock().unwrap();
+        let open = files
+            .get_mut(&handle)
+            .filter(|open| open.inode == inode)
+            .ok_or(Errno::EBADF)?;
+        if !open.writable {
+            return Err(Errno::EBADF);
+        }
+        if let OpenHandle::Pending(identity) = &open.handle {
+            let store =
+                DraftStore::open(self.draft_root.as_ref().unwrap()).map_err(map_draft_error)?;
+            let draft = if let Some(existing) = store.recover(identity).map_err(|_| Errno::EIO)? {
+                existing
+            } else {
+                let cached = self.open_cached(inode)?;
+                store
+                    .begin_from_file(identity.clone(), cached.source_file())
+                    .map_err(map_draft_error)?
+            };
+            open.handle = OpenHandle::Draft(draft);
+        }
+        let OpenHandle::Draft(draft) = &open.handle else {
+            return Err(Errno::EROFS);
+        };
+        let written = draft.write_at(offset, data).map_err(map_draft_error)?;
+        u32::try_from(written).map_err(|_| Errno::EIO)
+    }
+
+    fn truncate_file(&self, inode: u64, handle: Option<u64>, size: u64) -> Result<(), Errno> {
+        if size > i64::MAX as u64 {
+            return Err(Errno::EINVAL);
+        }
+        let owned_handle = if let Some(handle) = handle {
+            handle
+        } else {
+            self.open_file(
+                inode,
+                OpenFlags(libc::O_WRONLY | if size == 0 { libc::O_TRUNC } else { 0 }),
+            )?
+        };
+        let result = (|| {
+            let mut files = self.files.lock().unwrap();
+            let open = files
+                .get_mut(&owned_handle)
+                .filter(|open| open.inode == inode && open.writable)
+                .ok_or(Errno::EBADF)?;
+            if let OpenHandle::Pending(identity) = &open.handle {
+                let store =
+                    DraftStore::open(self.draft_root.as_ref().unwrap()).map_err(map_draft_error)?;
+                let draft = if size == 0 {
+                    store.begin_empty(identity.clone())
+                } else {
+                    let cached = self.open_cached(inode)?;
+                    store.begin_from_file(identity.clone(), cached.source_file())
+                }
+                .map_err(map_draft_error)?;
+                open.handle = OpenHandle::Draft(draft);
+            }
+            let OpenHandle::Draft(draft) = &open.handle else {
+                return Err(Errno::EROFS);
+            };
+            draft.set_len(size).map_err(map_draft_error)
+        })();
+        if handle.is_none() {
+            self.files.lock().unwrap().remove(&owned_handle);
+        }
+        result
+    }
+}
+
+fn read_draft(draft: &DraftFile, offset: u64, size: u32) -> Result<Vec<u8>, Errno> {
+    if size > MAX_READ_BYTES {
+        return Err(Errno::EINVAL);
+    }
+    let mut bytes = vec![0; size as usize];
+    let count = draft.read_at(offset, &mut bytes).map_err(|_| Errno::EIO)?;
+    bytes.truncate(count);
+    Ok(bytes)
 }
 
 fn map_open_error(error: OpenError) -> Errno {
     match error {
         OpenError::MissingFile => Errno::ENOENT,
         OpenError::IsDirectory => Errno::EISDIR,
+        _ => Errno::EIO,
+    }
+}
+
+fn map_draft_error(error: io::Error) -> Errno {
+    match error.raw_os_error() {
+        Some(libc::ENOSPC) => Errno::ENOSPC,
+        Some(libc::EDQUOT) => Errno::EDQUOT,
         _ => Errno::EIO,
     }
 }
@@ -179,14 +382,17 @@ fn map_loader_error(error: io::Error) -> Errno {
     }
 }
 
-impl Filesystem for ReadOnlyFuse {
+impl Filesystem for VirtualFuse {
     fn lookup(&self, _request: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let Some(name) = name.to_str() else {
             reply.error(Errno::ENOENT);
             return;
         };
         match self.tree.lookup(parent.0, name) {
-            Some(node) => reply.entry(&TTL, &self.attr(node), Generation(0)),
+            Some(node) => match self.attr(node) {
+                Ok(attr) => reply.entry(&TTL, &attr, Generation(0)),
+                Err(error) => reply.error(error),
+            },
             None => reply.error(Errno::ENOENT),
         }
     }
@@ -199,8 +405,50 @@ impl Filesystem for ReadOnlyFuse {
         reply: ReplyAttr,
     ) {
         match self.tree.getattr(inode.0) {
-            Some(node) => reply.attr(&TTL, &self.attr(node)),
+            Some(node) => match self.attr(node) {
+                Ok(attr) => reply.attr(&TTL, &attr),
+                Err(error) => reply.error(error),
+            },
             None => reply.error(Errno::ENOENT),
+        }
+    }
+
+    fn setattr(
+        &self,
+        _request: &Request,
+        inode: INodeNo,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        size: Option<u64>,
+        _atime: Option<fuser::TimeOrNow>,
+        _mtime: Option<fuser::TimeOrNow>,
+        _ctime: Option<std::time::SystemTime>,
+        handle: Option<FileHandle>,
+        _crtime: Option<std::time::SystemTime>,
+        _chgtime: Option<std::time::SystemTime>,
+        _bkuptime: Option<std::time::SystemTime>,
+        flags: Option<fuser::BsdFileFlags>,
+        reply: ReplyAttr,
+    ) {
+        if mode.is_some() || uid.is_some() || gid.is_some() || flags.is_some() {
+            reply.error(Errno::EROFS);
+            return;
+        }
+        let Some(size) = size else {
+            reply.error(Errno::EROFS);
+            return;
+        };
+        match self.truncate_file(inode.0, handle.map(|handle| handle.0), size) {
+            Ok(()) => match self
+                .tree
+                .getattr(inode.0)
+                .and_then(|node| self.attr(node).ok())
+            {
+                Some(attr) => reply.attr(&TTL, &attr),
+                None => reply.error(Errno::EIO),
+            },
+            Err(error) => reply.error(error),
         }
     }
 
@@ -229,7 +477,14 @@ impl Filesystem for ReadOnlyFuse {
 
     fn open(&self, _request: &Request, inode: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
         match self.open_file(inode.0, flags) {
-            Ok(handle) => reply.opened(FileHandle(handle), FopenFlags::empty()),
+            Ok(handle) => reply.opened(
+                FileHandle(handle),
+                if self.draft_root.is_some() {
+                    FopenFlags::FOPEN_DIRECT_IO
+                } else {
+                    FopenFlags::empty()
+                },
+            ),
             Err(error) => reply.error(error),
         }
     }
@@ -248,6 +503,68 @@ impl Filesystem for ReadOnlyFuse {
         match self.read_file(inode.0, handle.0, offset, size) {
             Ok(bytes) => reply.data(&bytes),
             Err(error) => reply.error(error),
+        }
+    }
+
+    fn write(
+        &self,
+        _request: &Request,
+        inode: INodeNo,
+        handle: FileHandle,
+        offset: u64,
+        data: &[u8],
+        _write_flags: fuser::WriteFlags,
+        _flags: OpenFlags,
+        _lock_owner: Option<fuser::LockOwner>,
+        reply: ReplyWrite,
+    ) {
+        match self.write_file(inode.0, handle.0, offset, data) {
+            Ok(count) => reply.written(count),
+            Err(error) => reply.error(error),
+        }
+    }
+
+    fn flush(
+        &self,
+        _request: &Request,
+        inode: INodeNo,
+        handle: FileHandle,
+        _lock_owner: fuser::LockOwner,
+        reply: ReplyEmpty,
+    ) {
+        let files = self.files.lock().unwrap();
+        match files.get(&handle.0).filter(|open| open.inode == inode.0) {
+            Some(OpenFile {
+                handle: OpenHandle::Draft(draft),
+                ..
+            }) => match draft.sync() {
+                Ok(()) => reply.ok(),
+                Err(_) => reply.error(Errno::EIO),
+            },
+            Some(_) => reply.ok(),
+            None => reply.error(Errno::EBADF),
+        }
+    }
+
+    fn fsync(
+        &self,
+        _request: &Request,
+        inode: INodeNo,
+        handle: FileHandle,
+        _datasync: bool,
+        reply: ReplyEmpty,
+    ) {
+        let files = self.files.lock().unwrap();
+        match files.get(&handle.0).filter(|open| open.inode == inode.0) {
+            Some(OpenFile {
+                handle: OpenHandle::Draft(draft),
+                ..
+            }) => match draft.sync() {
+                Ok(()) => reply.ok(),
+                Err(_) => reply.error(Errno::EIO),
+            },
+            Some(_) => reply.ok(),
+            None => reply.error(Errno::EBADF),
         }
     }
 
@@ -306,7 +623,7 @@ mod tests {
                 .map_err(io::Error::other)
         });
         let tree = VirtualTree::from_items("drive", "root", [file_item()]).unwrap();
-        let fuse = ReadOnlyFuse::new(tree, cache_root, 10, loader);
+        let fuse = VirtualFuse::new(tree, cache_root, 10, loader);
         let entries = fuse.directory_entries(ROOT_INODE).unwrap();
         assert_eq!(
             entries
@@ -334,6 +651,115 @@ mod tests {
             Errno::ENETDOWN
         );
         assert_eq!(map_loader_error(io::Error::other("failed")), Errno::EIO);
+        assert_eq!(
+            map_draft_error(io::Error::from_raw_os_error(libc::ENOSPC)),
+            Errno::ENOSPC
+        );
+        assert_eq!(
+            map_draft_error(io::Error::from_raw_os_error(libc::EDQUOT)),
+            Errno::EDQUOT
+        );
+    }
+
+    #[test]
+    fn writable_open_keeps_durable_draft_separate_from_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_root = dir.path().join("cache");
+        let draft_root = dir.path().join("drafts");
+        let source = dir.path().join("source");
+        fs::write(&source, b"hello").unwrap();
+        let tree = VirtualTree::from_items("drive", "root", [file_item()]).unwrap();
+        let request = tree.request_for_item("file").unwrap();
+        CacheStore::open(&cache_root, 10)
+            .unwrap()
+            .put(&request.cache_key(), &source, 5)
+            .unwrap();
+        let fuse = VirtualFuse::new_writable(
+            tree,
+            cache_root,
+            draft_root.clone(),
+            10,
+            Arc::new(|_| Err(io::ErrorKind::NotConnected.into())),
+        );
+        let inode = fuse.tree.lookup(ROOT_INODE, "текст.txt").unwrap().inode;
+        let reader = fuse.open_file(inode, OpenFlags(libc::O_RDONLY)).unwrap();
+        let handle = fuse.open_file(inode, OpenFlags(libc::O_RDWR)).unwrap();
+        assert_eq!(fuse.write_file(inode, handle, 1, b"a").unwrap(), 1);
+        assert_eq!(fuse.read_file(inode, handle, 0, 5).unwrap(), b"hallo");
+        assert_eq!(fuse.read_file(inode, reader, 0, 5).unwrap(), b"hallo");
+        assert_eq!(
+            fuse.attr(fuse.tree.getattr(inode).unwrap()).unwrap().size,
+            5
+        );
+        drop(fuse);
+        assert_eq!(fs::read(source).unwrap(), b"hello");
+        let store = DraftStore::open(&draft_root).unwrap();
+        assert_eq!(store.list().unwrap().len(), 1);
+        let draft = store.recover_item("drive", "file").unwrap().unwrap();
+        let mut bytes = [0; 5];
+        draft.read_at(0, &mut bytes).unwrap();
+        assert_eq!(&bytes, b"hallo");
+    }
+
+    #[test]
+    fn writable_mount_persists_truncating_replacement() {
+        if std::env::var_os("ONEDRIVE_FUSE_SMOKE").is_none() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mountpoint = dir.path().join("mount");
+        let cache_root = dir.path().join("cache");
+        let draft_root = dir.path().join("drafts");
+        let source = dir.path().join("source");
+        fs::create_dir(&mountpoint).unwrap();
+        fs::write(&source, b"hello").unwrap();
+        let tree = VirtualTree::from_items("drive", "root", [file_item()]).unwrap();
+        let session = VirtualFuse::new_writable(
+            tree,
+            cache_root,
+            draft_root.clone(),
+            10,
+            Arc::new(|_| Err(io::ErrorKind::NotConnected.into())),
+        )
+        .mount(&mountpoint)
+        .unwrap();
+        fs::write(mountpoint.join("текст.txt"), b"saved locally").unwrap();
+        assert_eq!(
+            fs::read(mountpoint.join("текст.txt")).unwrap(),
+            b"saved locally"
+        );
+        session.umount_and_join().unwrap();
+        let draft = DraftStore::open(&draft_root)
+            .unwrap()
+            .recover_item("drive", "file")
+            .unwrap()
+            .unwrap();
+        assert_eq!(draft.len().unwrap(), 13);
+        assert_eq!(fs::read(source).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn truncation_can_start_offline_without_cached_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let draft_root = dir.path().join("drafts");
+        let tree = VirtualTree::from_items("drive", "root", [file_item()]).unwrap();
+        let fuse = VirtualFuse::new_writable(
+            tree,
+            dir.path().join("cache"),
+            draft_root.clone(),
+            10,
+            Arc::new(|_| Err(io::ErrorKind::NotConnected.into())),
+        );
+        let inode = fuse.tree.lookup(ROOT_INODE, "текст.txt").unwrap().inode;
+        let handle = fuse
+            .open_file(inode, OpenFlags(libc::O_WRONLY | libc::O_TRUNC))
+            .unwrap();
+        assert_eq!(fuse.write_file(inode, handle, 0, b"local").unwrap(), 5);
+        assert_eq!(fuse.read_file(inode, handle, 0, 5).unwrap(), b"local");
+        assert_eq!(
+            DraftStore::open(&draft_root).unwrap().list().unwrap().len(),
+            1
+        );
     }
 
     #[test]
@@ -373,7 +799,7 @@ mod tests {
                 .put(&request.cache_key(), &source, request.size)
                 .map_err(io::Error::other)
         });
-        let session = ReadOnlyFuse::new(tree, cache_root, 10, loader)
+        let session = VirtualFuse::new(tree, cache_root, 10, loader)
             .mount(&mountpoint)
             .unwrap();
         let mut entries = fs::read_dir(&mountpoint)

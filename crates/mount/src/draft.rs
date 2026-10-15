@@ -77,6 +77,30 @@ impl DraftStore {
         if let Some(existing) = self.recover(&identity)? {
             return Ok(existing);
         }
+        let input = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(source)?;
+        self.begin_from_file(identity, &input)
+    }
+
+    pub fn begin_from_file(&self, identity: DraftIdentity, input: &File) -> io::Result<DraftFile> {
+        self.begin_with_source(identity, Some(input))
+    }
+
+    pub fn begin_empty(&self, identity: DraftIdentity) -> io::Result<DraftFile> {
+        self.begin_with_source(identity, None)
+    }
+
+    fn begin_with_source(
+        &self,
+        identity: DraftIdentity,
+        input: Option<&File>,
+    ) -> io::Result<DraftFile> {
+        identity.validate()?;
+        if let Some(existing) = self.recover(&identity)? {
+            return Ok(existing);
+        }
         let (metadata_path, data_path) = self.paths(&identity);
         if fs::symlink_metadata(&data_path).is_ok() {
             return Err(io::Error::new(
@@ -84,18 +108,25 @@ impl DraftStore {
                 "orphan draft data",
             ));
         }
-        let mut input = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(source)?;
-        if !input.metadata()?.is_file() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "draft source is not a file",
-            ));
-        }
         let mut temporary = tempfile::NamedTempFile::new_in(&self.root)?;
-        io::copy(&mut input, &mut temporary)?;
+        if let Some(input) = input {
+            if !input.metadata()?.is_file() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "draft source is not a file",
+                ));
+            }
+            let mut position = 0;
+            let mut buffer = [0_u8; 64 * 1024];
+            loop {
+                let count = input.read_at(&mut buffer, position)?;
+                if count == 0 {
+                    break;
+                }
+                temporary.write_all(&buffer[..count])?;
+                position += count as u64;
+            }
+        }
         temporary.as_file().sync_all()?;
         temporary
             .persist_noclobber(&data_path)
@@ -144,6 +175,14 @@ impl DraftStore {
             identity: metadata,
             file,
         }))
+    }
+
+    pub fn recover_item(&self, drive_id: &str, item_id: &str) -> io::Result<Option<DraftFile>> {
+        self.recover(&DraftIdentity {
+            drive_id: drive_id.to_owned(),
+            item_id: item_id.to_owned(),
+            base_etag: "lookup".to_owned(),
+        })
     }
 
     pub fn list(&self) -> io::Result<Vec<DraftIdentity>> {
@@ -205,6 +244,15 @@ impl DraftFile {
 
     pub fn is_empty(&self) -> io::Result<bool> {
         Ok(self.len()? == 0)
+    }
+
+    pub fn set_len(&self, size: u64) -> io::Result<()> {
+        self.file.set_len(size)?;
+        self.file.sync_all()
+    }
+
+    pub fn sync(&self) -> io::Result<()> {
+        self.file.sync_all()
     }
 
     pub fn read_at(&self, offset: u64, buffer: &mut [u8]) -> io::Result<usize> {
