@@ -307,6 +307,131 @@ fn read_sync_root() -> Result<Option<PathBuf>, String> {
     validated_sync_root(&root)
 }
 
+fn read_virtual_mount_path() -> zbus::Result<String> {
+    daemon_call("VirtualMountPath")
+}
+
+fn mount_virtual_drive(path: &str) -> zbus::Result<String> {
+    let connection = zbus::blocking::Connection::session()?;
+    let proxy = zbus::blocking::Proxy::new(&connection, BUS_NAME, OBJECT_PATH, INTERFACE_NAME)?;
+    proxy.call("MountVirtualDrive", &(path))
+}
+
+fn unmount_virtual_drive() -> zbus::Result<()> {
+    daemon_call("UnmountVirtualDrive")
+}
+
+#[derive(Clone)]
+struct VirtualMountControls {
+    label: gtk::Label,
+    mount: gtk::Button,
+    unmount: gtk::Button,
+    busy: Rc<Cell<bool>>,
+}
+
+impl VirtualMountControls {
+    fn new(label: &gtk::Label, mount: &gtk::Button, unmount: &gtk::Button) -> Self {
+        Self {
+            label: label.clone(),
+            mount: mount.clone(),
+            unmount: unmount.clone(),
+            busy: Rc::new(Cell::new(false)),
+        }
+    }
+
+    fn show_path(&self, path: Option<&str>) {
+        match path {
+            Some("") => {
+                self.label.set_text("Виртуальный диск не подключён");
+                self.mount.set_sensitive(true);
+                self.unmount.set_sensitive(false);
+            }
+            Some(path) => {
+                self.label.set_text(&format!("Виртуальный диск: {path}"));
+                self.mount.set_sensitive(false);
+                self.unmount.set_sensitive(true);
+            }
+            None => {
+                self.label.set_text("Виртуальный диск: демон недоступен");
+                self.mount.set_sensitive(false);
+                self.unmount.set_sensitive(false);
+            }
+        }
+    }
+
+    fn refresh(&self) {
+        if self.busy.replace(true) {
+            return;
+        }
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(read_virtual_mount_path());
+        });
+        let controls = self.clone();
+        gtk::glib::timeout_add_local(Duration::from_millis(100), move || {
+            let result = match receiver.try_recv() {
+                Ok(result) => result,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    return gtk::glib::ControlFlow::Continue;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    controls.show_path(None);
+                    controls.busy.set(false);
+                    return gtk::glib::ControlFlow::Break;
+                }
+            };
+            controls.show_path(result.ok().as_deref());
+            controls.busy.set(false);
+            gtk::glib::ControlFlow::Break
+        });
+    }
+
+    fn run(&self, mount_path: Option<String>, status: &gtk::Label) {
+        if self.busy.replace(true) {
+            return;
+        }
+        self.mount.set_sensitive(false);
+        self.unmount.set_sensitive(false);
+        status.set_text(if mount_path.is_some() {
+            "Подключение виртуального диска…"
+        } else {
+            "Отключение виртуального диска…"
+        });
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = match mount_path {
+                Some(path) => mount_virtual_drive(&path).map(|_| "Виртуальный диск подключён"),
+                None => unmount_virtual_drive().map(|()| "Виртуальный диск отключён"),
+            };
+            let path = read_virtual_mount_path();
+            let _ = sender.send((result, path));
+        });
+        let controls = self.clone();
+        let status = status.clone();
+        gtk::glib::timeout_add_local(Duration::from_millis(100), move || {
+            let result = match receiver.try_recv() {
+                Ok(result) => result,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    return gtk::glib::ControlFlow::Continue;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    controls.show_path(None);
+                    status.set_text("Не удалось выполнить операцию с виртуальным диском");
+                    controls.busy.set(false);
+                    return gtk::glib::ControlFlow::Break;
+                }
+            };
+            controls.show_path(result.1.ok().as_deref());
+            match result.0 {
+                Ok(message) => status.set_text(message),
+                Err(error) => status.set_text(&format!("Виртуальный диск: {error}")),
+            }
+            controls.busy.set(false);
+            gtk::glib::ControlFlow::Break
+        });
+    }
+}
+
 fn read_sync_preview() -> Result<UiPreview, String> {
     let json: String = daemon_call("PreviewSync").map_err(|error| error.to_string())?;
     serde_json::from_str(&json).map_err(|error| error.to_string())
@@ -804,6 +929,15 @@ fn main() {
         let preview_sync = gtk::Button::with_label("План синхронизации");
         let review = gtk::Button::with_label("Рассмотреть изменения");
         let history = gtk::Button::with_label("Очередь и история");
+        let mount = gtk::Button::with_label("Подключить виртуальный диск");
+        let unmount = gtk::Button::with_label("Отключить виртуальный диск");
+        mount.set_sensitive(false);
+        unmount.set_sensitive(false);
+        let mount_label = gtk::Label::new(Some("Виртуальный диск: проверка состояния…"));
+        mount_label.set_xalign(0.0);
+        mount_label.set_wrap(true);
+        mount_label.set_selectable(true);
+        let mount_controls = VirtualMountControls::new(&mount_label, &mount, &unmount);
         let exit = gtk::Button::with_label("Выход");
         let controls = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         controls.append(&login);
@@ -821,6 +955,12 @@ fn main() {
         sync_actions.append(&pause);
         sync_controls.append(&sync_setup);
         sync_controls.append(&sync_actions);
+        let virtual_controls = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        virtual_controls.append(&mount_label);
+        let virtual_actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        virtual_actions.append(&mount);
+        virtual_actions.append(&unmount);
+        virtual_controls.append(&virtual_actions);
         let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
         content.set_margin_start(18);
         content.set_margin_end(18);
@@ -830,6 +970,7 @@ fn main() {
         content.append(&status);
         content.append(&controls);
         content.append(&sync_controls);
+        content.append(&virtual_controls);
         content.append(&scroll);
         let window = adw::ApplicationWindow::builder()
             .application(app)
@@ -912,6 +1053,32 @@ fn main() {
                     }
                 },
             );
+        });
+        let window_for_mount = window.clone();
+        let status_for_mount = status.clone();
+        let controls_for_mount = mount_controls.clone();
+        mount.connect_clicked(move |_| {
+            let dialog = gtk::FileDialog::new();
+            dialog.set_title("Выберите пустую папку для виртуального диска");
+            let status = status_for_mount.clone();
+            let controls = controls_for_mount.clone();
+            dialog.select_folder(
+                Some(&window_for_mount),
+                None::<&gio::Cancellable>,
+                move |result| {
+                    let Ok(folder) = result else { return };
+                    let Some(path) = folder.path() else {
+                        status.set_text("Выберите локальную папку для виртуального диска");
+                        return;
+                    };
+                    controls.run(Some(path.to_string_lossy().into_owned()), &status);
+                },
+            );
+        });
+        let status_for_unmount = status.clone();
+        let controls_for_unmount = mount_controls.clone();
+        unmount.connect_clicked(move |_| {
+            controls_for_unmount.run(None, &status_for_unmount);
         });
         let window_for_preview = window.clone();
         let status_for_preview = status.clone();
@@ -1141,6 +1308,11 @@ fn main() {
         });
         app.add_action(&quit_action);
         refresh_view(&monitor, &status, &list, &pause);
+        mount_controls.refresh();
+        gtk::glib::timeout_add_local(Duration::from_secs(10), move || {
+            mount_controls.refresh();
+            gtk::glib::ControlFlow::Continue
+        });
         monitor.start();
         window.present();
     });
