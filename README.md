@@ -249,3 +249,8 @@ OneDrive. Каталоги с конфликтом имени или регис�
 права прямого монтирования также нужен `fusermount3` из пакета `fuse3`.
 `fuser` собирается без `fuse3-devel`. AppImage также требует отдельного
 инструмента упаковки и проверки на целевых системах.
+На Linux-хосте с доступным FUSE можно проверить путь чтения без аккаунта:
+
+```sh
+ONEDRIVE_FUSE_SMOKE=1 cargo test -p onedrive-mount mounted_tree_reads_cached_file_without_network
+```
