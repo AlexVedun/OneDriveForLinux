@@ -1617,6 +1617,7 @@ version = "0.1.0"
 name = "onedrive-daemon"
 version = "0.1.0"
 dependencies = [
+ "fuser",
  "keyring",
  "libc",
  "oauth2",
