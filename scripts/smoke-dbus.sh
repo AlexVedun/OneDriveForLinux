@@ -45,6 +45,20 @@ test "$items" = "('[]',)"
 gdbus introspect --session \
     --dest io.github.onedrive_linux.Daemon \
     --object-path /io/github/onedrive_linux/Daemon | grep -q PrepareVirtualFile
+gdbus introspect --session \
+    --dest io.github.onedrive_linux.Daemon \
+    --object-path /io/github/onedrive_linux/Daemon | grep -q MountVirtualDrive
+mount_path=$(gdbus call --session \
+    --dest io.github.onedrive_linux.Daemon \
+    --object-path /io/github/onedrive_linux/Daemon \
+    --method io.github.onedrive_linux.Daemon.VirtualMountPath)
+test "$mount_path" = "('',)"
+if gdbus call --session \
+    --dest io.github.onedrive_linux.Daemon \
+    --object-path /io/github/onedrive_linux/Daemon \
+    --method io.github.onedrive_linux.Daemon.MountVirtualDrive relative >/dev/null 2>&1; then
+    exit 1
+fi
 if gdbus call --session \
     --dest io.github.onedrive_linux.Daemon \
     --object-path /io/github/onedrive_linux/Daemon \

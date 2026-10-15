@@ -13,6 +13,7 @@ use onedrive_cache::{CacheError, CacheStore};
 use onedrive_catalog::{Catalog, CatalogItem, FetchError};
 use onedrive_core::{BUS_NAME, EngineState, OBJECT_PATH};
 use onedrive_mount::{DownloadRequest, VirtualTree};
+use onedrive_mount::{fuse::ReadOnlyFuse, preflight};
 use onedrive_sync::{
     Action, Baseline, QueuedOperation, SyncStore,
     folders::local_directory_exists,
@@ -23,6 +24,7 @@ use onedrive_sync::{
     upload::{UploadError, UploadStep, upload_queued},
 };
 use std::fs::{self, OpenOptions};
+use std::io;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
 use std::sync::{
@@ -32,6 +34,7 @@ use std::sync::{
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
+    signal::unix::{SignalKind, signal},
     time::{Duration, timeout},
 };
 use zbus::connection::Builder;
@@ -40,9 +43,9 @@ const KEYRING_SERVICE: &str = "io.github.onedrive_linux";
 const KEYRING_USER: &str = "personal";
 const VIRTUAL_CACHE_BYTES: u64 = 1024 * 1024 * 1024;
 
-struct DownloadGuard(Arc<AtomicBool>);
+struct BusyFlagGuard(Arc<AtomicBool>);
 
-impl Drop for DownloadGuard {
+impl Drop for BusyFlagGuard {
     fn drop(&mut self) {
         self.0.store(false, Ordering::SeqCst);
     }
@@ -94,15 +97,219 @@ struct Daemon {
     download_in_progress: Arc<AtomicBool>,
     upload_in_progress: Arc<AtomicBool>,
     local_change_epoch: Arc<AtomicU64>,
+    virtual_mount: Arc<Mutex<Option<MountedVirtualDrive>>>,
+    mount_in_progress: Arc<AtomicBool>,
+}
+
+struct MountedVirtualDrive {
+    path: PathBuf,
+    session: fuser::BackgroundSession,
+}
+
+#[derive(Clone)]
+struct VirtualDownloadContext {
+    state: Arc<Mutex<EngineState>>,
+    catalog: Arc<Mutex<Catalog>>,
+    download_in_progress: Arc<AtomicBool>,
+    upload_in_progress: Arc<AtomicBool>,
+}
+
+impl From<&Daemon> for VirtualDownloadContext {
+    fn from(daemon: &Daemon) -> Self {
+        Self {
+            state: Arc::clone(&daemon.state),
+            catalog: Arc::clone(&daemon.catalog),
+            download_in_progress: Arc::clone(&daemon.download_in_progress),
+            upload_in_progress: Arc::clone(&daemon.upload_in_progress),
+        }
+    }
+}
+
+async fn prepare_virtual_request(
+    context: &VirtualDownloadContext,
+    request: DownloadRequest,
+) -> zbus::fdo::Result<String> {
+    if context.upload_in_progress.load(Ordering::SeqCst) {
+        return Err(zbus::fdo::Error::Failed("upload is running".to_owned()));
+    }
+    let current = {
+        let catalog = context.catalog.lock().unwrap();
+        let (_, tree) = VirtualTree::from_catalog(&catalog)
+            .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
+        tree.request_for_item(&request.item_id)
+            .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?
+    };
+    if current != request {
+        return Err(zbus::fdo::Error::Failed(
+            "virtual file version changed".to_owned(),
+        ));
+    }
+    if request.size > VIRTUAL_CACHE_BYTES {
+        return Err(zbus::fdo::Error::Failed(
+            "file exceeds virtual cache limit".to_owned(),
+        ));
+    }
+    if context
+        .download_in_progress
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return Err(zbus::fdo::Error::Failed(
+            "download is already running".to_owned(),
+        ));
+    }
+    let _guard = BusyFlagGuard(Arc::clone(&context.download_in_progress));
+    let state_root = state_directory()
+        .map_err(|_| zbus::fdo::Error::Failed("cannot access state directory".to_owned()))?;
+    let cache_root = state_root.join("virtual-cache");
+    let key = request.cache_key();
+    let expected_size = request.size;
+    let cache_root_for_check = cache_root.clone();
+    let already_cached = tokio::task::spawn_blocking(move || {
+        let mut cache = CacheStore::open(&cache_root_for_check, VIRTUAL_CACHE_BYTES)?;
+        match cache.get(&key)? {
+            Some(file) => Ok::<_, CacheError>(file.metadata()?.len() == expected_size),
+            None => Ok(false),
+        }
+    })
+    .await
+    .map_err(|_| zbus::fdo::Error::Failed("cache check failed".to_owned()))?
+    .map_err(|_| zbus::fdo::Error::Failed("cannot read virtual cache".to_owned()))?;
+    if already_cached {
+        return Ok("cached".to_owned());
+    }
+    let client_id = client_id().ok_or_else(|| {
+        zbus::fdo::Error::Failed("ONEDRIVE_CLIENT_ID is not configured".to_owned())
+    })?;
+    let token = access_token(&client_id)
+        .await
+        .map_err(|_| zbus::fdo::Error::Failed("sign-in is required".to_owned()))?;
+    let staging = tempfile::tempdir_in(&state_root)
+        .map_err(|_| zbus::fdo::Error::Failed("cannot stage virtual file".to_owned()))?;
+    let target = staging.path().join("content");
+    let graph = GraphClient::new()
+        .map_err(|_| zbus::fdo::Error::Failed("cannot create Graph client".to_owned()))?;
+    let mut transfer_state = TransferStateGuard::start(&context.state);
+    graph
+        .download_cache_item(&request, &token, &target)
+        .await
+        .map_err(|_| {
+            zbus::fdo::Error::Failed("virtual file changed or download failed".to_owned())
+        })?;
+    let cache_root_for_put = cache_root;
+    let stored = tokio::task::spawn_blocking(move || {
+        publish_virtual_file(&cache_root_for_put, &request, &target)
+    })
+    .await
+    .map_err(|_| zbus::fdo::Error::Failed("cache write failed".to_owned()))?
+    .map_err(|_| zbus::fdo::Error::Failed("cannot publish virtual file".to_owned()));
+    stored?;
+    transfer_state.finish();
+    Ok("downloaded".to_owned())
 }
 
 #[zbus::interface(name = "io.github.onedrive_linux.Daemon")]
 impl Daemon {
+    fn virtual_mount_path(&self) -> String {
+        self.virtual_mount
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|mount| mount.path.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    }
+
+    async fn mount_virtual_drive(&self, mount_path: &str) -> zbus::fdo::Result<String> {
+        let mount_path = PathBuf::from(mount_path);
+        if !mount_path.is_absolute() {
+            return Err(zbus::fdo::Error::InvalidArgs(
+                "mount point must be absolute".to_owned(),
+            ));
+        }
+        if self
+            .mount_in_progress
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Err(zbus::fdo::Error::Failed(
+                "mount operation is running".to_owned(),
+            ));
+        }
+        let _guard = BusyFlagGuard(Arc::clone(&self.mount_in_progress));
+        if self.virtual_mount.lock().unwrap().is_some() {
+            return Err(zbus::fdo::Error::Failed(
+                "virtual drive is already mounted".to_owned(),
+            ));
+        }
+        let sync_root = self
+            .sync
+            .lock()
+            .unwrap()
+            .root()
+            .map_err(|_| zbus::fdo::Error::Failed("cannot read sync root".to_owned()))?;
+        let state_root = state_directory()
+            .map_err(|_| zbus::fdo::Error::Failed("cannot access state directory".to_owned()))?;
+        let cache_root = state_root.join("virtual-cache");
+        let mount_path =
+            preflight::validate_mount_paths(&mount_path, sync_root.as_deref(), &cache_root)
+                .map_err(|error| zbus::fdo::Error::InvalidArgs(error.to_string()))?;
+        preflight::check_fuse_device()
+            .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
+        let tree = {
+            let catalog = self.catalog.lock().unwrap();
+            VirtualTree::from_catalog(&catalog)
+                .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?
+                .1
+        };
+        let context = VirtualDownloadContext::from(self);
+        let runtime = tokio::runtime::Handle::current();
+        let loader = Arc::new(move |request: &DownloadRequest| -> io::Result<()> {
+            let expected = request.clone();
+            runtime
+                .block_on(prepare_virtual_request(&context, expected))
+                .map(|_| ())
+                .map_err(io::Error::other)
+        });
+        let fuse = ReadOnlyFuse::new(tree, cache_root, VIRTUAL_CACHE_BYTES, loader);
+        let path_for_mount = mount_path.clone();
+        let session = tokio::task::spawn_blocking(move || fuse.mount(&path_for_mount))
+            .await
+            .map_err(|_| zbus::fdo::Error::Failed("FUSE mount task failed".to_owned()))?
+            .map_err(|error| {
+                zbus::fdo::Error::Failed(format!("cannot mount virtual drive: {error}"))
+            })?;
+        *self.virtual_mount.lock().unwrap() = Some(MountedVirtualDrive {
+            path: mount_path.clone(),
+            session,
+        });
+        Ok(mount_path.to_string_lossy().into_owned())
+    }
+
+    async fn unmount_virtual_drive(&self) -> zbus::fdo::Result<()> {
+        if self
+            .mount_in_progress
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Err(zbus::fdo::Error::Failed(
+                "mount operation is running".to_owned(),
+            ));
+        }
+        let _guard = BusyFlagGuard(Arc::clone(&self.mount_in_progress));
+        let mounted =
+            self.virtual_mount.lock().unwrap().take().ok_or_else(|| {
+                zbus::fdo::Error::Failed("virtual drive is not mounted".to_owned())
+            })?;
+        tokio::task::spawn_blocking(move || mounted.session.umount_and_join())
+            .await
+            .map_err(|_| zbus::fdo::Error::Failed("FUSE unmount task failed".to_owned()))?
+            .map_err(|error| {
+                zbus::fdo::Error::Failed(format!("cannot unmount virtual drive: {error}"))
+            })
+    }
+
     /// Fetch a file into the virtual-drive cache on demand. Returns "cached" or "downloaded".
     async fn prepare_virtual_file(&self, item_id: &str) -> zbus::fdo::Result<String> {
-        if self.upload_in_progress.load(Ordering::SeqCst) {
-            return Err(zbus::fdo::Error::Failed("upload is running".to_owned()));
-        }
         let request = {
             let catalog = self.catalog.lock().unwrap();
             let (_, tree) = VirtualTree::from_catalog(&catalog)
@@ -110,68 +317,8 @@ impl Daemon {
             tree.request_for_item(item_id)
                 .map_err(|error| zbus::fdo::Error::InvalidArgs(error.to_string()))?
         };
-        if request.size > VIRTUAL_CACHE_BYTES {
-            return Err(zbus::fdo::Error::Failed(
-                "file exceeds virtual cache limit".to_owned(),
-            ));
-        }
-        if self
-            .download_in_progress
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
-            return Err(zbus::fdo::Error::Failed(
-                "download is already running".to_owned(),
-            ));
-        }
-        let _guard = DownloadGuard(Arc::clone(&self.download_in_progress));
-        let state_root = state_directory()
-            .map_err(|_| zbus::fdo::Error::Failed("cannot access state directory".to_owned()))?;
-        let cache_root = state_root.join("virtual-cache");
-        let key = request.cache_key();
-        let expected_size = request.size;
-        let cache_root_for_check = cache_root.clone();
-        let already_cached = tokio::task::spawn_blocking(move || {
-            let mut cache = CacheStore::open(&cache_root_for_check, VIRTUAL_CACHE_BYTES)?;
-            match cache.get(&key)? {
-                Some(file) => Ok::<_, CacheError>(file.metadata()?.len() == expected_size),
-                None => Ok(false),
-            }
-        })
-        .await
-        .map_err(|_| zbus::fdo::Error::Failed("cache check failed".to_owned()))?
-        .map_err(|_| zbus::fdo::Error::Failed("cannot read virtual cache".to_owned()))?;
-        if already_cached {
-            return Ok("cached".to_owned());
-        }
-        let client_id = client_id().ok_or_else(|| {
-            zbus::fdo::Error::Failed("ONEDRIVE_CLIENT_ID is not configured".to_owned())
-        })?;
-        let token = access_token(&client_id)
-            .await
-            .map_err(|_| zbus::fdo::Error::Failed("sign-in is required".to_owned()))?;
-        let staging = tempfile::tempdir_in(&state_root)
-            .map_err(|_| zbus::fdo::Error::Failed("cannot stage virtual file".to_owned()))?;
-        let target = staging.path().join("content");
-        let graph = GraphClient::new()
-            .map_err(|_| zbus::fdo::Error::Failed("cannot create Graph client".to_owned()))?;
-        let mut transfer_state = TransferStateGuard::start(&self.state);
-        graph
-            .download_cache_item(&request, &token, &target)
-            .await
-            .map_err(|_| {
-                zbus::fdo::Error::Failed("virtual file changed or download failed".to_owned())
-            })?;
-        let cache_root_for_put = cache_root;
-        let stored = tokio::task::spawn_blocking(move || {
-            publish_virtual_file(&cache_root_for_put, &request, &target)
-        })
-        .await
-        .map_err(|_| zbus::fdo::Error::Failed("cache write failed".to_owned()))?
-        .map_err(|_| zbus::fdo::Error::Failed("cannot publish virtual file".to_owned()));
-        stored?;
-        transfer_state.finish();
-        Ok("downloaded".to_owned())
+        let context = VirtualDownloadContext::from(self);
+        prepare_virtual_request(&context, request).await
     }
 
     fn status(&self) -> String {
@@ -2353,6 +2500,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let download_in_progress = Arc::new(AtomicBool::new(false));
     let upload_in_progress = Arc::new(AtomicBool::new(false));
     let local_change_epoch = Arc::new(AtomicU64::new(0));
+    let virtual_mount = Arc::new(Mutex::new(None::<MountedVirtualDrive>));
     watch_local_root(Arc::clone(&sync), Arc::clone(&local_change_epoch));
     let daemon = Daemon {
         state: Arc::clone(&state),
@@ -2363,6 +2511,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         download_in_progress: Arc::clone(&download_in_progress),
         upload_in_progress: Arc::clone(&upload_in_progress),
         local_change_epoch,
+        virtual_mount: Arc::clone(&virtual_mount),
+        mount_in_progress: Arc::new(AtomicBool::new(false)),
     };
     let _connection = Builder::session()?
         .name(BUS_NAME)?
@@ -2381,20 +2531,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ));
     }
     eprintln!("onedrive-daemon listening on {BUS_NAME}");
-    tokio::signal::ctrl_c().await?;
+    let mut terminate = signal(SignalKind::terminate())?;
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => result?,
+        _ = terminate.recv() => {},
+    }
+    let mounted = virtual_mount.lock().unwrap().take();
+    if let Some(mounted) = mounted {
+        tokio::task::spawn_blocking(move || mounted.session.umount_and_join()).await??;
+    }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        Baseline, CatalogItem, QueuedOperation, VIRTUAL_CACHE_BYTES, client_id_from_dotenv,
-        client_id_from_sources, local_delete_candidate, publish_virtual_file,
-        remote_delete_candidate, remote_folder_candidate, remote_rename_candidate,
+        Baseline, CatalogItem, QueuedOperation, VIRTUAL_CACHE_BYTES, VirtualDownloadContext,
+        client_id_from_dotenv, client_id_from_sources, local_delete_candidate,
+        prepare_virtual_request, publish_virtual_file, remote_delete_candidate,
+        remote_folder_candidate, remote_rename_candidate,
     };
     use onedrive_cache::{CacheError, CacheStore};
+    use onedrive_catalog::{Catalog, DeltaPage};
+    use onedrive_core::EngineState;
     use onedrive_mount::DownloadRequest;
     use std::fs;
+    use std::sync::{Arc, Mutex, atomic::AtomicBool};
 
     #[test]
     fn queued_folder_is_rechecked_before_graph_write() {
@@ -2740,5 +2902,35 @@ mod tests {
         let mut cache = CacheStore::open(&cache_root, VIRTUAL_CACHE_BYTES).unwrap();
         assert!(cache.get(&request.cache_key()).unwrap().is_some());
         assert!(cache.get(&changed.cache_key()).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn virtual_loader_rejects_stale_snapshot_before_network() {
+        let mut catalog = Catalog::in_memory().unwrap();
+        catalog.set_active_drive_id("drive").unwrap();
+        catalog.set_root_id("drive", "root").unwrap();
+        let page: DeltaPage = serde_json::from_str(
+            r#"{"value":[{"id":"file","parentReference":{"id":"root"},"name":"name","file":{},"size":5,"eTag":"v2"}],"@odata.deltaLink":"https://graph.microsoft.com/v1.0/me/drive/root/delta?token=done"}"#,
+        ).unwrap();
+        catalog.apply_page("drive", &page).unwrap();
+        let context = VirtualDownloadContext {
+            state: Arc::new(Mutex::new(EngineState::Connected)),
+            catalog: Arc::new(Mutex::new(catalog)),
+            download_in_progress: Arc::new(AtomicBool::new(false)),
+            upload_in_progress: Arc::new(AtomicBool::new(false)),
+        };
+        let stale = DownloadRequest {
+            drive_id: "drive".into(),
+            item_id: "file".into(),
+            etag: "v1".into(),
+            size: 5,
+        };
+        assert!(prepare_virtual_request(&context, stale).await.is_err());
+        assert_eq!(*context.state.lock().unwrap(), EngineState::Connected);
+        assert!(
+            !context
+                .download_in_progress
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
     }
 }
