@@ -63,6 +63,10 @@ pub struct FileHandle {
 }
 
 impl FileHandle {
+    pub fn source_file(&self) -> &File {
+        &self.file
+    }
+
     pub fn read(&self, offset: u64, size: u32) -> io::Result<Vec<u8>> {
         if size > MAX_READ_BYTES {
             return Err(io::Error::new(
@@ -166,6 +170,10 @@ pub struct VirtualTree {
 }
 
 impl VirtualTree {
+    pub fn drive_id(&self) -> &str {
+        &self.drive_id
+    }
+
     pub fn request_for_item(&self, item_id: &str) -> Result<DownloadRequest, OpenError> {
         let inode = if self.nodes[&ROOT_INODE].item_id == item_id {
             ROOT_INODE

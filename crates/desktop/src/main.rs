@@ -319,6 +319,10 @@ fn read_virtual_fuse_diagnostics() -> zbus::Result<(String, bool)> {
     daemon_call("VirtualFuseDiagnostics")
 }
 
+fn read_virtual_draft_count() -> zbus::Result<u64> {
+    daemon_call("VirtualDraftCount")
+}
+
 fn fuse_diagnostics_label(device: &str, helper: bool) -> &'static str {
     match (device, helper) {
         ("device-missing", _) => {
@@ -643,6 +647,7 @@ impl OfflineControls {
 struct VirtualMountControls {
     label: gtk::Label,
     diagnostics: gtk::Label,
+    drafts: gtk::Label,
     mount: gtk::Button,
     unmount: gtk::Button,
     busy: Rc<Cell<bool>>,
@@ -652,12 +657,14 @@ impl VirtualMountControls {
     fn new(
         label: &gtk::Label,
         diagnostics: &gtk::Label,
+        drafts: &gtk::Label,
         mount: &gtk::Button,
         unmount: &gtk::Button,
     ) -> Self {
         Self {
             label: label.clone(),
             diagnostics: diagnostics.clone(),
+            drafts: drafts.clone(),
             mount: mount.clone(),
             unmount: unmount.clone(),
             busy: Rc::new(Cell::new(false)),
@@ -678,6 +685,18 @@ impl VirtualMountControls {
                     .set_text("FUSE: диагностика демона недоступна");
                 self.mount.set_sensitive(false);
             }
+        }
+    }
+
+    fn show_drafts(&self, result: zbus::Result<u64>) {
+        match result {
+            Ok(0) => self.drafts.set_text("Локальных изменений для отправки нет"),
+            Ok(count) => self.drafts.set_text(&format!(
+                "Локально сохранено: {count}. Отправка в OneDrive ещё не включена."
+            )),
+            Err(_) => self
+                .drafts
+                .set_text("Не удалось проверить локальные изменения"),
         }
     }
 
@@ -712,7 +731,11 @@ impl VirtualMountControls {
         }
         let (sender, receiver) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let _ = sender.send((virtual_mount_paths(), read_virtual_fuse_diagnostics()));
+            let _ = sender.send((
+                virtual_mount_paths(),
+                read_virtual_fuse_diagnostics(),
+                read_virtual_draft_count(),
+            ));
         });
         let controls = self.clone();
         gtk::glib::timeout_add_local(Duration::from_millis(100), move || {
@@ -735,6 +758,7 @@ impl VirtualMountControls {
                     .map(|(current, recovery)| (current.as_str(), recovery.as_str())),
             );
             controls.show_diagnostics(result.1);
+            controls.show_drafts(result.2);
             controls.busy.set(false);
             gtk::glib::ControlFlow::Break
         });
@@ -759,7 +783,8 @@ impl VirtualMountControls {
             };
             let path = virtual_mount_paths();
             let diagnostics = read_virtual_fuse_diagnostics();
-            let _ = sender.send((result, path, diagnostics));
+            let drafts = read_virtual_draft_count();
+            let _ = sender.send((result, path, diagnostics, drafts));
         });
         let controls = self.clone();
         let status = status.clone();
@@ -784,6 +809,7 @@ impl VirtualMountControls {
                     .map(|(current, recovery)| (current.as_str(), recovery.as_str())),
             );
             controls.show_diagnostics(result.2);
+            controls.show_drafts(result.3);
             match result.0 {
                 Ok(message) => status.set_text(message),
                 Err(error) => status.set_text(&format!("Виртуальный диск: {error}")),
@@ -1302,7 +1328,11 @@ fn main() {
         let fuse_label = gtk::Label::new(Some("FUSE: проверка состояния…"));
         fuse_label.set_xalign(0.0);
         fuse_label.set_wrap(true);
-        let mount_controls = VirtualMountControls::new(&mount_label, &fuse_label, &mount, &unmount);
+        let drafts_label = gtk::Label::new(Some("Локальные изменения: проверка состояния…"));
+        drafts_label.set_xalign(0.0);
+        drafts_label.set_wrap(true);
+        let mount_controls =
+            VirtualMountControls::new(&mount_label, &fuse_label, &drafts_label, &mount, &unmount);
         let offline_label = gtk::Label::new(Some("Выберите файл для доступа офлайн"));
         offline_label.set_xalign(0.0);
         offline_label.set_wrap(true);
@@ -1341,6 +1371,7 @@ fn main() {
         let virtual_controls = gtk::Box::new(gtk::Orientation::Vertical, 6);
         virtual_controls.append(&mount_label);
         virtual_controls.append(&fuse_label);
+        virtual_controls.append(&drafts_label);
         let virtual_actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         virtual_actions.append(&mount);
         virtual_actions.append(&unmount);

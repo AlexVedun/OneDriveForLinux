@@ -82,6 +82,11 @@ recovery_path=$(gdbus call --session \
     --object-path /io/github/onedrive_linux/Daemon \
     --method io.github.onedrive_linux.Daemon.VirtualMountRecoveryPath)
 test "$recovery_path" = "('',)"
+draft_count=$(gdbus call --session \
+    --dest io.github.onedrive_linux.Daemon \
+    --object-path /io/github/onedrive_linux/Daemon \
+    --method io.github.onedrive_linux.Daemon.VirtualDraftCount)
+test "$draft_count" = "(uint64 0,)"
 fuse_diagnostics=$(gdbus call --session \
     --dest io.github.onedrive_linux.Daemon \
     --object-path /io/github/onedrive_linux/Daemon \
