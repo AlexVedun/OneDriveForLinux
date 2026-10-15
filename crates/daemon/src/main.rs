@@ -42,6 +42,8 @@ use zbus::connection::Builder;
 const KEYRING_SERVICE: &str = "io.github.onedrive_linux";
 const KEYRING_USER: &str = "personal";
 const VIRTUAL_CACHE_BYTES: u64 = 1024 * 1024 * 1024;
+const MIN_VIRTUAL_CACHE_BYTES: u64 = VIRTUAL_CACHE_BYTES / 4;
+const MAX_VIRTUAL_CACHE_BYTES: u64 = VIRTUAL_CACHE_BYTES * 64;
 
 struct BusyFlagGuard(Arc<AtomicBool>);
 
@@ -377,6 +379,40 @@ impl Daemon {
         .map_err(|_| zbus::fdo::Error::Failed("cache pin task failed".to_owned()))?
         .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
         Ok(if pinned { "pinned" } else { "cached" }.to_owned())
+    }
+
+    /// Current cache use and persistent limit, in bytes.
+    async fn virtual_cache_stats(&self) -> zbus::fdo::Result<(u64, u64)> {
+        let root = state_directory()
+            .map_err(|_| zbus::fdo::Error::Failed("cannot access state directory".to_owned()))?
+            .join("virtual-cache");
+        tokio::task::spawn_blocking(move || {
+            let cache = CacheStore::open(&root, VIRTUAL_CACHE_BYTES)?;
+            Ok::<_, CacheError>((cache.usage_bytes()?, cache.limit_bytes()))
+        })
+        .await
+        .map_err(|_| zbus::fdo::Error::Failed("cache stats task failed".to_owned()))?
+        .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))
+    }
+
+    /// Apply a new limit immediately; pinned files can never be evicted to satisfy it.
+    async fn set_virtual_cache_limit(&self, bytes: u64) -> zbus::fdo::Result<(u64, u64)> {
+        if !(MIN_VIRTUAL_CACHE_BYTES..=MAX_VIRTUAL_CACHE_BYTES).contains(&bytes) {
+            return Err(zbus::fdo::Error::InvalidArgs(
+                "cache limit must be between 256 MiB and 64 GiB".to_owned(),
+            ));
+        }
+        let root = state_directory()
+            .map_err(|_| zbus::fdo::Error::Failed("cannot access state directory".to_owned()))?
+            .join("virtual-cache");
+        tokio::task::spawn_blocking(move || {
+            let mut cache = CacheStore::open(&root, VIRTUAL_CACHE_BYTES)?;
+            cache.set_limit(bytes)?;
+            Ok::<_, CacheError>((cache.usage_bytes()?, cache.limit_bytes()))
+        })
+        .await
+        .map_err(|_| zbus::fdo::Error::Failed("cache limit task failed".to_owned()))?
+        .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))
     }
 
     fn status(&self) -> String {

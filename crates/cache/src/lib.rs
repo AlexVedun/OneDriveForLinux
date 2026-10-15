@@ -153,17 +153,35 @@ impl CacheStore {
                 singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
                 seq INTEGER NOT NULL
             );
-            INSERT OR IGNORE INTO clock(singleton, seq) VALUES (1, 0);",
+            INSERT OR IGNORE INTO clock(singleton, seq) VALUES (1, 0);
+            CREATE TABLE IF NOT EXISTS cache_config (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                limit_bytes INTEGER NOT NULL CHECK (limit_bytes >= 0)
+            );",
         )?;
+        let saved_limit: Option<i64> = connection
+            .query_row(
+                "SELECT limit_bytes FROM cache_config WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let effective_limit = saved_limit.map_or(Ok(max_bytes), |saved| {
+            u64::try_from(saved).map_err(|_| CacheError::LimitExceeded)
+        })?;
         let mut store = Self {
             connection,
             objects,
-            max_bytes,
+            max_bytes: effective_limit,
             _lock: lock,
         };
         store.reconcile_orphans()?;
-        store.set_limit(max_bytes)?;
+        store.set_limit(effective_limit)?;
         Ok(store)
+    }
+
+    pub fn limit_bytes(&self) -> u64 {
+        self.max_bytes
     }
 
     pub fn usage_bytes(&self) -> Result<u64, CacheError> {
@@ -335,6 +353,7 @@ impl CacheStore {
     }
 
     pub fn set_limit(&mut self, max_bytes: u64) -> Result<(), CacheError> {
+        let stored_limit = i64::try_from(max_bytes).map_err(|_| CacheError::LimitExceeded)?;
         let pinned: i64 = self.connection.query_row(
             "SELECT COALESCE(SUM(size), 0) FROM entry WHERE pinned = 1",
             [],
@@ -343,8 +362,18 @@ impl CacheStore {
         if pinned as u64 > max_bytes {
             return Err(CacheError::LimitExceeded);
         }
+        let previous_limit = self.max_bytes;
         self.max_bytes = max_bytes;
-        self.evict_to_limit()
+        if let Err(error) = self.evict_to_limit() {
+            self.max_bytes = previous_limit;
+            return Err(error);
+        }
+        self.connection.execute(
+            "INSERT INTO cache_config(singleton, limit_bytes) VALUES (1, ?1)
+             ON CONFLICT(singleton) DO UPDATE SET limit_bytes = excluded.limit_bytes",
+            [stored_limit],
+        )?;
+        Ok(())
     }
 
     fn evict_to_limit(&mut self) -> Result<(), CacheError> {
@@ -434,10 +463,41 @@ mod tests {
             fs::write(&orphan, b"orphan").unwrap();
             assert!(CacheStore::open(&root, 5).is_err());
         }
-        assert!(CacheStore::open(&root, 4).is_err());
-        let mut reopened = CacheStore::open(&root, 5).unwrap();
+        let mut reopened = CacheStore::open(&root, 4).unwrap();
+        assert_eq!(reopened.limit_bytes(), 10);
+        assert!(reopened.set_limit(4).is_err());
         assert_eq!(content(reopened.get(&updated).unwrap().unwrap()), "world");
         assert_eq!(fs::read_dir(root.join("objects")).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn configured_limit_survives_restart_and_never_evicts_pinned_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("cache");
+        let source = directory.path().join("source");
+        let mut cache = CacheStore::open(&root, 10).unwrap();
+        fs::write(&source, b"one").unwrap();
+        cache.put(&key("one", "v1"), &source, 3).unwrap();
+        cache.set_pinned(&key("one", "v1"), true).unwrap();
+        fs::write(&source, b"two").unwrap();
+        cache.put(&key("two", "v1"), &source, 3).unwrap();
+        cache.set_limit(4).unwrap();
+        assert_eq!(cache.limit_bytes(), 4);
+        assert_eq!(cache.usage_bytes().unwrap(), 3);
+        assert!(cache.get(&key("two", "v1")).unwrap().is_none());
+        drop(cache);
+
+        let mut reopened = CacheStore::open(&root, 100).unwrap();
+        assert_eq!(reopened.limit_bytes(), 4);
+        assert_eq!(
+            reopened.cached_pin_state(&key("one", "v1")).unwrap(),
+            Some(true)
+        );
+        assert!(matches!(
+            reopened.set_limit(2),
+            Err(CacheError::LimitExceeded)
+        ));
+        assert_eq!(reopened.limit_bytes(), 4);
     }
 
     #[test]

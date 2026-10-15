@@ -333,6 +333,133 @@ fn set_virtual_file_pinned(item_id: &str, pinned: bool) -> zbus::Result<String> 
     proxy.call("SetVirtualFilePinned", &(item_id, pinned))
 }
 
+fn read_virtual_cache_stats() -> zbus::Result<(u64, u64)> {
+    daemon_call("VirtualCacheStats")
+}
+
+fn set_virtual_cache_limit(bytes: u64) -> zbus::Result<(u64, u64)> {
+    let connection = zbus::blocking::Connection::session()?;
+    let proxy = zbus::blocking::Proxy::new(&connection, BUS_NAME, OBJECT_PATH, INTERFACE_NAME)?;
+    proxy.call("SetVirtualCacheLimit", &(bytes))
+}
+
+const GIB: u64 = 1024 * 1024 * 1024;
+
+#[derive(Clone)]
+struct VirtualCacheControls {
+    label: gtk::Label,
+    size: gtk::SpinButton,
+    apply: gtk::Button,
+    busy: Rc<Cell<bool>>,
+    dirty: Rc<Cell<bool>>,
+}
+
+impl VirtualCacheControls {
+    fn new(label: &gtk::Label, size: &gtk::SpinButton, apply: &gtk::Button) -> Self {
+        let dirty = Rc::new(Cell::new(false));
+        let dirty_on_edit = Rc::clone(&dirty);
+        size.connect_value_changed(move |_| dirty_on_edit.set(true));
+        Self {
+            label: label.clone(),
+            size: size.clone(),
+            apply: apply.clone(),
+            busy: Rc::new(Cell::new(false)),
+            dirty,
+        }
+    }
+
+    fn show_stats(&self, usage: u64, limit: u64) {
+        self.label.set_text(&format!(
+            "Кэш: {:.1} МиБ из {:.2} ГиБ",
+            usage as f64 / (1024 * 1024) as f64,
+            limit as f64 / GIB as f64
+        ));
+        if !self.dirty.get() {
+            self.size.set_value(limit as f64 / GIB as f64);
+            self.dirty.set(false);
+        }
+        self.apply.set_sensitive(true);
+    }
+
+    fn refresh(&self) {
+        if self.busy.replace(true) {
+            return;
+        }
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(read_virtual_cache_stats());
+        });
+        let controls = self.clone();
+        gtk::glib::timeout_add_local(Duration::from_millis(100), move || {
+            let result = match receiver.try_recv() {
+                Ok(result) => result,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    return gtk::glib::ControlFlow::Continue;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    controls
+                        .label
+                        .set_text("Не удалось прочитать состояние кэша");
+                    controls.apply.set_sensitive(false);
+                    controls.busy.set(false);
+                    return gtk::glib::ControlFlow::Break;
+                }
+            };
+            match result {
+                Ok((usage, limit)) => controls.show_stats(usage, limit),
+                Err(error) => {
+                    controls.label.set_text(&format!("Кэш недоступен: {error}"));
+                    controls.apply.set_sensitive(false);
+                }
+            }
+            controls.busy.set(false);
+            gtk::glib::ControlFlow::Break
+        });
+    }
+
+    fn apply(&self, status: &gtk::Label) {
+        if self.busy.replace(true) {
+            return;
+        }
+        let bytes = (self.size.value() * GIB as f64).round() as u64;
+        self.apply.set_sensitive(false);
+        status.set_text("Изменение лимита кэша…");
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(set_virtual_cache_limit(bytes));
+        });
+        let controls = self.clone();
+        let status = status.clone();
+        gtk::glib::timeout_add_local(Duration::from_millis(100), move || {
+            let result = match receiver.try_recv() {
+                Ok(result) => result,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    return gtk::glib::ControlFlow::Continue;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    controls.apply.set_sensitive(true);
+                    controls.busy.set(false);
+                    status.set_text("Не удалось изменить лимит кэша");
+                    return gtk::glib::ControlFlow::Break;
+                }
+            };
+            match result {
+                Ok((usage, limit)) => {
+                    controls.dirty.set(false);
+                    controls.show_stats(usage, limit);
+                    status.set_text("Лимит кэша сохранён");
+                }
+                Err(error) => {
+                    controls.apply.set_sensitive(true);
+                    status.set_text(&format!("Не удалось изменить лимит кэша: {error}"));
+                }
+            }
+            controls.busy.set(false);
+            gtk::glib::ControlFlow::Break
+        });
+    }
+}
+
 #[derive(Clone)]
 struct OfflineControls {
     label: gtk::Label,
@@ -1108,6 +1235,14 @@ fn main() {
         list.connect_row_selected(move |_, row| {
             offline_for_selection.set_selected(row.map(|row| row.widget_name().to_string()));
         });
+        let cache_label = gtk::Label::new(Some("Кэш: проверка состояния…"));
+        cache_label.set_xalign(0.0);
+        let cache_size = gtk::SpinButton::with_range(0.25, 64.0, 0.25);
+        cache_size.set_digits(2);
+        cache_size.set_numeric(true);
+        let cache_apply = gtk::Button::with_label("Сохранить лимит кэша");
+        cache_apply.set_sensitive(false);
+        let cache_controls = VirtualCacheControls::new(&cache_label, &cache_size, &cache_apply);
         let exit = gtk::Button::with_label("Выход");
         let controls = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         controls.append(&login);
@@ -1133,6 +1268,12 @@ fn main() {
         virtual_controls.append(&virtual_actions);
         virtual_controls.append(&offline_label);
         virtual_controls.append(&offline_button);
+        virtual_controls.append(&cache_label);
+        let cache_actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        cache_actions.append(&gtk::Label::new(Some("Лимит кэша (ГиБ):")));
+        cache_actions.append(&cache_size);
+        cache_actions.append(&cache_apply);
+        virtual_controls.append(&cache_actions);
         let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
         content.set_margin_start(18);
         content.set_margin_end(18);
@@ -1255,6 +1396,11 @@ fn main() {
         let status_for_offline = status.clone();
         offline_button.connect_clicked(move |_| {
             offline_controls.toggle(&status_for_offline);
+        });
+        let status_for_cache = status.clone();
+        let cache_for_apply = cache_controls.clone();
+        cache_apply.connect_clicked(move |_| {
+            cache_for_apply.apply(&status_for_cache);
         });
         let window_for_preview = window.clone();
         let status_for_preview = status.clone();
@@ -1487,6 +1633,11 @@ fn main() {
         mount_controls.refresh();
         gtk::glib::timeout_add_local(Duration::from_secs(10), move || {
             mount_controls.refresh();
+            gtk::glib::ControlFlow::Continue
+        });
+        cache_controls.refresh();
+        gtk::glib::timeout_add_local(Duration::from_secs(30), move || {
+            cache_controls.refresh();
             gtk::glib::ControlFlow::Continue
         });
         monitor.start();
