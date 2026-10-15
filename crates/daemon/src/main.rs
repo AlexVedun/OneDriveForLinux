@@ -5,7 +5,7 @@ mod transfer;
 use auth::LoginAttempt;
 use graph::{
     FolderCreateError, GraphClient, GraphUpload, QueuedDownloadError, QueuedDownloadTarget,
-    RemoteDeleteError, RemoteRenameError, RemoteRenameInput,
+    RemoteDeleteError, RemoteRenameError, RemoteRenameInput, VirtualDownloadError,
 };
 use keyring::v1::Entry;
 use oauth2::{TokenResponse, basic::BasicTokenResponse};
@@ -69,6 +69,11 @@ impl TransferStateGuard {
 
     fn finish(&mut self) {
         *self.state.lock().unwrap() = EngineState::Connected;
+        self.complete = true;
+    }
+
+    fn offline(&mut self) {
+        *self.state.lock().unwrap() = EngineState::Offline;
         self.complete = true;
     }
 }
@@ -190,21 +195,43 @@ async fn prepare_virtual_request(
     let client_id = client_id().ok_or_else(|| {
         zbus::fdo::Error::Failed("ONEDRIVE_CLIENT_ID is not configured".to_owned())
     })?;
-    let token = access_token(&client_id)
-        .await
-        .map_err(|_| zbus::fdo::Error::Failed("sign-in is required".to_owned()))?;
+    let token = match access_token_detailed(&client_id).await {
+        Ok(token) => token,
+        Err(TokenAccessError::Offline) => {
+            *context.state.lock().unwrap() = EngineState::Offline;
+            return Err(zbus::fdo::Error::NoNetwork(
+                "file is not cached and OneDrive is unavailable".to_owned(),
+            ));
+        }
+        Err(TokenAccessError::Auth) => {
+            return Err(zbus::fdo::Error::Failed("sign-in is required".to_owned()));
+        }
+    };
     let staging = tempfile::tempdir_in(&state_root)
         .map_err(|_| zbus::fdo::Error::Failed("cannot stage virtual file".to_owned()))?;
     let target = staging.path().join("content");
     let graph = GraphClient::new()
         .map_err(|_| zbus::fdo::Error::Failed("cannot create Graph client".to_owned()))?;
     let mut transfer_state = TransferStateGuard::start(&context.state);
-    graph
-        .download_cache_item(&request, &token, &target)
-        .await
-        .map_err(|_| {
-            zbus::fdo::Error::Failed("virtual file changed or download failed".to_owned())
-        })?;
+    match graph.download_cache_item(&request, &token, &target).await {
+        Ok(()) => {}
+        Err(VirtualDownloadError::Offline) => {
+            transfer_state.offline();
+            return Err(zbus::fdo::Error::NoNetwork(
+                "file is not cached and OneDrive is unavailable".to_owned(),
+            ));
+        }
+        Err(VirtualDownloadError::Changed) => {
+            return Err(zbus::fdo::Error::Failed(
+                "virtual file version changed".to_owned(),
+            ));
+        }
+        Err(VirtualDownloadError::Failed) => {
+            return Err(zbus::fdo::Error::Failed(
+                "virtual file download failed".to_owned(),
+            ));
+        }
+    }
     let cache_root_for_put = cache_root;
     let stored = tokio::task::spawn_blocking(move || {
         publish_virtual_file(&cache_root_for_put, &request, &target)
@@ -288,7 +315,10 @@ impl Daemon {
             runtime
                 .block_on(prepare_virtual_request(&context, expected))
                 .map(|_| ())
-                .map_err(io::Error::other)
+                .map_err(|error| match error {
+                    zbus::fdo::Error::NoNetwork(_) => io::ErrorKind::NotConnected.into(),
+                    other => io::Error::other(other),
+                })
         });
         let fuse = ReadOnlyFuse::new(tree, cache_root, VIRTUAL_CACHE_BYTES, loader);
         let path_for_mount = mount_path.clone();
@@ -1432,10 +1462,9 @@ impl Daemon {
         let in_progress = Arc::clone(&self.scan_in_progress);
         tokio::spawn(async move {
             *state.lock().unwrap() = EngineState::Checking;
-            if scan_catalog(catalog, client_id).await.is_ok() {
-                *state.lock().unwrap() = EngineState::Connected;
-            } else {
-                *state.lock().unwrap() = EngineState::Error;
+            let outcome = scan_catalog(catalog, client_id).await;
+            *state.lock().unwrap() = scan_outcome_state(&outcome);
+            if outcome.is_err() {
                 eprintln!("catalog scan failed; request URLs and credentials were not logged");
             }
             in_progress.store(false, Ordering::SeqCst);
@@ -2453,28 +2482,60 @@ async fn restore_login(state: Arc<Mutex<EngineState>>, client_id: String) {
     *state.lock().unwrap() = EngineState::Connected;
 }
 
-async fn scan_catalog(catalog: Arc<Mutex<Catalog>>, client_id: String) -> Result<(), ()> {
-    let access_token = access_token(&client_id).await?;
-    let graph = GraphClient::new().map_err(|_| ())?;
-    let drive_id = graph.drive_id(&access_token).await.map_err(|_| ())?;
-    let root_id = graph.root_id(&access_token).await.map_err(|_| ())?;
+#[derive(Debug, PartialEq, Eq)]
+enum ScanCatalogError {
+    Offline,
+    Failed,
+}
+
+impl From<FetchError> for ScanCatalogError {
+    fn from(error: FetchError) -> Self {
+        if error == FetchError::Offline {
+            Self::Offline
+        } else {
+            Self::Failed
+        }
+    }
+}
+
+fn scan_outcome_state(result: &Result<(), ScanCatalogError>) -> EngineState {
+    match result {
+        Ok(()) => EngineState::Connected,
+        Err(ScanCatalogError::Offline) => EngineState::Offline,
+        Err(ScanCatalogError::Failed) => EngineState::Error,
+    }
+}
+
+async fn scan_catalog(
+    catalog: Arc<Mutex<Catalog>>,
+    client_id: String,
+) -> Result<(), ScanCatalogError> {
+    let access_token = access_token_detailed(&client_id)
+        .await
+        .map_err(|error| match error {
+            TokenAccessError::Offline => ScanCatalogError::Offline,
+            TokenAccessError::Auth => ScanCatalogError::Failed,
+        })?;
+    let graph = GraphClient::new().map_err(|_| ScanCatalogError::Failed)?;
+    let drive_id = graph.drive_id(&access_token).await?;
+    let root_id = graph.root_id(&access_token).await?;
     catalog
         .lock()
         .unwrap()
         .set_active_drive_id(&drive_id)
-        .map_err(|_| ())?;
+        .map_err(|_| ScanCatalogError::Failed)?;
     catalog
         .lock()
         .unwrap()
         .set_root_id(&drive_id, &root_id)
-        .map_err(|_| ())?;
+        .map_err(|_| ScanCatalogError::Failed)?;
     let mut handled_gone = false;
     loop {
         let url = catalog
             .lock()
             .unwrap()
             .request_url(&drive_id)
-            .map_err(|_| ())?;
+            .map_err(|_| ScanCatalogError::Failed)?;
         let page = match graph.delta_page(&url, &access_token).await {
             Ok(page) => page,
             Err(FetchError::Gone) if !handled_gone => {
@@ -2482,18 +2543,18 @@ async fn scan_catalog(catalog: Arc<Mutex<Catalog>>, client_id: String) -> Result
                     .lock()
                     .unwrap()
                     .reset_expired_cursor(&drive_id)
-                    .map_err(|_| ())?;
+                    .map_err(|_| ScanCatalogError::Failed)?;
                 handled_gone = true;
                 continue;
             }
-            Err(_) => return Err(()),
+            Err(error) => return Err(error.into()),
         };
         let complete = page.delta_link.is_some();
         catalog
             .lock()
             .unwrap()
             .apply_page(&drive_id, &page)
-            .map_err(|_| ())?;
+            .map_err(|_| ScanCatalogError::Failed)?;
         if complete {
             break;
         }
@@ -2501,21 +2562,65 @@ async fn scan_catalog(catalog: Arc<Mutex<Catalog>>, client_id: String) -> Result
     Ok(())
 }
 
-async fn access_token(client_id: &str) -> Result<String, ()> {
+#[derive(Debug, PartialEq, Eq)]
+enum TokenAccessError {
+    Auth,
+    Offline,
+}
+
+fn is_network_failure(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut source = Some(error);
+    while let Some(error) = source {
+        if let Some(transport) = error.downcast_ref::<reqwest::Error>()
+            && (transport.is_connect() || transport.is_timeout() || transport.is_body())
+        {
+            return true;
+        }
+        if let Some(io) = error.downcast_ref::<io::Error>()
+            && matches!(
+                io.kind(),
+                io::ErrorKind::NotConnected
+                    | io::ErrorKind::ConnectionRefused
+                    | io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::TimedOut
+                    | io::ErrorKind::NetworkUnreachable
+                    | io::ErrorKind::HostUnreachable
+            )
+        {
+            return true;
+        }
+        source = error.source();
+    }
+    false
+}
+
+async fn access_token_detailed(client_id: &str) -> Result<String, TokenAccessError> {
     let refresh = tokio::task::spawn_blocking(|| {
         Entry::new(KEYRING_SERVICE, KEYRING_USER)
             .and_then(|entry| entry.get_password())
-            .map_err(|_| ())
+            .map_err(|_| TokenAccessError::Auth)
     })
     .await
-    .map_err(|_| ())??;
+    .map_err(|_| TokenAccessError::Auth)??;
     let token = auth::refresh_token(client_id, &refresh)
         .await
-        .map_err(|_| ())?;
+        .map_err(|error| {
+            if is_network_failure(error.as_ref()) {
+                TokenAccessError::Offline
+            } else {
+                TokenAccessError::Auth
+            }
+        })?;
     if let Some(rotated) = token.refresh_token() {
-        store_refresh(rotated.secret().to_owned()).await?;
+        store_refresh(rotated.secret().to_owned())
+            .await
+            .map_err(|_| TokenAccessError::Auth)?;
     }
     Ok(token.access_token().secret().to_owned())
+}
+
+async fn access_token(client_id: &str) -> Result<String, ()> {
+    access_token_detailed(client_id).await.map_err(|_| ())
 }
 
 async fn poll_catalog(
@@ -2545,11 +2650,7 @@ async fn poll_catalog(
         }
         *state.lock().unwrap() = EngineState::Checking;
         let result = scan_catalog(Arc::clone(&catalog), client_id.clone()).await;
-        *state.lock().unwrap() = if result.is_ok() {
-            EngineState::Connected
-        } else {
-            EngineState::Error
-        };
+        *state.lock().unwrap() = scan_outcome_state(&result);
         scan_in_progress.store(false, Ordering::SeqCst);
     }
 }
@@ -2647,16 +2748,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Baseline, CatalogItem, QueuedOperation, VIRTUAL_CACHE_BYTES, VirtualDownloadContext,
-        client_id_from_dotenv, client_id_from_sources, inspect_virtual_cache,
-        local_delete_candidate, prepare_virtual_request, publish_virtual_file,
-        remote_delete_candidate, remote_folder_candidate, remote_rename_candidate,
+        Baseline, CatalogItem, QueuedOperation, ScanCatalogError, VIRTUAL_CACHE_BYTES,
+        VirtualDownloadContext, client_id_from_dotenv, client_id_from_sources,
+        inspect_virtual_cache, is_network_failure, local_delete_candidate, prepare_virtual_request,
+        publish_virtual_file, remote_delete_candidate, remote_folder_candidate,
+        remote_rename_candidate, scan_outcome_state,
     };
     use onedrive_cache::{CacheError, CacheStore};
     use onedrive_catalog::{Catalog, DeltaPage};
     use onedrive_core::EngineState;
     use onedrive_mount::DownloadRequest;
     use std::fs;
+    use std::io;
     use std::sync::{Arc, Mutex, atomic::AtomicBool};
 
     #[test]
@@ -2971,6 +3074,22 @@ mod tests {
             client_id_from_sources(None, Some("ONEDRIVE_CLIENT_ID=registered"), Some("built"))
                 .as_deref(),
             Some("registered")
+        );
+    }
+
+    #[test]
+    fn network_failure_detection_does_not_confuse_authentication() {
+        assert!(is_network_failure(&io::Error::from(
+            io::ErrorKind::NotConnected
+        )));
+        assert!(!is_network_failure(&io::Error::other("access denied")));
+        assert_eq!(
+            scan_outcome_state(&Err(ScanCatalogError::Offline)),
+            EngineState::Offline
+        );
+        assert_eq!(
+            scan_outcome_state(&Err(ScanCatalogError::Failed)),
+            EngineState::Error
         );
     }
 

@@ -128,7 +128,7 @@ impl ReadOnlyFuse {
             Ok(handle) => handle,
             Err(OpenError::NotCached(request)) => {
                 drop(cache);
-                (self.loader)(&request).map_err(|_| Errno::EIO)?;
+                (self.loader)(&request).map_err(map_loader_error)?;
                 let mut cache =
                     CacheStore::open(&self.cache_root, self.cache_limit).map_err(|_| Errno::EIO)?;
                 self.tree
@@ -163,6 +163,19 @@ fn map_open_error(error: OpenError) -> Errno {
         OpenError::MissingFile => Errno::ENOENT,
         OpenError::IsDirectory => Errno::EISDIR,
         _ => Errno::EIO,
+    }
+}
+
+fn map_loader_error(error: io::Error) -> Errno {
+    if matches!(
+        error.kind(),
+        io::ErrorKind::NotConnected
+            | io::ErrorKind::NetworkUnreachable
+            | io::ErrorKind::HostUnreachable
+    ) {
+        Errno::ENETDOWN
+    } else {
+        Errno::EIO
     }
 }
 
@@ -315,6 +328,15 @@ mod tests {
     }
 
     #[test]
+    fn unavailable_network_has_distinct_fuse_error() {
+        assert_eq!(
+            map_loader_error(io::ErrorKind::NotConnected.into()),
+            Errno::ENETDOWN
+        );
+        assert_eq!(map_loader_error(io::Error::other("failed")), Errno::EIO);
+    }
+
+    #[test]
     fn mounted_tree_reads_cached_file_without_network() {
         if std::env::var_os("ONEDRIVE_FUSE_SMOKE").is_none() {
             return;
@@ -329,7 +351,10 @@ mod tests {
         let mut on_demand = file_item();
         on_demand.item_id = "second".into();
         on_demand.name = Some("по-запросу.txt".into());
-        let tree = VirtualTree::from_items("drive", "root", [item, on_demand]).unwrap();
+        let mut offline = file_item();
+        offline.item_id = "offline".into();
+        offline.name = Some("без-сети.txt".into());
+        let tree = VirtualTree::from_items("drive", "root", [item, on_demand, offline]).unwrap();
         let request = tree.request_for_item("file").unwrap();
         let mut cache = CacheStore::open(&cache_root, 10).unwrap();
         cache.put(&request.cache_key(), &source, 5).unwrap();
@@ -338,6 +363,9 @@ mod tests {
         let calls_for_loader = Arc::clone(&calls);
         let cache_for_loader = cache_root.clone();
         let loader: Arc<ContentLoader> = Arc::new(move |request| {
+            if request.item_id == "offline" {
+                return Err(io::ErrorKind::NotConnected.into());
+            }
             assert_eq!(request.item_id, "second");
             calls_for_loader.fetch_add(1, Ordering::SeqCst);
             let mut cache = CacheStore::open(&cache_for_loader, 10).map_err(io::Error::other)?;
@@ -356,6 +384,7 @@ mod tests {
         assert_eq!(
             entries,
             [
+                std::ffi::OsString::from("без-сети.txt"),
                 std::ffi::OsString::from("по-запросу.txt"),
                 std::ffi::OsString::from("текст.txt")
             ]
@@ -371,6 +400,13 @@ mod tests {
             b"hello"
         );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            fs::read(mountpoint.join("без-сети.txt"))
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::ENETDOWN)
+        );
+        assert_eq!(fs::read(mountpoint.join("текст.txt")).unwrap(), b"hello");
         assert!(fs::write(mountpoint.join("new.txt"), b"no").is_err());
         session.umount_and_join().unwrap();
     }

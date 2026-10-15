@@ -85,6 +85,7 @@ pub struct Catalog {
 #[derive(Debug, PartialEq, Eq)]
 pub enum FetchError {
     Gone,
+    Offline,
     Failed,
 }
 
