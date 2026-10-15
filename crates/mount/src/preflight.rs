@@ -5,7 +5,7 @@ use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::io;
 use std::os::unix::ffi::OsStringExt;
-use std::os::unix::fs::FileTypeExt;
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug)]
@@ -111,6 +111,40 @@ pub fn check_fuse_device() -> Result<(), MountError> {
     }
 }
 
+/// A helper is needed when the kernel rejects direct mounting for an unprivileged user.
+/// Its absence does not rule out direct mounting.
+pub fn fuse_mount_helper_available() -> bool {
+    if let Some(override_path) = std::env::var_os("FUSERMOUNT_PATH") {
+        return executable_in_path(Path::new(&override_path));
+    }
+    ["fusermount3", "fusermount"]
+        .iter()
+        .any(|name| executable_in_path(Path::new(name)))
+        || [
+            "/sbin/fusermount3",
+            "/sbin/fusermount",
+            "/bin/fusermount3",
+            "/bin/fusermount",
+        ]
+        .iter()
+        .any(|name| executable_in_path(Path::new(name)))
+}
+
+fn executable_in_path(path: &Path) -> bool {
+    if path.components().count() > 1 || path.is_absolute() {
+        return is_executable(path);
+    }
+    std::env::var_os("PATH")
+        .into_iter()
+        .flat_map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
+        .any(|directory| is_executable(&directory.join(path)))
+}
+
+fn is_executable(path: &Path) -> bool {
+    fs::metadata(path)
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+}
+
 /// Check an existing mount without requiring an empty directory.
 pub fn is_mountpoint_busy(path: &Path) -> io::Result<bool> {
     Ok(mountinfo_contains(
@@ -199,5 +233,16 @@ mod tests {
             "31 20 0:45 / /tmp/bad\\777 rw - fuse.test test rw",
             Path::new("/tmp/bad")
         ));
+    }
+
+    #[test]
+    fn helper_probe_requires_executable_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let helper = directory.path().join("fusermount3");
+        fs::write(&helper, b"#!/bin/sh\n").unwrap();
+        assert!(!is_executable(&helper));
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(is_executable(&helper));
+        assert!(!is_executable(directory.path()));
     }
 }

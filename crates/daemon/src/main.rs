@@ -258,6 +258,17 @@ fn virtual_request_for_item(
 
 #[zbus::interface(name = "io.github.onedrive_linux.Daemon")]
 impl Daemon {
+    /// Device status and optional unprivileged mount helper status.
+    fn virtual_fuse_diagnostics(&self) -> (String, bool) {
+        let device = match preflight::check_fuse_device() {
+            Ok(()) => "ready",
+            Err(preflight::MountError::FuseUnavailable) => "device-missing",
+            Err(preflight::MountError::FusePermission) => "device-permission",
+            Err(_) => "device-error",
+        };
+        (device.to_owned(), preflight::fuse_mount_helper_available())
+    }
+
     fn virtual_mount_path(&self) -> String {
         self.virtual_mount
             .lock()
