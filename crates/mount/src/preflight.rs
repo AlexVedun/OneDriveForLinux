@@ -77,8 +77,7 @@ pub fn validate_mount_paths(
         return Err(MountError::NotDirectory);
     }
     let resolved = resolve_path(mount)?;
-    let mountinfo = fs::read_to_string("/proc/self/mountinfo")?;
-    if mountinfo_contains(&mountinfo, &resolved) {
+    if is_mountpoint_busy(&resolved)? {
         return Err(MountError::Busy);
     }
     if fs::read_dir(mount)?.next().transpose()?.is_some() {
@@ -110,6 +109,14 @@ pub fn check_fuse_device() -> Result<(), MountError> {
         }
         Err(error) => Err(MountError::Io(error)),
     }
+}
+
+/// Check an existing mount without requiring an empty directory.
+pub fn is_mountpoint_busy(path: &Path) -> io::Result<bool> {
+    Ok(mountinfo_contains(
+        &fs::read_to_string("/proc/self/mountinfo")?,
+        path,
+    ))
 }
 
 fn mountinfo_contains(content: &str, path: &Path) -> bool {
