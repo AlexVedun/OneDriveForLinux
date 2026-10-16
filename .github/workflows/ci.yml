@@ -12,10 +12,11 @@ jobs:
         with:
           components: clippy, rustfmt
       - name: Install native dependencies
-        run: sudo apt-get update && sudo apt-get install -y libgtk-4-dev libadwaita-1-dev pkg-config dbus-bin libglib2.0-bin
+        run: sudo apt-get update && sudo apt-get install -y libgtk-4-dev libadwaita-1-dev pkg-config dbus-bin libglib2.0-bin desktop-file-utils
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
       - run: cargo build -p onedrive-daemon
       - run: SMOKE_TEST_LOGIN=1 dbus-run-session -- sh scripts/smoke-dbus.sh
       - run: SMOKE_TEST_LOGIN=xdg dbus-run-session -- sh scripts/smoke-dbus.sh
+      - run: sh scripts/smoke-appdir.sh
