@@ -345,6 +345,15 @@ fn upload_virtual_draft(item_id: &str) -> Result<String, String> {
         .map_err(|error| error.to_string())
 }
 
+fn export_virtual_draft(drive_id: &str, item_id: &str, destination: &str) -> Result<(), String> {
+    let connection = zbus::blocking::Connection::session().map_err(|error| error.to_string())?;
+    let proxy = zbus::blocking::Proxy::new(&connection, BUS_NAME, OBJECT_PATH, INTERFACE_NAME)
+        .map_err(|error| error.to_string())?;
+    proxy
+        .call("ExportVirtualDraft", &(drive_id, item_id, destination))
+        .map_err(|error| error.to_string())
+}
+
 fn virtual_draft_status_label(status: &str) -> &'static str {
     match status {
         "ready" => "версия в каталоге совпадает",
@@ -1174,9 +1183,9 @@ fn present_virtual_drafts_dialog(
     content.set_margin_top(18);
     content.set_margin_bottom(18);
     let hint = gtk::Label::new(Some(if upload_enabled {
-        "Отправка экспериментальная. Отключите виртуальный диск и папку синхронизации. Перед отправкой демон повторно проверит версию файла в OneDrive."
+        "Экспорт сохраняет копию без удаления черновика. Отправка экспериментальная: отключите виртуальный диск и папку синхронизации. Перед отправкой демон повторно проверит версию файла в OneDrive."
     } else {
-        "Ручная отправка доступна после включения ONEDRIVE_EXPERIMENTAL_VIRTUAL_UPLOAD=1 для демона."
+        "Экспорт сохраняет копию без удаления черновика. Ручная отправка доступна после включения ONEDRIVE_EXPERIMENTAL_VIRTUAL_UPLOAD=1 для демона."
     }));
     hint.set_wrap(true);
     hint.set_xalign(0.0);
@@ -1201,6 +1210,57 @@ fn present_virtual_drafts_dialog(
         let state = gtk::Label::new(Some(virtual_draft_status_label(&draft.status)));
         state.set_xalign(0.0);
         row.append(&state);
+        let export = gtk::Button::with_label("Сохранить локальную копию…");
+        row.append(&export);
+        let export_drive_id = draft.drive_id.clone();
+        let export_item_id = draft.item_id.clone();
+        let export_name = format!("{name}.local-copy");
+        let export_parent = parent.clone();
+        let export_result = result.clone();
+        export.connect_clicked(move |button| {
+            button.set_sensitive(false);
+            let dialog = gtk::FileDialog::new();
+            dialog.set_title("Сохранить локальный черновик");
+            dialog.set_initial_name(Some(&export_name));
+            let button = button.clone();
+            let result = export_result.clone();
+            let drive_id = export_drive_id.clone();
+            let item_id = export_item_id.clone();
+            dialog.save(
+                Some(&export_parent),
+                None::<&gio::Cancellable>,
+                move |selection| {
+                    let Ok(file) = selection else {
+                        button.set_sensitive(true);
+                        return;
+                    };
+                    let Some(path) = file.path() else {
+                        result.set_text("Выберите локальный путь для копии");
+                        button.set_sensitive(true);
+                        return;
+                    };
+                    result.set_text("Сохранение локальной копии…");
+                    let (sender, receiver) = std::sync::mpsc::channel();
+                    std::thread::spawn(move || {
+                        let _ = sender.send(export_virtual_draft(
+                            &drive_id,
+                            &item_id,
+                            &path.to_string_lossy(),
+                        ));
+                    });
+                    gtk::glib::timeout_add_local(Duration::from_millis(100), move || {
+                        match receiver.try_recv() {
+                            Ok(Ok(())) => result.set_text("Локальная копия сохранена. Черновик оставлен без изменений."),
+                            Ok(Err(error)) => result.set_text(&format!("Не удалось сохранить копию: {error}. Существующий файл не перезаписывается.")),
+                            Err(std::sync::mpsc::TryRecvError::Empty) => return gtk::glib::ControlFlow::Continue,
+                            Err(std::sync::mpsc::TryRecvError::Disconnected) => result.set_text("Не удалось получить результат сохранения"),
+                        }
+                        button.set_sensitive(true);
+                        gtk::glib::ControlFlow::Break
+                    });
+                },
+            );
+        });
         if upload_enabled && draft.status == "ready" {
             let send = gtk::Button::with_label("Отправить в OneDrive");
             row.append(&send);

@@ -316,6 +316,28 @@ impl Daemon {
             .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))
     }
 
+    /// Export a local copy without removing the draft or contacting OneDrive.
+    async fn export_virtual_draft(
+        &self,
+        drive_id: String,
+        item_id: String,
+        destination: String,
+    ) -> zbus::fdo::Result<()> {
+        let root = state_directory()
+            .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?
+            .join("virtual-drafts");
+        tokio::task::spawn_blocking(move || {
+            DraftStore::open(&root)?.export_item(
+                &drive_id,
+                &item_id,
+                std::path::Path::new(&destination),
+            )
+        })
+        .await
+        .map_err(|_| zbus::fdo::Error::Failed("draft export task failed".to_owned()))?
+        .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))
+    }
+
     /// Explicit experimental transfer of one existing virtual-drive draft.
     async fn run_virtual_draft_upload(&self, item_id: String) -> zbus::fdo::Result<String> {
         if !self.virtual_draft_upload_enabled() {
