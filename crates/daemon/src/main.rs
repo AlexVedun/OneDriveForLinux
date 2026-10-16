@@ -110,6 +110,7 @@ fn inspect_virtual_cache(
     Ok((cached, cache.limit_bytes()))
 }
 
+#[derive(Clone)]
 struct Daemon {
     state: Arc<Mutex<EngineState>>,
     login_in_progress: Arc<AtomicBool>,
@@ -258,6 +259,71 @@ fn virtual_request_for_item(
         .map_err(|error| zbus::fdo::Error::InvalidArgs(error.to_string()))
 }
 
+impl Daemon {
+    fn virtual_draft_auto_upload_enabled(&self) -> bool {
+        self.virtual_draft_upload_enabled()
+            && std::env::var("ONEDRIVE_EXPERIMENTAL_VIRTUAL_AUTO_UPLOAD").as_deref() == Ok("1")
+    }
+
+    /// Advisory catalog view. Upload must recheck the remote eTag before writing.
+    fn virtual_draft_statuses(&self) -> zbus::fdo::Result<Vec<virtual_drafts::VirtualDraftStatus>> {
+        let root = state_directory()
+            .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?
+            .join("virtual-drafts");
+        let drafts = DraftStore::open(&root)
+            .and_then(|store| store.list())
+            .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
+        let catalog = self.catalog.lock().unwrap();
+        let active_drive = catalog
+            .active_drive_id()
+            .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
+        let complete = match &active_drive {
+            Some(drive_id) => catalog
+                .is_complete(drive_id)
+                .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?,
+            None => false,
+        };
+        drafts
+            .iter()
+            .map(|draft| {
+                let item = if active_drive.as_deref() == Some(draft.drive_id.as_str()) && complete {
+                    catalog
+                        .item(&draft.drive_id, &draft.item_id)
+                        .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?
+                } else {
+                    None
+                };
+                Ok(virtual_drafts::classify(
+                    draft,
+                    active_drive.as_deref(),
+                    complete,
+                    item.as_ref(),
+                ))
+            })
+            .collect::<zbus::fdo::Result<Vec<_>>>()
+    }
+
+    fn virtual_auto_upload_candidate(&self, after: Option<&str>) -> Option<String> {
+        if !self.virtual_draft_auto_upload_enabled()
+            || !matches!(
+                *self.state.lock().unwrap(),
+                EngineState::Connected | EngineState::Synced
+            )
+            || self.sync_paused().ok()?
+            || self.sync.lock().unwrap().root().ok()?.is_some()
+            || self.virtual_mount.lock().unwrap().is_some()
+            || self.mount_in_progress.load(Ordering::SeqCst)
+            || self.scan_in_progress.load(Ordering::SeqCst)
+            || self.download_in_progress.load(Ordering::SeqCst)
+            || self.upload_in_progress.load(Ordering::SeqCst)
+        {
+            return None;
+        }
+        let statuses = self.virtual_draft_statuses().ok()?;
+        virtual_drafts::next_ready_item_id(&statuses, after).map(str::to_owned)
+    }
+}
+
 #[zbus::interface(name = "io.github.onedrive_linux.Daemon")]
 impl Daemon {
     /// UI capability flag only; RunVirtualDraftUpload repeats all safety checks.
@@ -276,42 +342,8 @@ impl Daemon {
         u64::try_from(count).map_err(|error| zbus::fdo::Error::Failed(error.to_string()))
     }
 
-    /// Advisory catalog view. Upload must recheck the remote eTag before writing.
     fn virtual_drafts(&self) -> zbus::fdo::Result<String> {
-        let root = state_directory()
-            .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?
-            .join("virtual-drafts");
-        let drafts = DraftStore::open(&root)
-            .and_then(|store| store.list())
-            .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
-        let catalog = self.catalog.lock().unwrap();
-        let active_drive = catalog
-            .active_drive_id()
-            .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
-        let complete = match &active_drive {
-            Some(drive_id) => catalog
-                .is_complete(drive_id)
-                .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?,
-            None => false,
-        };
-        let statuses = drafts
-            .iter()
-            .map(|draft| {
-                let item = if active_drive.as_deref() == Some(draft.drive_id.as_str()) && complete {
-                    catalog
-                        .item(&draft.drive_id, &draft.item_id)
-                        .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?
-                } else {
-                    None
-                };
-                Ok(virtual_drafts::classify(
-                    draft,
-                    active_drive.as_deref(),
-                    complete,
-                    item.as_ref(),
-                ))
-            })
-            .collect::<zbus::fdo::Result<Vec<_>>>()?;
+        let statuses = self.virtual_draft_statuses()?;
         serde_json::to_string(&statuses)
             .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))
     }
@@ -2973,6 +3005,24 @@ async fn poll_catalog(
     }
 }
 
+/// Drafts are the durable queue; one candidate is retried per interval.
+async fn poll_virtual_drafts(daemon: Daemon) {
+    let mut interval = tokio::time::interval(Duration::from_secs(300));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    interval.tick().await;
+    let mut last_attempted = None;
+    loop {
+        interval.tick().await;
+        let Some(item_id) = daemon.virtual_auto_upload_candidate(last_attempted.as_deref()) else {
+            continue;
+        };
+        last_attempted = Some(item_id.clone());
+        if daemon.run_virtual_draft_upload(item_id).await.is_err() {
+            eprintln!("automatic virtual draft upload failed; local draft retained");
+        }
+    }
+}
+
 fn state_directory() -> Result<PathBuf, Box<dyn std::error::Error>> {
     let state_home = std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
@@ -3042,12 +3092,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         virtual_mount: Arc::clone(&virtual_mount),
         mount_in_progress: Arc::new(AtomicBool::new(false)),
     };
+    let automatic_upload = daemon.clone();
     let _connection = Builder::session()?
         .name(BUS_NAME)?
         .serve_at(OBJECT_PATH, daemon)?
         .build()
         .await?;
     if let Some(client_id) = client_id() {
+        if automatic_upload.virtual_draft_auto_upload_enabled() {
+            tokio::spawn(poll_virtual_drafts(automatic_upload));
+        }
         tokio::spawn(restore_login(Arc::clone(&state), client_id.clone()));
         tokio::spawn(poll_catalog(
             state,

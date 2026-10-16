@@ -375,7 +375,7 @@ fn virtual_drafts_text(drafts: &[UiVirtualDraft]) -> String {
         .filter(|draft| draft.status != "ready")
         .count();
     let mut lines = vec![format!(
-        "Локально сохранено: {} · требуют внимания: {attention}. Автоматическая отправка в OneDrive ещё не включена.",
+        "Локально сохранено: {} · требуют внимания: {attention}. Откройте полный список для проверки.",
         drafts.len()
     )];
     for draft in drafts
@@ -2047,7 +2047,7 @@ mod tests {
         assert!(text.contains("Локально сохранено: 2 · требуют внимания: 1"));
         assert!(text.contains("note.txt (drive) — версия в каталоге совпадает"));
         assert!(text.contains("2 (drive) — версия в каталоге изменилась"));
-        assert!(text.contains("Автоматическая отправка в OneDrive ещё не включена"));
+        assert!(text.contains("Откройте полный список для проверки"));
     }
 
     #[test]
