@@ -87,6 +87,11 @@ draft_count=$(gdbus call --session \
     --object-path /io/github/onedrive_linux/Daemon \
     --method io.github.onedrive_linux.Daemon.VirtualDraftCount)
 test "$draft_count" = "(uint64 0,)"
+drafts=$(gdbus call --session \
+    --dest io.github.onedrive_linux.Daemon \
+    --object-path /io/github/onedrive_linux/Daemon \
+    --method io.github.onedrive_linux.Daemon.VirtualDrafts)
+test "$drafts" = "('[]',)"
 fuse_diagnostics=$(gdbus call --session \
     --dest io.github.onedrive_linux.Daemon \
     --object-path /io/github/onedrive_linux/Daemon \

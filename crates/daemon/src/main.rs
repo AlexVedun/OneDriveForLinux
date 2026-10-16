@@ -2,6 +2,7 @@ mod auth;
 mod graph;
 mod mount_record;
 mod transfer;
+mod virtual_drafts;
 
 use auth::LoginAttempt;
 use graph::{
@@ -267,6 +268,46 @@ impl Daemon {
             .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?
             .len();
         u64::try_from(count).map_err(|error| zbus::fdo::Error::Failed(error.to_string()))
+    }
+
+    /// Advisory catalog view. Upload must recheck the remote eTag before writing.
+    fn virtual_drafts(&self) -> zbus::fdo::Result<String> {
+        let root = state_directory()
+            .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?
+            .join("virtual-drafts");
+        let drafts = DraftStore::open(&root)
+            .and_then(|store| store.list())
+            .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
+        let catalog = self.catalog.lock().unwrap();
+        let active_drive = catalog
+            .active_drive_id()
+            .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
+        let complete = match &active_drive {
+            Some(drive_id) => catalog
+                .is_complete(drive_id)
+                .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?,
+            None => false,
+        };
+        let statuses = drafts
+            .iter()
+            .map(|draft| {
+                let item = if active_drive.as_deref() == Some(draft.drive_id.as_str()) && complete {
+                    catalog
+                        .item(&draft.drive_id, &draft.item_id)
+                        .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?
+                } else {
+                    None
+                };
+                Ok(virtual_drafts::classify(
+                    draft,
+                    active_drive.as_deref(),
+                    complete,
+                    item.as_ref(),
+                ))
+            })
+            .collect::<zbus::fdo::Result<Vec<_>>>()?;
+        serde_json::to_string(&statuses)
+            .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))
     }
 
     /// Device status and optional unprivileged mount helper status.
