@@ -2711,28 +2711,55 @@ fn watch_local_root(sync: Arc<Mutex<SyncStore>>, epoch: Arc<AtomicU64>) {
 
 fn client_id() -> Option<String> {
     match std::env::var("ONEDRIVE_CLIENT_ID") {
-        Ok(value) => client_id_from_sources(Some(&value), None, None),
+        Ok(value) => client_id_from_sources(Some(&value), None, None, None),
         Err(std::env::VarError::NotUnicode(_)) => None,
         Err(std::env::VarError::NotPresent) => {
+            let config_home = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from);
+            let home = std::env::var_os("HOME").map(PathBuf::from);
+            let config = client_config_path(config_home.as_deref(), home.as_deref())
+                .and_then(|path| fs::read_to_string(path).ok());
             let dotenv = fs::read_to_string(".env").ok();
-            client_id_from_sources(None, dotenv.as_deref(), option_env!("ONEDRIVE_CLIENT_ID"))
+            client_id_from_sources(
+                None,
+                config.as_deref(),
+                dotenv.as_deref(),
+                option_env!("ONEDRIVE_CLIENT_ID"),
+            )
         }
     }
 }
 
+fn client_config_path(
+    config_home: Option<&std::path::Path>,
+    home: Option<&std::path::Path>,
+) -> Option<PathBuf> {
+    config_home
+        .filter(|path| path.is_absolute())
+        .map(PathBuf::from)
+        .or_else(|| {
+            home.filter(|path| path.is_absolute())
+                .map(|path| path.join(".config"))
+        })
+        .map(|path| path.join("onedrive-linux/config.env"))
+}
+
 fn client_id_from_sources(
     explicit: Option<&str>,
+    config: Option<&str>,
     dotenv: Option<&str>,
     compiled: Option<&str>,
 ) -> Option<String> {
     if let Some(value) = explicit {
         return (!value.is_empty()).then(|| value.to_owned());
     }
-    dotenv.and_then(client_id_from_dotenv).or_else(|| {
-        compiled
-            .filter(|value| !value.is_empty())
-            .map(str::to_owned)
-    })
+    config
+        .and_then(client_id_from_dotenv)
+        .or_else(|| dotenv.and_then(client_id_from_dotenv))
+        .or_else(|| {
+            compiled
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+        })
 }
 
 fn client_id_from_dotenv(contents: &str) -> Option<String> {
@@ -3169,7 +3196,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if automatic_upload.virtual_draft_auto_upload_enabled() {
             tokio::spawn(poll_virtual_drafts(automatic_upload));
         }
-        tokio::spawn(restore_login(Arc::clone(&state), client_id.clone()));
+        if std::env::var("ONEDRIVE_SMOKE_NO_RESTORE").as_deref() != Ok("1") {
+            tokio::spawn(restore_login(Arc::clone(&state), client_id.clone()));
+        }
         tokio::spawn(poll_catalog(
             state,
             catalog,
@@ -3197,7 +3226,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::{
         Baseline, CatalogItem, QueuedOperation, ScanCatalogError, VIRTUAL_CACHE_BYTES,
-        VirtualDownloadContext, client_id_from_dotenv, client_id_from_sources,
+        VirtualDownloadContext, client_config_path, client_id_from_dotenv, client_id_from_sources,
         inspect_virtual_cache, is_network_failure, local_delete_candidate, prepare_virtual_request,
         publish_virtual_file, remote_delete_candidate, remote_folder_candidate,
         remote_rename_candidate, scan_outcome_state, virtual_upload_issue,
@@ -3208,6 +3237,7 @@ mod tests {
     use onedrive_mount::{DownloadRequest, draft::DraftUploadIssue};
     use std::fs;
     use std::io;
+    use std::path::Path;
     use std::sync::{Arc, Mutex, atomic::AtomicBool};
 
     #[test]
@@ -3535,16 +3565,49 @@ mod tests {
         assert_eq!(
             client_id_from_sources(
                 Some(""),
+                Some("ONEDRIVE_CLIENT_ID=config"),
                 Some("ONEDRIVE_CLIENT_ID=registered"),
                 Some("built")
             ),
             None
         );
         assert_eq!(
-            client_id_from_sources(None, Some("ONEDRIVE_CLIENT_ID=registered"), Some("built"))
-                .as_deref(),
+            client_id_from_sources(
+                None,
+                None,
+                Some("ONEDRIVE_CLIENT_ID=registered"),
+                Some("built")
+            )
+            .as_deref(),
             Some("registered")
         );
+    }
+
+    #[test]
+    fn xdg_config_precedes_project_dotenv_and_has_absolute_fallback() {
+        assert_eq!(
+            client_id_from_sources(
+                None,
+                Some("ONEDRIVE_CLIENT_ID=configured"),
+                Some("ONEDRIVE_CLIENT_ID=project"),
+                Some("built"),
+            )
+            .as_deref(),
+            Some("configured")
+        );
+        assert_eq!(
+            client_config_path(
+                Some(Path::new("/tmp/config")),
+                Some(Path::new("/home/user"))
+            )
+            .unwrap(),
+            Path::new("/tmp/config/onedrive-linux/config.env")
+        );
+        assert_eq!(
+            client_config_path(Some(Path::new("relative")), Some(Path::new("/home/user"))).unwrap(),
+            Path::new("/home/user/.config/onedrive-linux/config.env")
+        );
+        assert!(client_config_path(Some(Path::new("relative")), None).is_none());
     }
 
     #[test]

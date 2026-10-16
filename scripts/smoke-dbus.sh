@@ -4,15 +4,23 @@ set -eu
 daemon="${1:-target/debug/onedrive-daemon}"
 test_state=$(mktemp -d)
 export XDG_STATE_HOME="$test_state"
+export ONEDRIVE_SMOKE_NO_RESTORE=1
 # The automatic flag alone must not enable experimental writes.
 export ONEDRIVE_EXPERIMENTAL_VIRTUAL_UPLOAD=
 export ONEDRIVE_EXPERIMENTAL_VIRTUAL_AUTO_UPLOAD=1
-if [ "${SMOKE_TEST_LOGIN:-0}" = 1 ]; then
-    export ONEDRIVE_CLIENT_ID=test-client
-else
-    # An explicit empty value prevents startup credential restoration.
-    export ONEDRIVE_CLIENT_ID=
-fi
+case "${SMOKE_TEST_LOGIN:-0}" in
+    1) export ONEDRIVE_CLIENT_ID=test-client ;;
+    xdg)
+        export XDG_CONFIG_HOME="$test_state/config"
+        mkdir -p "$XDG_CONFIG_HOME/onedrive-linux"
+        printf 'ONEDRIVE_CLIENT_ID=test-client\n' > "$XDG_CONFIG_HOME/onedrive-linux/config.env"
+        unset ONEDRIVE_CLIENT_ID
+        ;;
+    *)
+        # An explicit empty value prevents startup credential restoration.
+        export ONEDRIVE_CLIENT_ID=
+        ;;
+esac
 "$daemon" &
 daemon_pid=$!
 trap 'kill "$daemon_pid" 2>/dev/null || true; rm -rf "$test_state"' EXIT HUP INT TERM
@@ -343,7 +351,7 @@ if gdbus call --session \
     exit 1
 fi
 
-if [ "${SMOKE_TEST_LOGIN:-0}" != 1 ]; then
+if [ "${SMOKE_TEST_LOGIN:-0}" != 1 ] && [ "${SMOKE_TEST_LOGIN:-0}" != xdg ]; then
     exit 0
 fi
 
@@ -352,7 +360,7 @@ login_url=$(gdbus call --session \
     --object-path /io/github/onedrive_linux/Daemon \
     --method io.github.onedrive_linux.Daemon.BeginLogin)
 case "$login_url" in
-    *login.microsoftonline.com*code_challenge_method=S256*) ;;
+    *login.microsoftonline.com*client_id=test-client*code_challenge_method=S256*) ;;
     *) exit 1 ;;
 esac
 
