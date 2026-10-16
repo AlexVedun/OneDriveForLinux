@@ -100,6 +100,12 @@ test "$upload_enabled" = "(false,)"
 if gdbus call --session \
     --dest io.github.onedrive_linux.Daemon \
     --object-path /io/github/onedrive_linux/Daemon \
+    --method io.github.onedrive_linux.Daemon.ExportVirtualDraft drive missing /tmp/missing-draft-copy >/dev/null 2>&1; then
+    exit 1
+fi
+if gdbus call --session \
+    --dest io.github.onedrive_linux.Daemon \
+    --object-path /io/github/onedrive_linux/Daemon \
     --method io.github.onedrive_linux.Daemon.RunVirtualDraftUpload item >/dev/null 2>&1; then
     exit 1
 fi

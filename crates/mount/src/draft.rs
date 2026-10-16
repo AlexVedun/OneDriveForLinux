@@ -442,6 +442,40 @@ impl DraftStore {
         }))
     }
 
+    /// Save a stable copy for manual conflict recovery without changing the draft.
+    pub fn export_item(&self, drive_id: &str, item_id: &str, destination: &Path) -> io::Result<()> {
+        if !destination.is_absolute() || destination.file_name().is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "export destination must be an absolute file path",
+            ));
+        }
+        let parent = destination
+            .parent()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing export directory"))?
+            .canonicalize()?;
+        if parent.starts_with(self.root.canonicalize()?) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cannot export into draft storage",
+            ));
+        }
+        let destination = parent.join(destination.file_name().unwrap());
+        let draft = self
+            .recover_item(drive_id, item_id)?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "draft is missing"))?;
+        let snapshot = self
+            .snapshot(draft.identity())?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "draft is missing"))?;
+        let mut temporary = tempfile::NamedTempFile::new_in(&parent)?;
+        io::copy(&mut snapshot.file.reopen()?, &mut temporary)?;
+        temporary.as_file().sync_all()?;
+        temporary
+            .persist_noclobber(destination)
+            .map_err(|error| error.error)?;
+        File::open(parent)?.sync_all()
+    }
+
     /// Forget only bytes that match the uploaded snapshot. A later edit stays local.
     pub fn acknowledge(&self, snapshot: &DraftSnapshot) -> io::Result<bool> {
         let _store_lock = lock_store(&self.root)?;
@@ -572,6 +606,41 @@ mod tests {
             item_id: "file".into(),
             base_etag: "v1".into(),
         }
+    }
+
+    #[test]
+    fn export_preserves_draft_and_never_overwrites_destination() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("drafts");
+        let store = DraftStore::open(&root).unwrap();
+        let draft = store.begin_empty(identity()).unwrap();
+        draft.write_at(0, b"local changes").unwrap();
+        let destination = temporary.path().join("recovered.txt");
+        store.export_item("drive", "file", &destination).unwrap();
+        assert_eq!(fs::read(&destination).unwrap(), b"local changes");
+        assert_eq!(
+            fs::metadata(&destination).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(store.list().unwrap(), vec![identity()]);
+        assert_eq!(
+            store
+                .export_item("drive", "file", &destination)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(fs::read(&destination).unwrap(), b"local changes");
+        assert!(
+            store
+                .export_item("drive", "file", &root.join("unsafe.txt"))
+                .is_err()
+        );
+        assert!(
+            store
+                .export_item("drive", "missing", &temporary.path().join("missing"))
+                .is_err()
+        );
     }
 
     #[test]
