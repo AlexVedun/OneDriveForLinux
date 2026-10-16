@@ -15,6 +15,29 @@ test -r "$appdir/.DirIcon"
 test "$(find "$appdir" -maxdepth 1 -name '*.desktop' | wc -l)" -eq 1
 desktop-file-validate "$appdir/io.github.onedrive_linux.desktop"
 sh -n "$appdir/AppRun"
+sh "$repo/scripts/audit-appdir-libs.sh" "$appdir" > "$scratch/library-audit"
+grep -q '^onedrive-daemon:$' "$scratch/library-audit"
+grep -q '^onedrive-desktop:$' "$scratch/library-audit"
+grep -q '^  HOST libgtk-4.so.1 ' "$scratch/library-audit"
+if grep -q '^  MISSING ' "$scratch/library-audit"; then
+    echo "AppDir has unresolved libraries" >&2
+    exit 1
+fi
+
+# A missing dependency must fail the audit, even if ldd still prints other libs.
+mkdir -p "$scratch/fake-bin"
+cat > "$scratch/fake-bin/ldd" <<'EOF'
+#!/bin/sh
+printf '\tlibmissing-for-smoke.so.1 => not found\n'
+printf '\tlibc.so.6 => /lib/libc.so.6 (0x1234)\n'
+EOF
+chmod +x "$scratch/fake-bin/ldd"
+if PATH="$scratch/fake-bin:$PATH" sh "$repo/scripts/audit-appdir-libs.sh" "$appdir" > "$scratch/missing-audit" 2>&1; then
+    echo "Library audit accepted an unresolved dependency" >&2
+    exit 1
+fi
+grep -q '^  MISSING libmissing-for-smoke.so.1$' "$scratch/missing-audit"
+
 if ONEDRIVE_APPDIR_PROFILE=dev sh "$repo/scripts/build-appdir.sh" "$appdir" >/dev/null 2>&1; then
     echo "AppDir builder overwrote an existing directory" >&2
     exit 1
