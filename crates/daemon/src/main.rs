@@ -3,6 +3,7 @@ mod graph;
 mod mount_record;
 mod transfer;
 mod virtual_drafts;
+mod virtual_upload;
 
 use auth::LoginAttempt;
 use graph::{
@@ -310,6 +311,175 @@ impl Daemon {
             .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))
     }
 
+    /// Explicit experimental transfer of one existing virtual-drive draft.
+    async fn run_virtual_draft_upload(&self, item_id: String) -> zbus::fdo::Result<String> {
+        if std::env::var("ONEDRIVE_EXPERIMENTAL_VIRTUAL_UPLOAD").as_deref() != Ok("1") {
+            return Err(zbus::fdo::Error::Failed(
+                "virtual draft upload is experimental and disabled".to_owned(),
+            ));
+        }
+        if item_id.is_empty() || self.sync_paused()? {
+            return Err(zbus::fdo::Error::Failed(
+                "invalid item or sync is paused".to_owned(),
+            ));
+        }
+        if self
+            .sync
+            .lock()
+            .unwrap()
+            .root()
+            .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?
+            .is_some()
+        {
+            return Err(zbus::fdo::Error::Failed(
+                "virtual upload cannot run while folder sync is configured".to_owned(),
+            ));
+        }
+        if self.virtual_mount.lock().unwrap().is_some()
+            || self.mount_in_progress.load(Ordering::SeqCst)
+        {
+            return Err(zbus::fdo::Error::Failed(
+                "unmount the virtual drive before uploading its draft".to_owned(),
+            ));
+        }
+        if self.scan_in_progress.load(Ordering::SeqCst)
+            || self.download_in_progress.load(Ordering::SeqCst)
+            || self
+                .upload_in_progress
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+        {
+            return Err(zbus::fdo::Error::Failed(
+                "transfer is already running".to_owned(),
+            ));
+        }
+        let _busy = BusyFlagGuard(Arc::clone(&self.upload_in_progress));
+        if self.virtual_mount.lock().unwrap().is_some()
+            || self.mount_in_progress.load(Ordering::SeqCst)
+        {
+            return Err(zbus::fdo::Error::Failed(
+                "unmount the virtual drive before uploading its draft".to_owned(),
+            ));
+        }
+        let (drive_id, draft) = {
+            let catalog = self.catalog.lock().unwrap();
+            let drive_id = catalog
+                .active_drive_id()
+                .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?
+                .ok_or_else(|| zbus::fdo::Error::Failed("OneDrive catalog is empty".to_owned()))?;
+            if !catalog
+                .is_complete(&drive_id)
+                .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?
+            {
+                return Err(zbus::fdo::Error::Failed("catalog is incomplete".to_owned()));
+            }
+            let root = state_directory()
+                .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?
+                .join("virtual-drafts");
+            let store = DraftStore::open(&root)
+                .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
+            let draft = store
+                .recover_item(&drive_id, &item_id)
+                .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?
+                .ok_or_else(|| zbus::fdo::Error::Failed("draft is missing".to_owned()))?;
+            let remote = catalog
+                .item(&drive_id, &item_id)
+                .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
+            if virtual_drafts::classify(draft.identity(), Some(&drive_id), true, remote.as_ref())
+                .status
+                != "ready"
+            {
+                return Err(zbus::fdo::Error::Failed(
+                    "draft needs review before upload".to_owned(),
+                ));
+            }
+            (drive_id, draft.identity().clone())
+        };
+        let client_id = client_id().ok_or_else(|| {
+            zbus::fdo::Error::Failed("ONEDRIVE_CLIENT_ID is not configured".to_owned())
+        })?;
+        let token = access_token(&client_id)
+            .await
+            .map_err(|_| zbus::fdo::Error::Failed("login is required".to_owned()))?;
+        let root = state_directory()
+            .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?
+            .join("virtual-drafts");
+        let snapshot =
+            tokio::task::spawn_blocking(move || DraftStore::open(&root)?.snapshot(&draft))
+                .await
+                .map_err(|_| zbus::fdo::Error::Failed("draft snapshot task failed".to_owned()))?
+                .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?
+                .ok_or_else(|| zbus::fdo::Error::Failed("draft is missing".to_owned()))?;
+        if snapshot.size == 0 {
+            return Err(zbus::fdo::Error::Failed(
+                "empty draft uploads are not supported yet".to_owned(),
+            ));
+        }
+        let graph = GraphClient::new()
+            .map_err(|_| zbus::fdo::Error::Failed("cannot create Graph client".to_owned()))?;
+        if !graph
+            .matches_remote_file_version(&drive_id, &item_id, &snapshot.identity.base_etag, &token)
+            .await
+            .map_err(|_| zbus::fdo::Error::Failed("cannot verify remote version".to_owned()))?
+        {
+            return Err(zbus::fdo::Error::Failed(
+                "remote file changed; local draft retained".to_owned(),
+            ));
+        }
+        let transport = GraphUpload::new(&graph, &drive_id, &token)
+            .map_err(|_| zbus::fdo::Error::Failed("cannot create upload transport".to_owned()))?;
+        let mut transfer_state = TransferStateGuard::start(&self.state);
+        let result = virtual_upload::upload_snapshot(&transport, &snapshot)
+            .await
+            .map_err(|_| {
+                zbus::fdo::Error::Failed("upload failed; local draft retained".to_owned())
+            })?;
+        let UploadStep::Complete {
+            etag: Some(uploaded_etag),
+            ..
+        } = result
+        else {
+            return Err(zbus::fdo::Error::Failed(
+                "upload result needs review; local draft retained".to_owned(),
+            ));
+        };
+        if !self
+            .catalog
+            .lock()
+            .unwrap()
+            .record_uploaded_version(
+                &drive_id,
+                &item_id,
+                &snapshot.identity.base_etag,
+                &uploaded_etag,
+                snapshot.size,
+            )
+            .map_err(|_| {
+                zbus::fdo::Error::Failed("catalog update failed; draft retained".to_owned())
+            })?
+        {
+            return Err(zbus::fdo::Error::Failed(
+                "catalog changed during upload; local draft retained".to_owned(),
+            ));
+        }
+        let root = state_directory()
+            .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?
+            .join("virtual-drafts");
+        let acknowledged =
+            tokio::task::spawn_blocking(move || DraftStore::open(&root)?.acknowledge(&snapshot))
+                .await
+                .map_err(|_| {
+                    zbus::fdo::Error::Failed("draft acknowledgement task failed".to_owned())
+                })?
+                .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
+        transfer_state.finish();
+        Ok(if acknowledged {
+            "uploaded".to_owned()
+        } else {
+            "uploaded-but-edited-locally".to_owned()
+        })
+    }
+
     /// Device status and optional unprivileged mount helper status.
     fn virtual_fuse_diagnostics(&self) -> (String, bool) {
         let device = match preflight::check_fuse_device() {
@@ -347,6 +517,9 @@ impl Daemon {
     }
 
     async fn mount_virtual_drive(&self, mount_path: &str) -> zbus::fdo::Result<String> {
+        if self.upload_in_progress.load(Ordering::SeqCst) {
+            return Err(zbus::fdo::Error::Failed("upload is running".to_owned()));
+        }
         let mount_path = PathBuf::from(mount_path);
         if !mount_path.is_absolute() {
             return Err(zbus::fdo::Error::InvalidArgs(
@@ -363,6 +536,9 @@ impl Daemon {
             ));
         }
         let _guard = BusyFlagGuard(Arc::clone(&self.mount_in_progress));
+        if self.upload_in_progress.load(Ordering::SeqCst) {
+            return Err(zbus::fdo::Error::Failed("upload is running".to_owned()));
+        }
         if self.virtual_mount.lock().unwrap().is_some() {
             return Err(zbus::fdo::Error::Failed(
                 "virtual drive is already mounted".to_owned(),

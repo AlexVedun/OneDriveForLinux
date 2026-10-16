@@ -390,6 +390,24 @@ impl Catalog {
             .optional()
             .map_err(Into::into)
     }
+
+    /// Reflect a confirmed upload without making an older local draft look ready again.
+    pub fn record_uploaded_version(
+        &self,
+        drive_id: &str,
+        item_id: &str,
+        expected_etag: &str,
+        uploaded_etag: &str,
+        size: u64,
+    ) -> Result<bool, CatalogError> {
+        let size = i64::try_from(size).map_err(|_| CatalogError::InvalidPage)?;
+        Ok(self.connection.execute(
+            "UPDATE remote_item SET etag = ?4, size = ?5
+             WHERE drive_id = ?1 AND item_id = ?2 AND etag = ?3
+               AND kind = 'file' AND deleted = 0",
+            params![drive_id, item_id, expected_etag, uploaded_etag, size],
+        )? == 1)
+    }
 }
 
 impl CatalogItem {
@@ -515,6 +533,32 @@ mod tests {
         assert_eq!(items[0].name.as_deref(), Some("before.txt"));
         assert_eq!(items[0].etag.as_deref(), Some("v1"));
         assert!(items[0].deleted);
+    }
+
+    #[test]
+    fn confirmed_upload_updates_only_matching_catalog_version() {
+        let mut catalog = Catalog::in_memory().unwrap();
+        catalog
+            .apply_page(
+                "drive",
+                &page(&format!(
+                    r#"{{"value":[{{"id":"item","name":"note.txt","file":{{}},"eTag":"old","size":3}}],"@odata.deltaLink":"{CURSOR}"}}"#
+                )),
+            )
+            .unwrap();
+        assert!(
+            !catalog
+                .record_uploaded_version("drive", "item", "wrong", "new", 4)
+                .unwrap()
+        );
+        assert!(
+            catalog
+                .record_uploaded_version("drive", "item", "old", "new", 4)
+                .unwrap()
+        );
+        let item = catalog.item("drive", "item").unwrap().unwrap();
+        assert_eq!(item.etag.as_deref(), Some("new"));
+        assert_eq!(item.size, Some(4));
     }
 
     #[test]

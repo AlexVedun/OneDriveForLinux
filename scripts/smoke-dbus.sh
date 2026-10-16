@@ -92,6 +92,12 @@ drafts=$(gdbus call --session \
     --object-path /io/github/onedrive_linux/Daemon \
     --method io.github.onedrive_linux.Daemon.VirtualDrafts)
 test "$drafts" = "('[]',)"
+if gdbus call --session \
+    --dest io.github.onedrive_linux.Daemon \
+    --object-path /io/github/onedrive_linux/Daemon \
+    --method io.github.onedrive_linux.Daemon.RunVirtualDraftUpload item >/dev/null 2>&1; then
+    exit 1
+fi
 fuse_diagnostics=$(gdbus call --session \
     --dest io.github.onedrive_linux.Daemon \
     --object-path /io/github/onedrive_linux/Daemon \
