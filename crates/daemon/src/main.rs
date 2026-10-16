@@ -260,6 +260,11 @@ fn virtual_request_for_item(
 
 #[zbus::interface(name = "io.github.onedrive_linux.Daemon")]
 impl Daemon {
+    /// UI capability flag only; RunVirtualDraftUpload repeats all safety checks.
+    fn virtual_draft_upload_enabled(&self) -> bool {
+        std::env::var("ONEDRIVE_EXPERIMENTAL_VIRTUAL_UPLOAD").as_deref() == Ok("1")
+    }
+
     fn virtual_draft_count(&self) -> zbus::fdo::Result<u64> {
         let root = state_directory()
             .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?
@@ -313,7 +318,7 @@ impl Daemon {
 
     /// Explicit experimental transfer of one existing virtual-drive draft.
     async fn run_virtual_draft_upload(&self, item_id: String) -> zbus::fdo::Result<String> {
-        if std::env::var("ONEDRIVE_EXPERIMENTAL_VIRTUAL_UPLOAD").as_deref() != Ok("1") {
+        if !self.virtual_draft_upload_enabled() {
             return Err(zbus::fdo::Error::Failed(
                 "virtual draft upload is experimental and disabled".to_owned(),
             ));

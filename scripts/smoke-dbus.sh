@@ -92,6 +92,11 @@ drafts=$(gdbus call --session \
     --object-path /io/github/onedrive_linux/Daemon \
     --method io.github.onedrive_linux.Daemon.VirtualDrafts)
 test "$drafts" = "('[]',)"
+upload_enabled=$(gdbus call --session \
+    --dest io.github.onedrive_linux.Daemon \
+    --object-path /io/github/onedrive_linux/Daemon \
+    --method io.github.onedrive_linux.Daemon.VirtualDraftUploadEnabled)
+test "$upload_enabled" = "(false,)"
 if gdbus call --session \
     --dest io.github.onedrive_linux.Daemon \
     --object-path /io/github/onedrive_linux/Daemon \

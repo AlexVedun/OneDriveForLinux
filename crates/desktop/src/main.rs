@@ -332,6 +332,19 @@ fn read_virtual_drafts() -> Result<Vec<UiVirtualDraft>, String> {
     serde_json::from_str(&json).map_err(|error| error.to_string())
 }
 
+fn read_virtual_draft_upload_enabled() -> Result<bool, String> {
+    daemon_call("VirtualDraftUploadEnabled").map_err(|error| error.to_string())
+}
+
+fn upload_virtual_draft(item_id: &str) -> Result<String, String> {
+    let connection = zbus::blocking::Connection::session().map_err(|error| error.to_string())?;
+    let proxy = zbus::blocking::Proxy::new(&connection, BUS_NAME, OBJECT_PATH, INTERFACE_NAME)
+        .map_err(|error| error.to_string())?;
+    proxy
+        .call("RunVirtualDraftUpload", &(item_id))
+        .map_err(|error| error.to_string())
+}
+
 fn virtual_draft_status_label(status: &str) -> &'static str {
     match status {
         "ready" => "версия в каталоге совпадает",
@@ -353,7 +366,7 @@ fn virtual_drafts_text(drafts: &[UiVirtualDraft]) -> String {
         .filter(|draft| draft.status != "ready")
         .count();
     let mut lines = vec![format!(
-        "Локально сохранено: {} · требуют внимания: {attention}. Отправка в OneDrive ещё не включена.",
+        "Локально сохранено: {} · требуют внимания: {attention}. Автоматическая отправка в OneDrive ещё не включена.",
         drafts.len()
     )];
     for draft in drafts
@@ -1149,6 +1162,115 @@ fn present_review_dialog(
     dialog.present();
 }
 
+fn present_virtual_drafts_dialog(
+    parent: &adw::ApplicationWindow,
+    controls: &VirtualMountControls,
+    drafts: Vec<UiVirtualDraft>,
+    upload_enabled: bool,
+) {
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    content.set_margin_start(18);
+    content.set_margin_end(18);
+    content.set_margin_top(18);
+    content.set_margin_bottom(18);
+    let hint = gtk::Label::new(Some(if upload_enabled {
+        "Отправка экспериментальная. Отключите виртуальный диск и папку синхронизации. Перед отправкой демон повторно проверит версию файла в OneDrive."
+    } else {
+        "Ручная отправка доступна после включения ONEDRIVE_EXPERIMENTAL_VIRTUAL_UPLOAD=1 для демона."
+    }));
+    hint.set_wrap(true);
+    hint.set_xalign(0.0);
+    content.append(&hint);
+    let result = gtk::Label::new(None);
+    result.set_xalign(0.0);
+    result.set_wrap(true);
+    result.set_selectable(true);
+    content.append(&result);
+    let rows = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    if drafts.is_empty() {
+        rows.append(&gtk::Label::new(Some("Локальных изменений нет")));
+    }
+    for draft in drafts {
+        let row = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        let name = draft.name.as_deref().unwrap_or(&draft.item_id);
+        let title = gtk::Label::new(Some(&format!("{name} ({})", draft.drive_id)));
+        title.set_xalign(0.0);
+        title.set_wrap(true);
+        title.set_selectable(true);
+        row.append(&title);
+        let state = gtk::Label::new(Some(virtual_draft_status_label(&draft.status)));
+        state.set_xalign(0.0);
+        row.append(&state);
+        if upload_enabled && draft.status == "ready" {
+            let send = gtk::Button::with_label("Отправить в OneDrive");
+            row.append(&send);
+            let item_id = draft.item_id;
+            let result = result.clone();
+            let controls = controls.clone();
+            let rows = rows.clone();
+            let row = row.clone();
+            let state = state.clone();
+            send.connect_clicked(move |button| {
+                button.set_sensitive(false);
+                result.set_text("Отправка черновика…");
+                let (sender, receiver) = std::sync::mpsc::channel();
+                let item_id = item_id.clone();
+                std::thread::spawn(move || {
+                    let _ = sender.send(upload_virtual_draft(&item_id));
+                });
+                let button = button.clone();
+                let result = result.clone();
+                let controls = controls.clone();
+                let rows = rows.clone();
+                let row = row.clone();
+                let state = state.clone();
+                gtk::glib::timeout_add_local(Duration::from_millis(100), move || {
+                    match receiver.try_recv() {
+                        Ok(Ok(outcome)) => {
+                            if outcome == "uploaded" {
+                                rows.remove(&row);
+                                result.set_text("Черновик отправлен.");
+                            } else {
+                                state.set_text("Файл отправлен, но появились новые локальные правки. Откройте список заново для проверки.");
+                                result.set_text("Новые локальные правки сохранены.");
+                            }
+                            controls.refresh();
+                        }
+                        Ok(Err(error)) => {
+                            result.set_text(&format!("Не удалось отправить черновик: {error}"));
+                            button.set_sensitive(true);
+                            controls.refresh();
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Empty) => {
+                            return gtk::glib::ControlFlow::Continue;
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            result.set_text("Не удалось получить результат отправки");
+                            button.set_sensitive(true);
+                        }
+                    }
+                    gtk::glib::ControlFlow::Break
+                });
+            });
+        }
+        rows.append(&row);
+    }
+    let scroll = gtk::ScrolledWindow::builder()
+        .child(&rows)
+        .vexpand(true)
+        .hexpand(true)
+        .build();
+    content.append(&scroll);
+    let dialog = gtk::Window::builder()
+        .transient_for(parent)
+        .title("Локальные изменения виртуального диска")
+        .default_width(700)
+        .default_height(460)
+        .child(&content)
+        .build();
+    dialog.present();
+}
+
 fn flatten_tree(items: Vec<UiItem>) -> Vec<(usize, UiItem)> {
     let active: HashMap<String, UiItem> = items
         .into_iter()
@@ -1368,6 +1490,7 @@ fn main() {
         let history = gtk::Button::with_label("Очередь и история");
         let mount = gtk::Button::with_label("Подключить виртуальный диск");
         let unmount = gtk::Button::with_label("Отключить виртуальный диск");
+        let show_drafts = gtk::Button::with_label("Все локальные изменения…");
         mount.set_sensitive(false);
         unmount.set_sensitive(false);
         let mount_label = gtk::Label::new(Some("Виртуальный диск: проверка состояния…"));
@@ -1424,6 +1547,7 @@ fn main() {
         let virtual_actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         virtual_actions.append(&mount);
         virtual_actions.append(&unmount);
+        virtual_actions.append(&show_drafts);
         virtual_controls.append(&virtual_actions);
         virtual_controls.append(&offline_label);
         virtual_controls.append(&offline_button);
@@ -1551,6 +1675,47 @@ fn main() {
         let controls_for_unmount = mount_controls.clone();
         unmount.connect_clicked(move |_| {
             controls_for_unmount.run(None, &status_for_unmount);
+        });
+        let window_for_drafts = window.clone();
+        let status_for_drafts = status.clone();
+        let controls_for_drafts = mount_controls.clone();
+        show_drafts.connect_clicked(move |button| {
+            button.set_sensitive(false);
+            status_for_drafts.set_text("Загрузка локальных изменений…");
+            let (sender, receiver) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = sender.send((read_virtual_drafts(), read_virtual_draft_upload_enabled()));
+            });
+            let button = button.clone();
+            let parent = window_for_drafts.clone();
+            let status = status_for_drafts.clone();
+            let controls = controls_for_drafts.clone();
+            gtk::glib::timeout_add_local(Duration::from_millis(100), move || {
+                let response = match receiver.try_recv() {
+                    Ok(response) => response,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        return gtk::glib::ControlFlow::Continue;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        status.set_text("Не удалось загрузить локальные изменения");
+                        button.set_sensitive(true);
+                        return gtk::glib::ControlFlow::Break;
+                    }
+                };
+                match response {
+                    (Ok(drafts), Ok(enabled)) => {
+                        present_virtual_drafts_dialog(&parent, &controls, drafts, enabled);
+                        status.set_text("Локальные изменения загружены");
+                    }
+                    (Err(error), _) | (_, Err(error)) => {
+                        status.set_text(&format!(
+                            "Не удалось загрузить локальные изменения: {error}"
+                        ));
+                    }
+                }
+                button.set_sensitive(true);
+                gtk::glib::ControlFlow::Break
+            });
         });
         let status_for_offline = status.clone();
         offline_button.connect_clicked(move |_| {
@@ -1810,7 +1975,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn virtual_drafts_show_conflicts_and_keep_upload_disabled() {
+    fn virtual_drafts_show_conflicts_and_manual_upload_summary() {
         let drafts: Vec<UiVirtualDraft> = serde_json::from_str(
             r#"[
               {"drive_id":"drive","item_id":"1","name":"note.txt","status":"ready"},
@@ -1822,7 +1987,7 @@ mod tests {
         assert!(text.contains("Локально сохранено: 2 · требуют внимания: 1"));
         assert!(text.contains("note.txt (drive) — версия в каталоге совпадает"));
         assert!(text.contains("2 (drive) — версия в каталоге изменилась"));
-        assert!(text.contains("Отправка в OneDrive ещё не включена"));
+        assert!(text.contains("Автоматическая отправка в OneDrive ещё не включена"));
     }
 
     #[test]
