@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=OneDrive for Linux
+Name[ru]=OneDrive для Linux
+Comment=OneDrive sync and virtual drive
+Comment[ru]=Синхронизация и виртуальный диск OneDrive
+Exec=onedrive-linux
+Icon=io.github.onedrive_linux
+Terminal=false
+Categories=Network;
+StartupNotify=true
