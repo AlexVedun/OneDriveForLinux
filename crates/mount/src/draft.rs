@@ -68,6 +68,35 @@ impl Drop for FileLock<'_> {
     }
 }
 
+struct StoreLock(File);
+
+impl Drop for StoreLock {
+    fn drop(&mut self) {
+        unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&self.0), libc::LOCK_UN) };
+    }
+}
+
+fn lock_store(root: &Path) -> io::Result<StoreLock> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(root.join(".store-lock"))?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid store lock",
+        ));
+    }
+    let result = unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&file), libc::LOCK_EX) };
+    if result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(StoreLock(file))
+}
+
 impl DraftStore {
     pub fn open(root: &Path) -> io::Result<Self> {
         match fs::create_dir(root) {
@@ -83,7 +112,40 @@ impl DraftStore {
             ));
         }
         fs::set_permissions(root, fs::Permissions::from_mode(0o700))?;
-        Ok(Self { root: root.into() })
+        let _lock = lock_store(root)?;
+        let store = Self { root: root.into() };
+        store.cleanup_uploaded()?;
+        Ok(store)
+    }
+
+    /// A marker is written only after Graph has confirmed the uploaded item.
+    fn cleanup_uploaded(&self) -> io::Result<()> {
+        for entry in fs::read_dir(&self.root)? {
+            let entry = entry?;
+            if entry.path().extension().is_none_or(|ext| ext != "uploaded") {
+                continue;
+            }
+            let identity = read_metadata(&entry.path())?;
+            identity.validate()?;
+            let (metadata_path, data_path) = self.paths(&identity);
+            if metadata_path.with_extension("uploaded") != entry.path() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "uploaded marker filename mismatch",
+                ));
+            }
+            if !metadata_path.exists() {
+                match fs::remove_file(data_path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
+                File::open(&self.root)?.sync_all()?;
+            }
+            fs::remove_file(entry.path())?;
+            File::open(&self.root)?.sync_all()?;
+        }
+        Ok(())
     }
 
     fn paths(&self, identity: &DraftIdentity) -> (PathBuf, PathBuf) {
@@ -121,6 +183,7 @@ impl DraftStore {
         input: Option<&File>,
     ) -> io::Result<DraftFile> {
         identity.validate()?;
+        let _store_lock = lock_store(&self.root)?;
         if let Some(existing) = self.recover(&identity)? {
             return Ok(existing);
         }
@@ -270,6 +333,7 @@ impl DraftStore {
 
     /// Forget only bytes that match the uploaded snapshot. A later edit stays local.
     pub fn acknowledge(&self, snapshot: &DraftSnapshot) -> io::Result<bool> {
+        let _store_lock = lock_store(&self.root)?;
         let Some(draft) = self.recover(&snapshot.identity)? else {
             return Ok(false);
         };
@@ -416,6 +480,46 @@ mod tests {
             draft.write_at(0, b"late").unwrap_err().kind(),
             io::ErrorKind::NotFound
         );
+    }
+
+    #[test]
+    fn reopening_finishes_interrupted_uploaded_cleanup() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("drafts");
+        let store = DraftStore::open(&root).unwrap();
+        let draft = store.begin_empty(identity()).unwrap();
+        draft.write_at(0, b"uploaded").unwrap();
+        let (metadata, data) = store.paths(&identity());
+        let marker = metadata.with_extension("uploaded");
+        fs::rename(&metadata, &marker).unwrap();
+        drop(draft);
+        drop(store);
+
+        let reopened = DraftStore::open(&root).unwrap();
+        assert!(reopened.list().unwrap().is_empty());
+        assert!(!data.exists());
+        assert!(!marker.exists());
+        let fresh = reopened.begin_empty(identity()).unwrap();
+        fresh.write_at(0, b"new").unwrap();
+        assert_eq!(reopened.list().unwrap(), vec![identity()]);
+    }
+
+    #[test]
+    fn reopening_finishes_cleanup_when_uploaded_data_is_already_gone() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("drafts");
+        let store = DraftStore::open(&root).unwrap();
+        store.begin_empty(identity()).unwrap();
+        let (metadata, data) = store.paths(&identity());
+        let marker = metadata.with_extension("uploaded");
+        fs::rename(&metadata, &marker).unwrap();
+        fs::remove_file(data).unwrap();
+        drop(store);
+
+        let reopened = DraftStore::open(&root).unwrap();
+        assert!(reopened.list().unwrap().is_empty());
+        assert!(!marker.exists());
+        assert!(reopened.begin_empty(identity()).is_ok());
     }
 
     #[test]
