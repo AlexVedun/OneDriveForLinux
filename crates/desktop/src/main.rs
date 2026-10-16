@@ -51,6 +51,14 @@ struct UiOperationHistory {
     operations: Vec<UiOperationSummary>,
 }
 
+#[derive(Debug, Deserialize)]
+struct UiVirtualDraft {
+    drive_id: String,
+    item_id: String,
+    name: Option<String>,
+    status: String,
+}
+
 #[derive(Deserialize)]
 struct UiOperationSummary {
     id: i64,
@@ -319,8 +327,52 @@ fn read_virtual_fuse_diagnostics() -> zbus::Result<(String, bool)> {
     daemon_call("VirtualFuseDiagnostics")
 }
 
-fn read_virtual_draft_count() -> zbus::Result<u64> {
-    daemon_call("VirtualDraftCount")
+fn read_virtual_drafts() -> Result<Vec<UiVirtualDraft>, String> {
+    let json: String = daemon_call("VirtualDrafts").map_err(|error| error.to_string())?;
+    serde_json::from_str(&json).map_err(|error| error.to_string())
+}
+
+fn virtual_draft_status_label(status: &str) -> &'static str {
+    match status {
+        "ready" => "версия в каталоге совпадает",
+        "other-drive" => "другая учётная запись или диск",
+        "catalog-incomplete" => "каталог ещё не сверён",
+        "remote-missing" => "файл отсутствует в каталоге",
+        "remote-not-file" => "объект больше не является файлом",
+        "remote-changed" => "версия в каталоге изменилась",
+        _ => "неизвестное состояние",
+    }
+}
+
+fn virtual_drafts_text(drafts: &[UiVirtualDraft]) -> String {
+    if drafts.is_empty() {
+        return "Локальных изменений для отправки нет".to_owned();
+    }
+    let attention = drafts
+        .iter()
+        .filter(|draft| draft.status != "ready")
+        .count();
+    let mut lines = vec![format!(
+        "Локально сохранено: {} · требуют внимания: {attention}. Отправка в OneDrive ещё не включена.",
+        drafts.len()
+    )];
+    for draft in drafts
+        .iter()
+        .filter(|draft| draft.status != "ready")
+        .chain(drafts.iter().filter(|draft| draft.status == "ready"))
+        .take(3)
+    {
+        let name = draft.name.as_deref().unwrap_or(&draft.item_id);
+        lines.push(format!(
+            "{name} ({}) — {}",
+            draft.drive_id,
+            virtual_draft_status_label(&draft.status)
+        ));
+    }
+    if drafts.len() > 3 {
+        lines.push(format!("И ещё {} локальных изменений", drafts.len() - 3));
+    }
+    lines.join("\n")
 }
 
 fn fuse_diagnostics_label(device: &str, helper: bool) -> &'static str {
@@ -688,12 +740,9 @@ impl VirtualMountControls {
         }
     }
 
-    fn show_drafts(&self, result: zbus::Result<u64>) {
+    fn show_drafts(&self, result: Result<Vec<UiVirtualDraft>, String>) {
         match result {
-            Ok(0) => self.drafts.set_text("Локальных изменений для отправки нет"),
-            Ok(count) => self.drafts.set_text(&format!(
-                "Локально сохранено: {count}. Отправка в OneDrive ещё не включена."
-            )),
+            Ok(drafts) => self.drafts.set_text(&virtual_drafts_text(&drafts)),
             Err(_) => self
                 .drafts
                 .set_text("Не удалось проверить локальные изменения"),
@@ -734,7 +783,7 @@ impl VirtualMountControls {
             let _ = sender.send((
                 virtual_mount_paths(),
                 read_virtual_fuse_diagnostics(),
-                read_virtual_draft_count(),
+                read_virtual_drafts(),
             ));
         });
         let controls = self.clone();
@@ -783,7 +832,7 @@ impl VirtualMountControls {
             };
             let path = virtual_mount_paths();
             let diagnostics = read_virtual_fuse_diagnostics();
-            let drafts = read_virtual_draft_count();
+            let drafts = read_virtual_drafts();
             let _ = sender.send((result, path, diagnostics, drafts));
         });
         let controls = self.clone();
@@ -1759,6 +1808,22 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn virtual_drafts_show_conflicts_and_keep_upload_disabled() {
+        let drafts: Vec<UiVirtualDraft> = serde_json::from_str(
+            r#"[
+              {"drive_id":"drive","item_id":"1","name":"note.txt","status":"ready"},
+              {"drive_id":"drive","item_id":"2","name":null,"status":"remote-changed"}
+            ]"#,
+        )
+        .unwrap();
+        let text = virtual_drafts_text(&drafts);
+        assert!(text.contains("Локально сохранено: 2 · требуют внимания: 1"));
+        assert!(text.contains("note.txt (drive) — версия в каталоге совпадает"));
+        assert!(text.contains("2 (drive) — версия в каталоге изменилась"));
+        assert!(text.contains("Отправка в OneDrive ещё не включена"));
+    }
 
     #[test]
     fn sync_folder_opening_requires_configured_canonical_directory() {
