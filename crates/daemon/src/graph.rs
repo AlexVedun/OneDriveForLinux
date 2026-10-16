@@ -880,6 +880,21 @@ impl GraphClient {
             .map_err(transport_fetch_error)
     }
 
+    pub async fn matches_remote_file_version(
+        &self,
+        drive_id: &str,
+        item_id: &str,
+        expected_etag: &str,
+        access_token: &str,
+    ) -> Result<bool, FetchError> {
+        let item = self.item_version(drive_id, item_id, access_token).await?;
+        Ok(
+            item.id == item_id
+                && item.etag.as_deref() == Some(expected_etag)
+                && item.file.is_some(),
+        )
+    }
+
     async fn content_response(
         &self,
         drive_id: &str,
