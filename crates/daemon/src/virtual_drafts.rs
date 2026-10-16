@@ -1,5 +1,5 @@
 use onedrive_catalog::CatalogItem;
-use onedrive_mount::draft::DraftIdentity;
+use onedrive_mount::draft::{DraftIdentity, DraftUploadIssue};
 use serde::Serialize;
 
 #[derive(Serialize)]
@@ -8,6 +8,7 @@ pub struct VirtualDraftStatus {
     pub item_id: String,
     pub name: Option<String>,
     pub status: &'static str,
+    pub last_upload_issue: Option<DraftUploadIssue>,
 }
 
 pub fn next_ready_item_id<'a>(
@@ -48,6 +49,7 @@ pub fn classify(
         item_id: draft.item_id.clone(),
         name: item.and_then(|item| item.name.clone()),
         status,
+        last_upload_issue: None,
     }
 }
 
