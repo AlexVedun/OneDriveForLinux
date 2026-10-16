@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::os::unix::fs::{FileExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -43,6 +43,29 @@ pub struct DraftStore {
 pub struct DraftFile {
     identity: DraftIdentity,
     file: File,
+}
+
+pub struct DraftSnapshot {
+    pub identity: DraftIdentity,
+    pub file: tempfile::NamedTempFile,
+    pub size: u64,
+    pub sha256: String,
+}
+
+fn lock_exclusive(file: &File) -> io::Result<FileLock<'_>> {
+    let result = unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(file), libc::LOCK_EX) };
+    if result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(FileLock(file))
+}
+
+struct FileLock<'a>(&'a File);
+
+impl Drop for FileLock<'_> {
+    fn drop(&mut self) {
+        unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(self.0), libc::LOCK_UN) };
+    }
 }
 
 impl DraftStore {
@@ -213,6 +236,71 @@ impl DraftStore {
         });
         Ok(drafts)
     }
+
+    /// Capture a stable copy while FUSE writes to this draft are serialized.
+    pub fn snapshot(&self, identity: &DraftIdentity) -> io::Result<Option<DraftSnapshot>> {
+        let Some(draft) = self.recover(identity)? else {
+            return Ok(None);
+        };
+        let _lock = lock_exclusive(&draft.file)?;
+        if draft.file.metadata()?.nlink() == 0 || self.recover(identity)?.is_none() {
+            return Ok(None);
+        }
+        let mut snapshot = tempfile::NamedTempFile::new_in(&self.root)?;
+        let mut hasher = Sha256::new();
+        let mut offset = 0_u64;
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let read = draft.file.read_at(&mut buffer, offset)?;
+            if read == 0 {
+                break;
+            }
+            snapshot.write_all(&buffer[..read])?;
+            hasher.update(&buffer[..read]);
+            offset += read as u64;
+        }
+        snapshot.as_file().sync_all()?;
+        Ok(Some(DraftSnapshot {
+            identity: draft.identity,
+            file: snapshot,
+            size: offset,
+            sha256: format!("{:x}", hasher.finalize()),
+        }))
+    }
+
+    /// Forget only bytes that match the uploaded snapshot. A later edit stays local.
+    pub fn acknowledge(&self, snapshot: &DraftSnapshot) -> io::Result<bool> {
+        let Some(draft) = self.recover(&snapshot.identity)? else {
+            return Ok(false);
+        };
+        let _lock = lock_exclusive(&draft.file)?;
+        if draft.file.metadata()?.nlink() == 0 || self.recover(&snapshot.identity)?.is_none() {
+            return Ok(false);
+        }
+        let mut hasher = Sha256::new();
+        let mut offset = 0_u64;
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let read = draft.file.read_at(&mut buffer, offset)?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+            offset += read as u64;
+        }
+        if offset != snapshot.size || format!("{:x}", hasher.finalize()) != snapshot.sha256 {
+            return Ok(false);
+        }
+        let (metadata_path, data_path) = self.paths(&snapshot.identity);
+        let uploaded_path = metadata_path.with_extension("uploaded");
+        fs::rename(&metadata_path, &uploaded_path)?;
+        File::open(&self.root)?.sync_all()?;
+        fs::remove_file(data_path)?;
+        File::open(&self.root)?.sync_all()?;
+        fs::remove_file(uploaded_path)?;
+        File::open(&self.root)?.sync_all()?;
+        Ok(true)
+    }
 }
 
 fn read_metadata(path: &Path) -> io::Result<DraftIdentity> {
@@ -247,6 +335,10 @@ impl DraftFile {
     }
 
     pub fn set_len(&self, size: u64) -> io::Result<()> {
+        let _lock = lock_exclusive(&self.file)?;
+        if self.file.metadata()?.nlink() == 0 {
+            return Err(io::Error::from(io::ErrorKind::NotFound));
+        }
         self.file.set_len(size)?;
         self.file.sync_all()
     }
@@ -261,6 +353,10 @@ impl DraftFile {
 
     /// A successful write is durably stored locally; upload is a separate step.
     pub fn write_at(&self, offset: u64, bytes: &[u8]) -> io::Result<usize> {
+        let _lock = lock_exclusive(&self.file)?;
+        if self.file.metadata()?.nlink() == 0 {
+            return Err(io::Error::from(io::ErrorKind::NotFound));
+        }
         let length =
             u64::try_from(bytes.len()).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
         if offset
@@ -296,6 +392,30 @@ mod tests {
             item_id: "file".into(),
             base_etag: "v1".into(),
         }
+    }
+
+    #[test]
+    fn uploaded_snapshot_only_removes_unchanged_draft() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = DraftStore::open(&temporary.path().join("drafts")).unwrap();
+        let draft = store.begin_empty(identity()).unwrap();
+        draft.write_at(0, b"first").unwrap();
+        let snapshot = store.snapshot(&identity()).unwrap().unwrap();
+        assert_eq!(snapshot.size, 5);
+        assert_eq!(fs::read(snapshot.file.path()).unwrap(), b"first");
+
+        draft.write_at(0, b"later").unwrap();
+        assert!(!store.acknowledge(&snapshot).unwrap());
+        assert_eq!(store.list().unwrap(), vec![identity()]);
+        assert_eq!(fs::read(snapshot.file.path()).unwrap(), b"first");
+
+        let latest = store.snapshot(&identity()).unwrap().unwrap();
+        assert!(store.acknowledge(&latest).unwrap());
+        assert!(store.list().unwrap().is_empty());
+        assert_eq!(
+            draft.write_at(0, b"late").unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
     }
 
     #[test]
