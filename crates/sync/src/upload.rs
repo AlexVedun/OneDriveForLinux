@@ -59,6 +59,10 @@ pub trait UploadTransport {
         total: u64,
         bytes: Vec<u8>,
     ) -> Result<UploadStep, UploadError>;
+
+    async fn upload_empty(&self, _operation: &QueuedOperation) -> Result<UploadStep, UploadError> {
+        Err(UploadError::InvalidResponse)
+    }
 }
 
 pub async fn upload_queued<T: UploadTransport>(

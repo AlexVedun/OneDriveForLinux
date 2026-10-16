@@ -7,7 +7,7 @@ use onedrive_sync::QueuedOperation;
 use onedrive_sync::upload::{UploadError, UploadStep, UploadTransport};
 use reqwest::{
     Client, StatusCode,
-    header::{CONTENT_RANGE, IF_MATCH, RETRY_AFTER},
+    header::{CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, IF_MATCH, RETRY_AFTER},
 };
 use serde::Deserialize;
 use std::path::Path;
@@ -45,6 +45,22 @@ struct UploadedItem {
     id: String,
     #[serde(rename = "eTag")]
     etag: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct UploadedEmptyItem {
+    id: String,
+    #[serde(rename = "eTag")]
+    etag: Option<String>,
+    size: Option<u64>,
+    file: Option<serde_json::Value>,
+}
+
+fn empty_upload_matches(item: &UploadedEmptyItem, expected_id: &str) -> bool {
+    item.id == expected_id
+        && item.etag.as_ref().is_some_and(|etag| !etag.is_empty())
+        && item.size == Some(0)
+        && item.file.is_some()
 }
 
 #[derive(Deserialize)]
@@ -262,6 +278,37 @@ impl<'a> GraphUpload<'a> {
         }
     }
 
+    fn empty_upload_request(
+        &self,
+        operation: &QueuedOperation,
+    ) -> Result<reqwest::Request, UploadError> {
+        if operation.kind != "UploadChanged" {
+            return Err(UploadError::InvalidResponse);
+        }
+        let item_id = operation
+            .remote_id
+            .as_deref()
+            .filter(|item_id| !item_id.is_empty())
+            .ok_or(UploadError::InvalidResponse)?;
+        let etag = operation
+            .expected_etag
+            .as_deref()
+            .filter(|etag| !etag.is_empty())
+            .ok_or(UploadError::InvalidResponse)?;
+        let url =
+            item_content_url(self.drive_id, item_id).map_err(|_| UploadError::InvalidResponse)?;
+        self.graph
+            .http
+            .put(url)
+            .bearer_auth(self.access_token)
+            .header(IF_MATCH, etag)
+            .header(CONTENT_TYPE, "application/octet-stream")
+            .header(CONTENT_LENGTH, "0")
+            .body(Vec::<u8>::new())
+            .build()
+            .map_err(|_| UploadError::InvalidResponse)
+    }
+
     fn range_request(
         &self,
         upload_url: &str,
@@ -447,6 +494,33 @@ impl UploadTransport for GraphUpload<'_> {
             }
             _ => Err(upload_error(response).await),
         }
+    }
+
+    async fn upload_empty(&self, operation: &QueuedOperation) -> Result<UploadStep, UploadError> {
+        let item_id = operation
+            .remote_id
+            .as_deref()
+            .ok_or(UploadError::InvalidResponse)?;
+        let response = self
+            .graph
+            .http
+            .execute(self.empty_upload_request(operation)?)
+            .await
+            .map_err(|_| UploadError::Transient)?;
+        if !matches!(response.status(), StatusCode::OK | StatusCode::CREATED) {
+            return Err(upload_error(response).await);
+        }
+        let item: UploadedEmptyItem = response
+            .json()
+            .await
+            .map_err(|_| UploadError::InvalidResponse)?;
+        if !empty_upload_matches(&item, item_id) {
+            return Err(UploadError::InvalidResponse);
+        }
+        Ok(UploadStep::Complete {
+            remote_id: item.id,
+            etag: item.etag,
+        })
     }
 }
 
@@ -1153,6 +1227,43 @@ mod tests {
             item_metadata_url("drive", "item").unwrap().path(),
             "/v1.0/drives/drive/items/item"
         );
+    }
+
+    #[test]
+    fn empty_upload_is_conditional_and_requires_confirmed_empty_file() {
+        let graph = GraphClient::new().unwrap();
+        let upload = GraphUpload::new(&graph, "drive", "test-token").unwrap();
+        let operation = QueuedOperation {
+            id: 0,
+            kind: "UploadChanged".into(),
+            path: String::new(),
+            from_path: None,
+            remote_id: Some("item".into()),
+            expected_etag: Some("v1".into()),
+            local_fingerprint: None,
+            attempts: 0,
+        };
+        let request = upload.empty_upload_request(&operation).unwrap();
+        assert_eq!(request.method(), reqwest::Method::PUT);
+        assert_eq!(
+            request.url().path(),
+            "/v1.0/drives/drive/items/item/content"
+        );
+        assert_eq!(request.headers()[IF_MATCH], "v1");
+        assert_eq!(request.headers()[CONTENT_LENGTH], "0");
+        assert!(request.headers().contains_key(AUTHORIZATION));
+        assert_eq!(request.body().unwrap().as_bytes().unwrap(), b"");
+        let item: UploadedEmptyItem = serde_json::from_value(serde_json::json!({
+            "id": "item", "eTag": "v2", "size": 0, "file": {}
+        }))
+        .unwrap();
+        assert!(empty_upload_matches(&item, "item"));
+        assert!(!empty_upload_matches(&item, "other"));
+        let missing_etag: UploadedEmptyItem = serde_json::from_value(serde_json::json!({
+            "id": "item", "size": 0, "file": {}
+        }))
+        .unwrap();
+        assert!(!empty_upload_matches(&missing_etag, "item"));
     }
 
     #[test]

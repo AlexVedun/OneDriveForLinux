@@ -12,9 +12,6 @@ pub async fn upload_snapshot<T: UploadTransport>(
     store: &DraftStore,
     snapshot: &DraftSnapshot,
 ) -> Result<UploadStep, UploadError> {
-    if snapshot.size == 0 {
-        return Err(UploadError::InvalidResponse);
-    }
     let operation = QueuedOperation {
         id: 0,
         kind: "UploadChanged".to_owned(),
@@ -25,6 +22,19 @@ pub async fn upload_snapshot<T: UploadTransport>(
         local_fingerprint: Some(snapshot.sha256.clone()),
         attempts: 0,
     };
+    if snapshot.size == 0 {
+        store.clear_upload_checkpoint(&snapshot.identity)?;
+        let result = transport.upload_empty(&operation).await?;
+        return match result {
+            UploadStep::Complete { remote_id, etag }
+                if remote_id == snapshot.identity.item_id
+                    && etag.as_ref().is_some_and(|etag| !etag.is_empty()) =>
+            {
+                Ok(UploadStep::Complete { remote_id, etag })
+            }
+            _ => Err(UploadError::InvalidResponse),
+        };
+    }
     let previous = store.upload_checkpoint(&snapshot.identity)?;
     let mut checkpoint = if let Some(mut previous) = previous {
         if previous.sha256 == snapshot.sha256
@@ -277,5 +287,87 @@ mod tests {
             store.upload_checkpoint(&identity).unwrap().unwrap().sha256,
             snapshot.sha256
         );
+    }
+
+    struct EmptyTransport {
+        remote_id: String,
+    }
+
+    impl UploadTransport for EmptyTransport {
+        async fn create_session(&self, _: &QueuedOperation, _: u64) -> Result<String, UploadError> {
+            unreachable!()
+        }
+
+        async fn session_offset(&self, _: &str) -> Result<u64, UploadError> {
+            unreachable!()
+        }
+
+        async fn send_range(
+            &self,
+            _: &str,
+            _: u64,
+            _: u64,
+            _: Vec<u8>,
+        ) -> Result<UploadStep, UploadError> {
+            unreachable!()
+        }
+
+        async fn upload_empty(
+            &self,
+            operation: &QueuedOperation,
+        ) -> Result<UploadStep, UploadError> {
+            assert_eq!(operation.kind, "UploadChanged");
+            assert_eq!(operation.expected_etag.as_deref(), Some("old"));
+            Ok(UploadStep::Complete {
+                remote_id: self.remote_id.clone(),
+                etag: Some("new".into()),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_draft_uses_direct_upload_and_discards_old_session() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = DraftStore::open(&temporary.path().join("drafts")).unwrap();
+        let identity = DraftIdentity {
+            drive_id: "drive".into(),
+            item_id: "item".into(),
+            base_etag: "old".into(),
+        };
+        store.begin_empty(identity.clone()).unwrap();
+        let snapshot = store.snapshot(&identity).unwrap().unwrap();
+        assert_eq!(snapshot.size, 0);
+        store
+            .save_upload_checkpoint(&DraftUploadCheckpoint {
+                identity: identity.clone(),
+                sha256: "f".repeat(64),
+                size: 1,
+                upload_url: "https://upload.example/old".into(),
+                next_offset: 0,
+            })
+            .unwrap();
+        assert!(matches!(
+            upload_snapshot(
+                &EmptyTransport {
+                    remote_id: "item".into()
+                },
+                &store,
+                &snapshot,
+            )
+            .await,
+            Ok(UploadStep::Complete { .. })
+        ));
+        assert!(store.upload_checkpoint(&identity).unwrap().is_none());
+        assert!(matches!(
+            upload_snapshot(
+                &EmptyTransport {
+                    remote_id: "wrong".into()
+                },
+                &store,
+                &snapshot,
+            )
+            .await,
+            Err(UploadError::InvalidResponse)
+        ));
     }
 }
