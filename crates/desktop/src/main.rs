@@ -57,6 +57,7 @@ struct UiVirtualDraft {
     item_id: String,
     name: Option<String>,
     status: String,
+    last_upload_issue: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -366,6 +367,15 @@ fn virtual_draft_status_label(status: &str) -> &'static str {
     }
 }
 
+fn virtual_draft_upload_issue_label(issue: &str) -> &'static str {
+    match issue {
+        "login-required" => "нужен повторный вход",
+        "remote-changed" => "облачный файл изменился",
+        "transfer-failed" => "ошибка передачи",
+        _ => "ошибка отправки",
+    }
+}
+
 fn virtual_drafts_text(drafts: &[UiVirtualDraft]) -> String {
     if drafts.is_empty() {
         return "Локальных изменений для отправки нет".to_owned();
@@ -374,8 +384,12 @@ fn virtual_drafts_text(drafts: &[UiVirtualDraft]) -> String {
         .iter()
         .filter(|draft| draft.status != "ready")
         .count();
+    let failed = drafts
+        .iter()
+        .filter(|draft| draft.last_upload_issue.is_some())
+        .count();
     let mut lines = vec![format!(
-        "Локально сохранено: {} · требуют внимания: {attention}. Откройте полный список для проверки.",
+        "Локально сохранено: {} · требуют внимания: {attention} · ошибки отправки: {failed}. Откройте полный список для проверки.",
         drafts.len()
     )];
     for draft in drafts
@@ -390,6 +404,12 @@ fn virtual_drafts_text(drafts: &[UiVirtualDraft]) -> String {
             draft.drive_id,
             virtual_draft_status_label(&draft.status)
         ));
+        if let Some(issue) = &draft.last_upload_issue {
+            lines.push(format!(
+                "Предыдущая фоновая отправка: {}",
+                virtual_draft_upload_issue_label(issue)
+            ));
+        }
     }
     if drafts.len() > 3 {
         lines.push(format!("И ещё {} локальных изменений", drafts.len() - 3));
@@ -1210,6 +1230,15 @@ fn present_virtual_drafts_dialog(
         let state = gtk::Label::new(Some(virtual_draft_status_label(&draft.status)));
         state.set_xalign(0.0);
         row.append(&state);
+        if let Some(issue) = &draft.last_upload_issue {
+            let warning = gtk::Label::new(Some(&format!(
+                "Предыдущая фоновая отправка: {}. Черновик сохранён локально.",
+                virtual_draft_upload_issue_label(issue)
+            )));
+            warning.set_xalign(0.0);
+            warning.set_wrap(true);
+            row.append(&warning);
+        }
         let export = gtk::Button::with_label("Сохранить локальную копию…");
         row.append(&export);
         let export_drive_id = draft.drive_id.clone();
@@ -2038,13 +2067,15 @@ mod tests {
     fn virtual_drafts_show_conflicts_and_manual_upload_summary() {
         let drafts: Vec<UiVirtualDraft> = serde_json::from_str(
             r#"[
-              {"drive_id":"drive","item_id":"1","name":"note.txt","status":"ready"},
+              {"drive_id":"drive","item_id":"1","name":"note.txt","status":"ready","last_upload_issue":"transfer-failed"},
               {"drive_id":"drive","item_id":"2","name":null,"status":"remote-changed"}
             ]"#,
         )
         .unwrap();
         let text = virtual_drafts_text(&drafts);
         assert!(text.contains("Локально сохранено: 2 · требуют внимания: 1"));
+        assert!(text.contains("ошибки отправки: 1"));
+        assert!(text.contains("Предыдущая фоновая отправка: ошибка передачи"));
         assert!(text.contains("note.txt (drive) — версия в каталоге совпадает"));
         assert!(text.contains("2 (drive) — версия в каталоге изменилась"));
         assert!(text.contains("Откройте полный список для проверки"));

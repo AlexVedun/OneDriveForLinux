@@ -62,6 +62,22 @@ pub struct DraftUploadCheckpoint {
     pub next_offset: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DraftUploadIssue {
+    LoginRequired,
+    RemoteChanged,
+    TransferFailed,
+    Other,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DraftUploadFailure {
+    pub identity: DraftIdentity,
+    pub issue: DraftUploadIssue,
+    pub attempted_at_unix: u64,
+}
+
 impl std::fmt::Debug for DraftUploadCheckpoint {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -188,6 +204,11 @@ impl DraftStore {
                     Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                     Err(error) => return Err(error),
                 }
+                match fs::remove_file(self.failure_path(&identity)) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
             }
             fs::remove_file(entry.path())?;
             File::open(&self.root)?.sync_all()?;
@@ -205,6 +226,69 @@ impl DraftStore {
 
     fn checkpoint_path(&self, identity: &DraftIdentity) -> PathBuf {
         self.root.join(format!("{}.session", identity.key()))
+    }
+
+    fn failure_path(&self, identity: &DraftIdentity) -> PathBuf {
+        self.root.join(format!("{}.failure", identity.key()))
+    }
+
+    pub fn upload_failure(
+        &self,
+        identity: &DraftIdentity,
+    ) -> io::Result<Option<DraftUploadFailure>> {
+        identity.validate()?;
+        let mut file = match OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(self.failure_path(identity))
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || metadata.len() > 4096 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid upload failure",
+            ));
+        }
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        let failure: DraftUploadFailure = serde_json::from_slice(&bytes)?;
+        if failure.identity != *identity {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "upload failure identity mismatch",
+            ));
+        }
+        Ok(Some(failure))
+    }
+
+    pub fn save_upload_failure(&self, failure: &DraftUploadFailure) -> io::Result<()> {
+        failure.identity.validate()?;
+        let _lock = lock_store(&self.root)?;
+        if self.recover(&failure.identity)?.is_none() {
+            return Err(io::Error::from(io::ErrorKind::NotFound));
+        }
+        let mut temporary = tempfile::NamedTempFile::new_in(&self.root)?;
+        serde_json::to_writer(&mut temporary, failure)?;
+        temporary.flush()?;
+        temporary.as_file().sync_all()?;
+        temporary
+            .persist(self.failure_path(&failure.identity))
+            .map_err(|error| error.error)?;
+        File::open(&self.root)?.sync_all()
+    }
+
+    pub fn clear_upload_failure(&self, identity: &DraftIdentity) -> io::Result<()> {
+        identity.validate()?;
+        let _lock = lock_store(&self.root)?;
+        match fs::remove_file(self.failure_path(identity)) {
+            Ok(()) => File::open(&self.root)?.sync_all(),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 
     pub fn upload_checkpoint(
@@ -511,6 +595,11 @@ impl DraftStore {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
+        match fs::remove_file(self.failure_path(&snapshot.identity)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
         fs::remove_file(uploaded_path)?;
         File::open(&self.root)?.sync_all()?;
         Ok(true)
@@ -606,6 +695,38 @@ mod tests {
             item_id: "file".into(),
             base_etag: "v1".into(),
         }
+    }
+
+    #[test]
+    fn upload_failure_survives_restart_and_clears_after_acknowledgement() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("drafts");
+        let store = DraftStore::open(&root).unwrap();
+        let draft = store.begin_empty(identity()).unwrap();
+        draft.write_at(0, b"local").unwrap();
+        let failure = DraftUploadFailure {
+            identity: identity(),
+            issue: DraftUploadIssue::TransferFailed,
+            attempted_at_unix: 123,
+        };
+        store.save_upload_failure(&failure).unwrap();
+        let path = store.failure_path(&identity());
+        assert_eq!(
+            fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let reopened = DraftStore::open(&root).unwrap();
+        assert_eq!(
+            reopened.upload_failure(&identity()).unwrap(),
+            Some(failure.clone())
+        );
+        reopened.clear_upload_failure(&identity()).unwrap();
+        assert!(reopened.upload_failure(&identity()).unwrap().is_none());
+        assert_eq!(reopened.list().unwrap(), vec![identity()]);
+        reopened.save_upload_failure(&failure).unwrap();
+        let snapshot = reopened.snapshot(&identity()).unwrap().unwrap();
+        assert!(reopened.acknowledge(&snapshot).unwrap());
+        assert!(reopened.upload_failure(&identity()).unwrap().is_none());
     }
 
     #[test]

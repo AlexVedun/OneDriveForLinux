@@ -16,7 +16,11 @@ use onedrive_cache::{CacheError, CacheStore};
 use onedrive_catalog::{Catalog, CatalogItem, FetchError};
 use onedrive_core::{BUS_NAME, EngineState, OBJECT_PATH};
 use onedrive_mount::{DownloadRequest, VirtualTree};
-use onedrive_mount::{draft::DraftStore, fuse::VirtualFuse, preflight};
+use onedrive_mount::{
+    draft::{DraftStore, DraftUploadFailure, DraftUploadIssue},
+    fuse::VirtualFuse,
+    preflight,
+};
 use onedrive_sync::{
     Action, Baseline, QueuedOperation, SyncStore,
     folders::local_directory_exists,
@@ -270,8 +274,10 @@ impl Daemon {
         let root = state_directory()
             .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?
             .join("virtual-drafts");
-        let drafts = DraftStore::open(&root)
-            .and_then(|store| store.list())
+        let store =
+            DraftStore::open(&root).map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
+        let drafts = store
+            .list()
             .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
         let catalog = self.catalog.lock().unwrap();
         let active_drive = catalog
@@ -293,17 +299,22 @@ impl Daemon {
                 } else {
                     None
                 };
-                Ok(virtual_drafts::classify(
+                let mut status = virtual_drafts::classify(
                     draft,
                     active_drive.as_deref(),
                     complete,
                     item.as_ref(),
-                ))
+                );
+                status.last_upload_issue = store
+                    .upload_failure(draft)
+                    .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?
+                    .map(|failure| failure.issue);
+                Ok(status)
             })
             .collect::<zbus::fdo::Result<Vec<_>>>()
     }
 
-    fn virtual_auto_upload_candidate(&self, after: Option<&str>) -> Option<String> {
+    fn virtual_auto_upload_candidate(&self, after: Option<&str>) -> Option<(String, String)> {
         if !self.virtual_draft_auto_upload_enabled()
             || !matches!(
                 *self.state.lock().unwrap(),
@@ -320,7 +331,11 @@ impl Daemon {
             return None;
         }
         let statuses = self.virtual_draft_statuses().ok()?;
-        virtual_drafts::next_ready_item_id(&statuses, after).map(str::to_owned)
+        let item_id = virtual_drafts::next_ready_item_id(&statuses, after)?;
+        statuses
+            .iter()
+            .find(|draft| draft.item_id == item_id && draft.status == "ready")
+            .map(|draft| (draft.drive_id.clone(), draft.item_id.clone()))
     }
 }
 
@@ -542,6 +557,13 @@ impl Daemon {
         checkpoint_store
             .clear_upload_checkpoint(&completed_identity)
             .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
+        if !acknowledged
+            && checkpoint_store
+                .clear_upload_failure(&completed_identity)
+                .is_err()
+        {
+            eprintln!("cannot clear previous virtual draft upload failure");
+        }
         transfer_state.finish();
         Ok(if acknowledged {
             "uploaded".to_owned()
@@ -3013,14 +3035,59 @@ async fn poll_virtual_drafts(daemon: Daemon) {
     let mut last_attempted = None;
     loop {
         interval.tick().await;
-        let Some(item_id) = daemon.virtual_auto_upload_candidate(last_attempted.as_deref()) else {
+        let Some((drive_id, item_id)) =
+            daemon.virtual_auto_upload_candidate(last_attempted.as_deref())
+        else {
             continue;
         };
         last_attempted = Some(item_id.clone());
-        if daemon.run_virtual_draft_upload(item_id).await.is_err() {
+        if let Err(error) = daemon.run_virtual_draft_upload(item_id.clone()).await {
+            let issue = virtual_upload_issue(&error);
+            let result = tokio::task::spawn_blocking(move || {
+                record_virtual_upload_failure(&drive_id, &item_id, issue)
+            })
+            .await;
+            if !matches!(result, Ok(Ok(()))) {
+                eprintln!("cannot record automatic virtual draft upload failure");
+            }
             eprintln!("automatic virtual draft upload failed; local draft retained");
         }
     }
+}
+
+fn virtual_upload_issue(error: &zbus::fdo::Error) -> DraftUploadIssue {
+    let message = error.to_string();
+    if message.contains("login is required") {
+        DraftUploadIssue::LoginRequired
+    } else if message.contains("remote file changed") {
+        DraftUploadIssue::RemoteChanged
+    } else if message.contains("upload failed") {
+        DraftUploadIssue::TransferFailed
+    } else {
+        DraftUploadIssue::Other
+    }
+}
+
+fn record_virtual_upload_failure(
+    drive_id: &str,
+    item_id: &str,
+    issue: DraftUploadIssue,
+) -> io::Result<()> {
+    let root = state_directory()
+        .map_err(|_| io::Error::other("cannot access state directory"))?
+        .join("virtual-drafts");
+    let store = DraftStore::open(&root)?;
+    let Some(draft) = store.recover_item(drive_id, item_id)? else {
+        return Ok(());
+    };
+    store.save_upload_failure(&DraftUploadFailure {
+        identity: draft.identity().clone(),
+        issue,
+        attempted_at_unix: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    })
 }
 
 fn state_directory() -> Result<PathBuf, Box<dyn std::error::Error>> {
@@ -3133,15 +3200,37 @@ mod tests {
         VirtualDownloadContext, client_id_from_dotenv, client_id_from_sources,
         inspect_virtual_cache, is_network_failure, local_delete_candidate, prepare_virtual_request,
         publish_virtual_file, remote_delete_candidate, remote_folder_candidate,
-        remote_rename_candidate, scan_outcome_state,
+        remote_rename_candidate, scan_outcome_state, virtual_upload_issue,
     };
     use onedrive_cache::{CacheError, CacheStore};
     use onedrive_catalog::{Catalog, DeltaPage};
     use onedrive_core::EngineState;
-    use onedrive_mount::DownloadRequest;
+    use onedrive_mount::{DownloadRequest, draft::DraftUploadIssue};
     use std::fs;
     use std::io;
     use std::sync::{Arc, Mutex, atomic::AtomicBool};
+
+    #[test]
+    fn upload_failure_record_uses_only_known_codes() {
+        assert_eq!(
+            virtual_upload_issue(&zbus::fdo::Error::Failed("login is required".into())),
+            DraftUploadIssue::LoginRequired
+        );
+        assert_eq!(
+            virtual_upload_issue(&zbus::fdo::Error::Failed("remote file changed".into())),
+            DraftUploadIssue::RemoteChanged
+        );
+        assert_eq!(
+            virtual_upload_issue(&zbus::fdo::Error::Failed(
+                "upload failed; secret URL".into()
+            )),
+            DraftUploadIssue::TransferFailed
+        );
+        assert_eq!(
+            virtual_upload_issue(&zbus::fdo::Error::Failed("unexpected secret URL".into())),
+            DraftUploadIssue::Other
+        );
+    }
 
     #[test]
     fn queued_folder_is_rechecked_before_graph_write() {
