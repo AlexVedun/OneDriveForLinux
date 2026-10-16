@@ -52,6 +52,48 @@ pub struct DraftSnapshot {
     pub sha256: String,
 }
 
+/// The URL authorizes writes without a bearer token and must stay private.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DraftUploadCheckpoint {
+    pub identity: DraftIdentity,
+    pub sha256: String,
+    pub size: u64,
+    pub upload_url: String,
+    pub next_offset: u64,
+}
+
+impl std::fmt::Debug for DraftUploadCheckpoint {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DraftUploadCheckpoint")
+            .field("identity", &self.identity)
+            .field("sha256", &self.sha256)
+            .field("size", &self.size)
+            .field("upload_url", &"[redacted]")
+            .field("next_offset", &self.next_offset)
+            .finish()
+    }
+}
+
+impl DraftUploadCheckpoint {
+    fn validate(&self) -> io::Result<()> {
+        self.identity.validate()?;
+        if self.size == 0
+            || self.next_offset >= self.size
+            || self.sha256.len() != 64
+            || !self.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || !self.upload_url.starts_with("https://")
+            || self.upload_url.len() > 16 * 1024
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid draft upload checkpoint",
+            ));
+        }
+        Ok(())
+    }
+}
+
 fn lock_exclusive(file: &File) -> io::Result<FileLock<'_>> {
     let result = unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(file), libc::LOCK_EX) };
     if result != 0 {
@@ -141,6 +183,11 @@ impl DraftStore {
                     Err(error) => return Err(error),
                 }
                 File::open(&self.root)?.sync_all()?;
+                match fs::remove_file(self.checkpoint_path(&identity)) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
             }
             fs::remove_file(entry.path())?;
             File::open(&self.root)?.sync_all()?;
@@ -154,6 +201,70 @@ impl DraftStore {
             self.root.join(format!("{key}.json")),
             self.root.join(format!("{key}.data")),
         )
+    }
+
+    fn checkpoint_path(&self, identity: &DraftIdentity) -> PathBuf {
+        self.root.join(format!("{}.session", identity.key()))
+    }
+
+    pub fn upload_checkpoint(
+        &self,
+        identity: &DraftIdentity,
+    ) -> io::Result<Option<DraftUploadCheckpoint>> {
+        identity.validate()?;
+        let path = self.checkpoint_path(identity);
+        let mut file = match OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || metadata.len() > 32 * 1024 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid checkpoint file",
+            ));
+        }
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        let checkpoint: DraftUploadCheckpoint = serde_json::from_slice(&bytes)?;
+        checkpoint.validate()?;
+        if checkpoint.identity.drive_id != identity.drive_id
+            || checkpoint.identity.item_id != identity.item_id
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "draft checkpoint identity mismatch",
+            ));
+        }
+        Ok(Some(checkpoint))
+    }
+
+    pub fn save_upload_checkpoint(&self, checkpoint: &DraftUploadCheckpoint) -> io::Result<()> {
+        checkpoint.validate()?;
+        let _lock = lock_store(&self.root)?;
+        let mut temporary = tempfile::NamedTempFile::new_in(&self.root)?;
+        serde_json::to_writer(&mut temporary, checkpoint)?;
+        temporary.flush()?;
+        temporary.as_file().sync_all()?;
+        temporary
+            .persist(self.checkpoint_path(&checkpoint.identity))
+            .map_err(|error| error.error)?;
+        File::open(&self.root)?.sync_all()
+    }
+
+    pub fn clear_upload_checkpoint(&self, identity: &DraftIdentity) -> io::Result<()> {
+        identity.validate()?;
+        let _lock = lock_store(&self.root)?;
+        match fs::remove_file(self.checkpoint_path(identity)) {
+            Ok(()) => File::open(&self.root)?.sync_all(),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 
     /// A new draft starts from a complete local snapshot. The cache source is never modified.
@@ -361,6 +472,11 @@ impl DraftStore {
         File::open(&self.root)?.sync_all()?;
         fs::remove_file(data_path)?;
         File::open(&self.root)?.sync_all()?;
+        match fs::remove_file(self.checkpoint_path(&snapshot.identity)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
         fs::remove_file(uploaded_path)?;
         File::open(&self.root)?.sync_all()?;
         Ok(true)
@@ -491,6 +607,15 @@ mod tests {
         draft.write_at(0, b"uploaded").unwrap();
         let (metadata, data) = store.paths(&identity());
         let marker = metadata.with_extension("uploaded");
+        store
+            .save_upload_checkpoint(&DraftUploadCheckpoint {
+                identity: identity(),
+                sha256: "a".repeat(64),
+                size: 8,
+                upload_url: "https://upload.example/secret".into(),
+                next_offset: 0,
+            })
+            .unwrap();
         fs::rename(&metadata, &marker).unwrap();
         drop(draft);
         drop(store);
@@ -499,6 +624,7 @@ mod tests {
         assert!(reopened.list().unwrap().is_empty());
         assert!(!data.exists());
         assert!(!marker.exists());
+        assert!(reopened.upload_checkpoint(&identity()).unwrap().is_none());
         let fresh = reopened.begin_empty(identity()).unwrap();
         fresh.write_at(0, b"new").unwrap();
         assert_eq!(reopened.list().unwrap(), vec![identity()]);
@@ -520,6 +646,36 @@ mod tests {
         assert!(reopened.list().unwrap().is_empty());
         assert!(!marker.exists());
         assert!(reopened.begin_empty(identity()).is_ok());
+    }
+
+    #[test]
+    fn upload_checkpoint_survives_restart_and_remains_private() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("drafts");
+        let store = DraftStore::open(&root).unwrap();
+        let checkpoint = DraftUploadCheckpoint {
+            identity: identity(),
+            sha256: "a".repeat(64),
+            size: 100,
+            upload_url: "https://upload.example/secret".into(),
+            next_offset: 50,
+        };
+        store.save_upload_checkpoint(&checkpoint).unwrap();
+        assert!(!format!("{checkpoint:?}").contains("secret"));
+        let path = store.checkpoint_path(&identity());
+        assert_eq!(
+            fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        drop(store);
+
+        let reopened = DraftStore::open(&root).unwrap();
+        assert_eq!(
+            reopened.upload_checkpoint(&identity()).unwrap(),
+            Some(checkpoint)
+        );
+        reopened.clear_upload_checkpoint(&identity()).unwrap();
+        assert!(reopened.upload_checkpoint(&identity()).unwrap().is_none());
     }
 
     #[test]

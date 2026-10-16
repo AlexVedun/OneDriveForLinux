@@ -428,8 +428,13 @@ impl Daemon {
         }
         let transport = GraphUpload::new(&graph, &drive_id, &token)
             .map_err(|_| zbus::fdo::Error::Failed("cannot create upload transport".to_owned()))?;
+        let checkpoint_root = state_directory()
+            .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?
+            .join("virtual-drafts");
+        let checkpoint_store = DraftStore::open(&checkpoint_root)
+            .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
         let mut transfer_state = TransferStateGuard::start(&self.state);
-        let result = virtual_upload::upload_snapshot(&transport, &snapshot)
+        let result = virtual_upload::upload_snapshot(&transport, &checkpoint_store, &snapshot)
             .await
             .map_err(|_| {
                 zbus::fdo::Error::Failed("upload failed; local draft retained".to_owned())
@@ -465,6 +470,7 @@ impl Daemon {
         let root = state_directory()
             .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?
             .join("virtual-drafts");
+        let completed_identity = snapshot.identity.clone();
         let acknowledged =
             tokio::task::spawn_blocking(move || DraftStore::open(&root)?.acknowledge(&snapshot))
                 .await
@@ -472,6 +478,9 @@ impl Daemon {
                     zbus::fdo::Error::Failed("draft acknowledgement task failed".to_owned())
                 })?
                 .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
+        checkpoint_store
+            .clear_upload_checkpoint(&completed_identity)
+            .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
         transfer_state.finish();
         Ok(if acknowledged {
             "uploaded".to_owned()
