@@ -10,6 +10,19 @@ pub struct VirtualDraftStatus {
     pub status: &'static str,
 }
 
+pub fn next_ready_item_id<'a>(
+    statuses: &'a [VirtualDraftStatus],
+    after: Option<&str>,
+) -> Option<&'a str> {
+    statuses
+        .iter()
+        .find(|draft| {
+            draft.status == "ready" && after.is_some_and(|id| draft.item_id.as_str() > id)
+        })
+        .or_else(|| statuses.iter().find(|draft| draft.status == "ready"))
+        .map(|draft| draft.item_id.as_str())
+}
+
 pub fn classify(
     draft: &DraftIdentity,
     active_drive: Option<&str>,
@@ -111,5 +124,34 @@ mod tests {
             classify(&draft, Some("drive"), true, Some(&item)).status,
             "remote-changed"
         );
+    }
+
+    #[test]
+    fn automatic_candidate_skips_conflicts() {
+        let draft = draft();
+        let mut changed = item();
+        changed.etag = Some("new".into());
+        let statuses = [
+            classify(&draft, Some("drive"), true, Some(&changed)),
+            classify(&draft, Some("drive"), true, Some(&item())),
+        ];
+        assert_eq!(next_ready_item_id(&statuses, None), Some("item"));
+        assert_eq!(next_ready_item_id(&statuses[..1], None), None);
+        let mut other = item();
+        other.item_id = "second".into();
+        let statuses = [
+            classify(&draft, Some("drive"), true, Some(&item())),
+            classify(
+                &DraftIdentity {
+                    item_id: "second".into(),
+                    ..draft
+                },
+                Some("drive"),
+                true,
+                Some(&other),
+            ),
+        ];
+        assert_eq!(next_ready_item_id(&statuses, Some("item")), Some("second"));
+        assert_eq!(next_ready_item_id(&statuses, Some("second")), Some("item"));
     }
 }
