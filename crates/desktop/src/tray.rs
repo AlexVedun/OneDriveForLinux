@@ -225,35 +225,149 @@ fn register_menu(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Presentation {
     status: &'static str,
-    icon: &'static str,
+    icon: IconKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IconKind {
+    Attention,
+    Offline,
+    Paused,
+    Transferring,
+    Synced,
+    Idle,
 }
 
 fn presentation(state: &str) -> Presentation {
     match state {
         "needs-login" | "error" | "reconciliation-needed" | "daemon-unavailable" => Presentation {
             status: "NeedsAttention",
-            icon: "dialog-warning-symbolic",
+            icon: IconKind::Attention,
         },
         "offline" => Presentation {
             status: "NeedsAttention",
-            icon: "network-offline-symbolic",
+            icon: IconKind::Offline,
         },
         "paused" => Presentation {
             status: "Active",
-            icon: "media-playback-pause-symbolic",
+            icon: IconKind::Paused,
         },
         "transferring" | "checking" => Presentation {
             status: "Active",
-            icon: "view-refresh-symbolic",
+            icon: IconKind::Transferring,
         },
         "synced" => Presentation {
             status: "Active",
-            icon: "object-select-symbolic",
+            icon: IconKind::Synced,
         },
         _ => Presentation {
             status: "Active",
-            icon: "network-idle-symbolic",
+            icon: IconKind::Idle,
         },
+    }
+}
+
+const ICON_SIZE: i32 = 22;
+
+fn icon_pixmap(kind: IconKind) -> Vec<(i32, i32, Vec<u8>)> {
+    let color = match kind {
+        IconKind::Attention => [0xcf, 0x42, 0x37],
+        IconKind::Offline => [0x74, 0x7a, 0x83],
+        IconKind::Paused => [0xb4, 0x72, 0x12],
+        IconKind::Transferring => [0x17, 0x64, 0xc2],
+        IconKind::Synced => [0x22, 0x85, 0x4c],
+        IconKind::Idle => [0x17, 0x64, 0xc2],
+    };
+    // StatusNotifierItem requires straight ARGB32 in network byte order.
+    let mut pixels = vec![0; (ICON_SIZE * ICON_SIZE * 4) as usize];
+    for y in 0..ICON_SIZE {
+        for x in 0..ICON_SIZE {
+            let dx = x - 11;
+            let dy = y - 11;
+            if dx * dx + dy * dy <= 100 {
+                set_pixel(&mut pixels, x, y, [255, color[0], color[1], color[2]]);
+            }
+        }
+    }
+    match kind {
+        IconKind::Attention => {
+            fill_rect(&mut pixels, 10, 5, 12, 13);
+            fill_rect(&mut pixels, 10, 15, 12, 17);
+        }
+        IconKind::Offline => {
+            for offset in 0..10 {
+                fill_rect(&mut pixels, 6 + offset, 6 + offset, 8 + offset, 8 + offset);
+                fill_rect(
+                    &mut pixels,
+                    15 - offset,
+                    6 + offset,
+                    17 - offset,
+                    8 + offset,
+                );
+            }
+        }
+        IconKind::Paused => {
+            fill_rect(&mut pixels, 7, 6, 10, 17);
+            fill_rect(&mut pixels, 13, 6, 16, 17);
+        }
+        IconKind::Transferring => {
+            fill_rect(&mut pixels, 10, 7, 12, 17);
+            for offset in 0..4 {
+                fill_rect(
+                    &mut pixels,
+                    7 + offset,
+                    10 - offset,
+                    9 + offset,
+                    12 - offset,
+                );
+                fill_rect(
+                    &mut pixels,
+                    13 - offset,
+                    7 + offset,
+                    15 - offset,
+                    9 + offset,
+                );
+            }
+        }
+        IconKind::Synced => {
+            for offset in 0..5 {
+                fill_rect(
+                    &mut pixels,
+                    5 + offset,
+                    11 + offset,
+                    7 + offset,
+                    13 + offset,
+                );
+                fill_rect(
+                    &mut pixels,
+                    9 + offset,
+                    15 - offset,
+                    11 + offset,
+                    17 - offset,
+                );
+            }
+        }
+        IconKind::Idle => {
+            fill_rect(&mut pixels, 6, 10, 16, 15);
+            fill_rect(&mut pixels, 8, 8, 12, 15);
+            fill_rect(&mut pixels, 12, 9, 15, 15);
+        }
+    }
+    vec![(ICON_SIZE, ICON_SIZE, pixels)]
+}
+
+fn fill_rect(pixels: &mut [u8], left: i32, top: i32, right: i32, bottom: i32) {
+    for y in top..bottom {
+        for x in left..right {
+            set_pixel(pixels, x, y, [255, 255, 255, 255]);
+        }
+    }
+}
+
+fn set_pixel(pixels: &mut [u8], x: i32, y: i32, argb: [u8; 4]) {
+    if (0..ICON_SIZE).contains(&x) && (0..ICON_SIZE).contains(&y) {
+        let offset = ((y * ICON_SIZE + x) * 4) as usize;
+        pixels[offset..offset + 4].copy_from_slice(&argb);
     }
 }
 
@@ -270,11 +384,14 @@ fn interface_xml(name: &str) -> String {
             <property name="Status" type="s" access="read"/>
             <property name="WindowId" type="u" access="read"/>
             <property name="IconName" type="s" access="read"/>
+            <property name="IconPixmap" type="a(iiay)" access="read"/>
             <property name="AttentionIconName" type="s" access="read"/>
+            <property name="AttentionIconPixmap" type="a(iiay)" access="read"/>
             <property name="ToolTip" type="(sa(iiay)ss)" access="read"/>
             <property name="ItemIsMenu" type="b" access="read"/>
             <property name="Menu" type="o" access="read"/>
             <signal name="NewIcon"/>
+            <signal name="NewAttentionIcon"/>
             <signal name="NewToolTip"/>
             <signal name="NewStatus"><arg name="status" type="s"/></signal>
         </interface></node>"#
@@ -288,11 +405,12 @@ fn property_value(name: &str, state: &str, label: &str) -> glib::Variant {
         "Title" => "OneDrive для Linux".to_variant(),
         "Status" => presentation(state).status.to_variant(),
         "WindowId" => 0_u32.to_variant(),
-        "IconName" => presentation(state).icon.to_variant(),
-        "AttentionIconName" => "dialog-warning-symbolic".to_variant(),
+        "IconName" | "AttentionIconName" => "".to_variant(),
+        "IconPixmap" => icon_pixmap(presentation(state).icon).to_variant(),
+        "AttentionIconPixmap" => icon_pixmap(IconKind::Attention).to_variant(),
         "ToolTip" => (
-            presentation(state).icon,
-            Vec::<(i32, i32, Vec<u8>)>::new(),
+            "",
+            icon_pixmap(presentation(state).icon),
             "OneDrive для Linux",
             label,
         )
@@ -438,6 +556,9 @@ impl TrayIndicator {
             let _ = self
                 .connection
                 .emit_signal(None, OBJECT_PATH, interface, "NewIcon", None);
+            let _ =
+                self.connection
+                    .emit_signal(None, OBJECT_PATH, interface, "NewAttentionIcon", None);
             let _ = self
                 .connection
                 .emit_signal(None, OBJECT_PATH, interface, "NewToolTip", None);
@@ -512,11 +633,48 @@ mod tests {
     #[test]
     fn status_icons_follow_attention_and_transfer_priority() {
         assert_eq!(presentation("error").status, "NeedsAttention");
-        assert_eq!(presentation("offline").icon, "network-offline-symbolic");
-        assert_eq!(presentation("paused").icon, "media-playback-pause-symbolic");
+        assert_eq!(presentation("offline").icon, IconKind::Offline);
+        assert_eq!(presentation("paused").icon, IconKind::Paused);
         assert_eq!(presentation("transferring").status, "Active");
-        assert_eq!(presentation("connected").icon, "network-idle-symbolic");
-        assert_eq!(presentation("synced").icon, "object-select-symbolic");
+        assert_eq!(presentation("connected").icon, IconKind::Idle);
+        assert_eq!(presentation("synced").icon, IconKind::Synced);
+    }
+
+    #[test]
+    fn status_pixmaps_are_complete_argb_images() {
+        let mut images = Vec::new();
+        for kind in [
+            IconKind::Attention,
+            IconKind::Offline,
+            IconKind::Paused,
+            IconKind::Transferring,
+            IconKind::Synced,
+            IconKind::Idle,
+        ] {
+            let pixmaps = icon_pixmap(kind);
+            assert_eq!(pixmaps.len(), 1);
+            let (width, height, pixels) = &pixmaps[0];
+            assert_eq!((*width, *height), (22, 22));
+            assert_eq!(pixels.len(), 22 * 22 * 4);
+            assert_eq!(&pixels[..4], &[0, 0, 0, 0]);
+            assert_eq!(pixels[(11 * 22 + 11) * 4], 255);
+            images.push(pixels.clone());
+        }
+        for (index, image) in images.iter().enumerate() {
+            assert!(images.iter().skip(index + 1).all(|other| other != image));
+        }
+        assert_eq!(
+            property_value("IconPixmap", "error", "error")
+                .type_()
+                .as_str(),
+            "a(iiay)"
+        );
+        assert_eq!(
+            property_value("AttentionIconPixmap", "error", "error")
+                .type_()
+                .as_str(),
+            "a(iiay)"
+        );
     }
 
     #[test]
