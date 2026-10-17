@@ -70,6 +70,8 @@ install -m 644 "$@" "$schema_target/"
 glib-compile-schemas --strict "$schema_target"
 test -s "$schema_target/gschemas.compiled"
 
+python3 "$repo/scripts/collect-appdir-licenses.py" "$input" "$staging"
+
 mv -T --no-clobber "$staging" "$output"
 if [ -e "$staging" ]; then
     echo "AppDir appeared during bundling: $output" >&2
