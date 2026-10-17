@@ -307,7 +307,8 @@ APPIMAGETOOL_RUNTIME_FILE=/path/to/runtime-x86_64 \
 ```
 
 `APPIMAGETOOL_RUNTIME_FILE` необязателен, если `appimagetool` может сам скачать
-runtime. При ограниченной сети передайте заранее загруженный файл. Проверка
+runtime. При ограниченной сети передайте заранее загруженный файл. Сборка
+проверяет AppStream-описание локально через `appstreamcli`. Проверка
 `scripts/smoke-appimage.sh` собирает тестовый AppImage, извлекает его и
 проверяет ресурсы и динамические зависимости. Для неё нужны те же переменные
 `LINUXDEPLOY`, `APPIMAGETOOL` и, при необходимости, `APPIMAGETOOL_RUNTIME_FILE`.

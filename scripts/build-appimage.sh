@@ -43,7 +43,13 @@ staging=$(mktemp -d "$(dirname -- "$output")/.onedrive-appimage.XXXXXX")
 trap 'rm -rf "$staging"' EXIT HUP INT TERM
 sh "$repo/scripts/build-appdir.sh" "$staging/input.AppDir" >/dev/null
 sh "$repo/scripts/bundle-appdir-libs.sh" "$staging/input.AppDir" "$staging/bundled.AppDir" >/dev/null
-"$tool" "$@" "$staging/bundled.AppDir" "$staging/generated.AppImage"
+if ! command -v appstreamcli >/dev/null 2>&1; then
+    echo "appstreamcli is required to validate AppStream metadata" >&2
+    exit 2
+fi
+appstreamcli validate-tree --no-net "$staging/bundled.AppDir"
+# appimagetool validates URLs online by default, so use the offline result above.
+"$tool" "$@" --no-appstream "$staging/bundled.AppDir" "$staging/generated.AppImage"
 if [ ! -x "$staging/generated.AppImage" ] || ! readelf -h "$staging/generated.AppImage" >/dev/null 2>&1; then
     echo "appimagetool did not produce an executable AppImage" >&2
     exit 1

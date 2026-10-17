@@ -12,7 +12,7 @@ jobs:
         with:
           components: clippy, rustfmt
       - name: Install native dependencies
-        run: sudo apt-get update && sudo apt-get install -y libgtk-4-dev libadwaita-1-dev pkg-config dbus-bin libglib2.0-bin desktop-file-utils
+        run: sudo apt-get update && sudo apt-get install -y libgtk-4-dev libadwaita-1-dev pkg-config dbus-bin libglib2.0-bin desktop-file-utils appstream
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
