@@ -21,3 +21,36 @@ jobs:
       - run: SMOKE_TEST_LOGIN=xdg dbus-run-session -- sh scripts/smoke-dbus.sh
       - run: sh -n scripts/bundle-appdir-libs.sh scripts/smoke-bundle-appdir.sh
       - run: sh scripts/smoke-appdir.sh
+
+  appimage:
+    needs: check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install native dependencies
+        run: sudo apt-get update && sudo apt-get install -y libgtk-4-dev libgtk-4-bin libadwaita-1-dev adwaita-icon-theme pkg-config dbus-bin libglib2.0-bin desktop-file-utils appstream
+      - name: Fetch verified AppImage tools
+        run: |
+          sh scripts/fetch-appimage-tools.sh "$RUNNER_TEMP/onedrive-tools"
+          echo "LINUXDEPLOY=$RUNNER_TEMP/onedrive-tools/linuxdeploy-x86_64.AppImage" >> "$GITHUB_ENV"
+          echo "APPIMAGETOOL=$RUNNER_TEMP/onedrive-tools/appimagetool-x86_64.AppImage" >> "$GITHUB_ENV"
+          echo "APPIMAGETOOL_RUNTIME_FILE=$RUNNER_TEMP/onedrive-tools/runtime-x86_64" >> "$GITHUB_ENV"
+      - name: Smoke test AppImage
+        run: sh scripts/smoke-appimage.sh
+      - name: Build release AppImage
+        run: sh scripts/build-appimage.sh target/dist/OneDriveForLinux-x86_64.AppImage
+      - name: Verify release startup and write checksum
+        run: |
+          dbus-run-session -- sh scripts/smoke-appimage-runtime.sh target/dist/OneDriveForLinux-x86_64.AppImage
+          cd target/dist
+          sha256sum OneDriveForLinux-x86_64.AppImage > OneDriveForLinux-x86_64.AppImage.sha256
+          sha256sum -c OneDriveForLinux-x86_64.AppImage.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OneDriveForLinux-x86_64
+          path: |
+            target/dist/OneDriveForLinux-x86_64.AppImage
+            target/dist/OneDriveForLinux-x86_64.AppImage.sha256
+          if-no-files-found: error
