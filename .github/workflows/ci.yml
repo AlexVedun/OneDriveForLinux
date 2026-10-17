@@ -19,4 +19,5 @@ jobs:
       - run: cargo build -p onedrive-daemon
       - run: SMOKE_TEST_LOGIN=1 dbus-run-session -- sh scripts/smoke-dbus.sh
       - run: SMOKE_TEST_LOGIN=xdg dbus-run-session -- sh scripts/smoke-dbus.sh
+      - run: sh -n scripts/bundle-appdir-libs.sh scripts/smoke-bundle-appdir.sh
       - run: sh scripts/smoke-appdir.sh

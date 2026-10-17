@@ -277,10 +277,25 @@ OneDrive. Каталоги с конфликтом имени или регис�
 `sh scripts/smoke-appdir.sh`. Команда
 `sh scripts/audit-appdir-libs.sh /tmp/OneDriveForLinux.AppDir` показывает
 библиотеки, загружаемые из AppDir (`BUNDLED`) или с хоста (`HOST`), и завершается
-ошибкой при неразрешённой зависимости (`MISSING`). Этот AppDir пока использует GTK и другие
-динамические библиотеки хоста: он ещё не является переносимым AppImage.
-Следующий этап — отбор библиотек и ресурсов GTK, упаковка и проверка
-на целевых дистрибутивах.
+ошибкой при неразрешённой зависимости (`MISSING`). Исходный AppDir использует
+GTK и другие динамические библиотеки хоста. При наличии `linuxdeploy` можно
+создать отдельный AppDir с ELF-зависимостями. Инструмент доступен на
+[странице выпусков linuxdeploy](https://github.com/linuxdeploy/linuxdeploy/releases):
+
+```sh
+LINUXDEPLOY=/path/to/linuxdeploy-x86_64.AppImage \
+  sh scripts/bundle-appdir-libs.sh /tmp/OneDriveForLinux.AppDir /tmp/OneDriveForLinux-bundled.AppDir
+```
+
+Скрипт не меняет исходный каталог, сохраняет `AppRun` и проверяет, что GTK,
+libadwaita и GLib берутся из результата. Для проверки выполните
+`LINUXDEPLOY=/path/to/linuxdeploy-x86_64.AppImage sh scripts/smoke-bundle-appdir.sh`.
+Локальный тест окна и трея из собранного каталога запускается командой
+`ONEDRIVE_SMOKE_BINARY_DIR=/path/to/bundled.AppDir/usr/bin dbus-run-session -- sh scripts/smoke-tray.sh`.
+Этот этап ещё не упаковывает ресурсы GTK, загружаемые во время работы, и
+лицензии сторонних библиотек. Переносимость AppImage и запуск на целевых
+дистрибутивах остаются непроверенными; релиз нужно собирать на выбранной
+минимальной версии Linux.
 Демон записывает точку виртуального диска в `XDG_STATE_HOME/onedrive-linux/virtual-mount-path`.
 Если после аварийного завершения она остаётся занятой, окно покажет путь и
 запретит новое подключение. Проверьте его через `findmnt --target ПУТЬ` и,
