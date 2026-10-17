@@ -1,0 +1,56 @@
+#!/bin/sh
+set -eu
+
+if [ "$#" -ne 1 ]; then
+    echo "Usage: LINUXDEPLOY=/path/to/linuxdeploy APPIMAGETOOL=/path/to/appimagetool $0 OUTPUT.AppImage" >&2
+    exit 2
+fi
+
+repo=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+case "$1" in
+    /*) output=$1 ;;
+    *) output="$PWD/$1" ;;
+esac
+output=$(realpath -m -- "$output")
+case "$output" in
+    *.AppImage) ;;
+    *) echo "Output must end in .AppImage: $output" >&2; exit 2 ;;
+esac
+if [ -e "$output" ] || [ -L "$output" ]; then
+    echo "AppImage already exists: $output" >&2
+    exit 2
+fi
+
+tool=${APPIMAGETOOL:-appimagetool}
+if ! command -v "$tool" >/dev/null 2>&1; then
+    echo "appimagetool is unavailable; set APPIMAGETOOL to its executable path" >&2
+    exit 2
+fi
+case "$tool" in
+    *.AppImage) set -- --appimage-extract-and-run ;;
+    *) set -- ;;
+esac
+if [ -n "${APPIMAGETOOL_RUNTIME_FILE:-}" ]; then
+    if [ ! -f "$APPIMAGETOOL_RUNTIME_FILE" ]; then
+        echo "AppImage runtime is unavailable: $APPIMAGETOOL_RUNTIME_FILE" >&2
+        exit 2
+    fi
+    set -- "$@" --runtime-file="$APPIMAGETOOL_RUNTIME_FILE"
+fi
+
+mkdir -p "$(dirname -- "$output")"
+staging=$(mktemp -d "$(dirname -- "$output")/.onedrive-appimage.XXXXXX")
+trap 'rm -rf "$staging"' EXIT HUP INT TERM
+sh "$repo/scripts/build-appdir.sh" "$staging/input.AppDir" >/dev/null
+sh "$repo/scripts/bundle-appdir-libs.sh" "$staging/input.AppDir" "$staging/bundled.AppDir" >/dev/null
+"$tool" "$@" "$staging/bundled.AppDir" "$staging/generated.AppImage"
+if [ ! -x "$staging/generated.AppImage" ] || ! readelf -h "$staging/generated.AppImage" >/dev/null 2>&1; then
+    echo "appimagetool did not produce an executable AppImage" >&2
+    exit 1
+fi
+mv -T --no-clobber "$staging/generated.AppImage" "$output"
+if [ -e "$staging/generated.AppImage" ]; then
+    echo "AppImage appeared during build: $output" >&2
+    exit 2
+fi
+echo "$output"
