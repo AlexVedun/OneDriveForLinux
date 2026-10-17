@@ -48,6 +48,8 @@ test "$(find "$scratch" -maxdepth 1 -name '.onedrive-appdir.*' | wc -l)" -eq 0
 # Test launcher process ownership and library paths without opening GTK or D-Bus.
 fake="$scratch/fake AppDir"
 mkdir -p "$fake/usr/bin" "$fake/usr/lib" "$fake/usr/lib64" "$fake/usr/lib/x86_64-linux-gnu"
+mkdir -p "$fake/usr/share/glib-2.0/schemas"
+printf 'compiled fixture\n' > "$fake/usr/share/glib-2.0/schemas/gschemas.compiled"
 cp "$appdir/AppRun" "$fake/AppRun"
 cat > "$fake/usr/bin/onedrive-daemon" <<'EOF'
 #!/bin/sh
@@ -57,13 +59,15 @@ EOF
 cat > "$fake/usr/bin/onedrive-desktop" <<'EOF'
 #!/bin/sh
 printf '%s\n' "$LD_LIBRARY_PATH" > "$ONEDRIVE_APPDIR_SMOKE_LIBPATH"
+printf '%s\n' "$GSETTINGS_SCHEMA_DIR" > "$ONEDRIVE_APPDIR_SMOKE_SCHEMAS"
 sleep 1
 exit 7
 EOF
 chmod +x "$fake/usr/bin/onedrive-daemon" "$fake/usr/bin/onedrive-desktop"
 export ONEDRIVE_APPDIR_SMOKE_MARKER="$scratch/daemon-stopped"
 export ONEDRIVE_APPDIR_SMOKE_LIBPATH="$scratch/library-path"
-if LD_LIBRARY_PATH="$scratch/host-lib" "$fake/AppRun"; then
+export ONEDRIVE_APPDIR_SMOKE_SCHEMAS="$scratch/schema-path"
+if LD_LIBRARY_PATH="$scratch/host-lib" GSETTINGS_SCHEMA_DIR="$scratch/host-schemas" "$fake/AppRun"; then
     echo "AppRun lost the desktop exit status" >&2
     exit 1
 else
@@ -73,3 +77,5 @@ fi
 test -e "$ONEDRIVE_APPDIR_SMOKE_MARKER"
 expected_libpath="$fake/usr/lib:$fake/usr/lib64:$fake/usr/lib/x86_64-linux-gnu:$scratch/host-lib"
 test "$(cat "$ONEDRIVE_APPDIR_SMOKE_LIBPATH")" = "$expected_libpath"
+expected_schemas="$fake/usr/share/glib-2.0/schemas:$scratch/host-schemas"
+test "$(cat "$ONEDRIVE_APPDIR_SMOKE_SCHEMAS")" = "$expected_schemas"

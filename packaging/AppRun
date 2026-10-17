@@ -11,6 +11,10 @@ done
 if [ -n "$bundled_lib_paths" ]; then
     export LD_LIBRARY_PATH="$bundled_lib_paths${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 fi
+schema_dir="$appdir/usr/share/glib-2.0/schemas"
+if [ -s "$schema_dir/gschemas.compiled" ]; then
+    export GSETTINGS_SCHEMA_DIR="$schema_dir${GSETTINGS_SCHEMA_DIR:+:$GSETTINGS_SCHEMA_DIR}"
+fi
 daemon_pid=
 desktop_pid=
 

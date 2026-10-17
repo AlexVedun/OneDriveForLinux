@@ -23,6 +23,14 @@ bundled="$scratch/bundled.AppDir"
 test -x "$bundled/usr/bin/onedrive-desktop"
 cmp "$repo/LICENSE" "$bundled/usr/share/licenses/onedrive-linux/LICENSE"
 desktop-file-validate "$bundled/io.github.onedrive_linux.desktop"
+schema_dir="$bundled/usr/share/glib-2.0/schemas"
+test -s "$schema_dir/gschemas.compiled"
+test -f "$schema_dir/org.gtk.gtk4.Settings.FileChooser.gschema.xml"
+glib-compile-schemas --strict --dry-run "$schema_dir"
+mkdir -p "$scratch/empty-data"
+XDG_DATA_HOME="$scratch/empty-data" XDG_DATA_DIRS="$scratch/empty-data" \
+    GSETTINGS_SCHEMA_DIR="$schema_dir" gsettings list-schemas \
+    | grep -q '^org.gtk.gtk4.Settings.FileChooser$'
 sh "$repo/scripts/audit-appdir-libs.sh" "$bundled" > "$scratch/audit.log"
 grep -q '^  BUNDLED libgtk-4.so.1 ' "$scratch/audit.log"
 grep -q '^  BUNDLED libadwaita-1.so.0 ' "$scratch/audit.log"
