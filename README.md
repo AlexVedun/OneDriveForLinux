@@ -297,6 +297,20 @@ LINUXDEPLOY=/path/to/linuxdeploy-x86_64.AppImage \
 в манифесте пустым `license_files`; их тексты нужно проверить при подготовке
 релиза. Для проверки выполните
 `LINUXDEPLOY=/path/to/linuxdeploy-x86_64.AppImage sh scripts/smoke-bundle-appdir.sh`.
+Готовый AppImage собирается отдельным `appimagetool`:
+
+```sh
+LINUXDEPLOY=/path/to/linuxdeploy-x86_64.AppImage \
+APPIMAGETOOL=/path/to/appimagetool \
+APPIMAGETOOL_RUNTIME_FILE=/path/to/runtime-x86_64 \
+  sh scripts/build-appimage.sh /tmp/OneDriveForLinux.AppImage
+```
+
+`APPIMAGETOOL_RUNTIME_FILE` необязателен, если `appimagetool` может сам скачать
+runtime. При ограниченной сети передайте заранее загруженный файл. Проверка
+`scripts/smoke-appimage.sh` собирает тестовый AppImage, извлекает его и
+проверяет ресурсы и динамические зависимости. Для неё нужны те же переменные
+`LINUXDEPLOY`, `APPIMAGETOOL` и, при необходимости, `APPIMAGETOOL_RUNTIME_FILE`.
 Локальный тест окна и трея из собранного каталога запускается командой
 `ONEDRIVE_SMOKE_BINARY_DIR=/path/to/bundled.AppDir/usr/bin dbus-run-session -- sh scripts/smoke-tray.sh`.
 Другие ресурсы GTK, которые могут загружаться во время работы, и полный набор
