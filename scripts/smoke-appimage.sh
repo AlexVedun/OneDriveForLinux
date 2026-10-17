@@ -33,4 +33,5 @@ test -s "$extracted/usr/share/licenses/onedrive-linux/native-libraries.json"
 cmp "$repo/LICENSE" "$extracted/usr/share/licenses/onedrive-linux/LICENSE"
 sh "$repo/scripts/audit-appdir-libs.sh" "$extracted" >"$scratch/audit.log"
 grep -q '^  BUNDLED libgtk-4.so.1 ' "$scratch/audit.log"
+dbus-run-session -- sh "$repo/scripts/smoke-appimage-runtime.sh" "$image"
 test "$(find "$scratch" -maxdepth 1 -name '.onedrive-appimage.*' | wc -l)" -eq 0

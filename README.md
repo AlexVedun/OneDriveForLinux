@@ -309,9 +309,11 @@ APPIMAGETOOL_RUNTIME_FILE=/path/to/runtime-x86_64 \
 `APPIMAGETOOL_RUNTIME_FILE` необязателен, если `appimagetool` может сам скачать
 runtime. При ограниченной сети передайте заранее загруженный файл. Сборка
 проверяет AppStream-описание локально через `appstreamcli`. Проверка
-`scripts/smoke-appimage.sh` собирает тестовый AppImage, извлекает его и
-проверяет ресурсы и динамические зависимости. Для неё нужны те же переменные
-`LINUXDEPLOY`, `APPIMAGETOOL` и, при необходимости, `APPIMAGETOOL_RUNTIME_FILE`.
+`scripts/smoke-appimage.sh` собирает тестовый AppImage, извлекает его, проверяет
+ресурсы и зависимости, затем запускает файл через `--appimage-extract-and-run`
+в изолированной D-Bus/GTK Broadway-сессии и проверяет демон и трей. Для неё
+нужны те же переменные `LINUXDEPLOY`, `APPIMAGETOOL` и, при необходимости,
+`APPIMAGETOOL_RUNTIME_FILE`.
 Локальный тест окна и трея из собранного каталога запускается командой
 `ONEDRIVE_SMOKE_BINARY_DIR=/path/to/bundled.AppDir/usr/bin dbus-run-session -- sh scripts/smoke-tray.sh`.
 Другие ресурсы GTK, которые могут загружаться во время работы, и полный набор
