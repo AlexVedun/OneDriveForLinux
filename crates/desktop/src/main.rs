@@ -81,6 +81,20 @@ where
     proxy.call(method, &())
 }
 
+fn app_title() -> String {
+    format!("OneDriveForLinux - {}", env!("CARGO_PKG_VERSION"))
+}
+
+fn login_error_text(error: &str) -> String {
+    if error.contains("ONEDRIVE_CLIENT_ID is not configured") {
+        "Не задан ONEDRIVE_CLIENT_ID. Добавьте его в ~/.config/onedrive-linux/config.env".to_owned()
+    } else if error.contains("login is already in progress") {
+        "Вход уже выполняется. Завершите его в браузере или подождите пять минут".to_owned()
+    } else {
+        format!("Не удалось начать вход: {error}")
+    }
+}
+
 fn read_status() -> String {
     daemon_call("Status").unwrap_or_else(|_| "daemon-unavailable".to_owned())
 }
@@ -1529,7 +1543,7 @@ fn main() {
                         status_after_login.set_text("Не удалось открыть браузер");
                     }
                 }
-                Err(_) => status_after_login.set_text("Не удалось начать вход"),
+                Err(error) => status_after_login.set_text(&login_error_text(&error.to_string())),
             }
         });
         let scan = gtk::Button::with_label("Проверить OneDrive");
@@ -1657,12 +1671,20 @@ fn main() {
         content.append(&sync_controls);
         content.append(&virtual_controls);
         content.append(&scroll);
+        let title = app_title();
+        let header = adw::HeaderBar::new();
+        let title_label = gtk::Label::new(Some(&title));
+        title_label.add_css_class("title");
+        header.set_title_widget(Some(&title_label));
+        let layout = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        layout.append(&header);
+        layout.append(&content);
         let window = adw::ApplicationWindow::builder()
             .application(app)
-            .title("OneDrive для Linux")
+            .title(&title)
             .default_width(850)
             .default_height(540)
-            .content(&content)
+            .content(&layout)
             .build();
         let hold = app.hold();
         window.connect_close_request(move |window| {
@@ -2062,6 +2084,18 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn title_shows_workspace_version_and_login_error_explains_missing_configuration() {
+        assert_eq!(app_title(), "OneDriveForLinux - 1.0.0");
+        assert!(
+            login_error_text(
+                "org.freedesktop.DBus.Error.Failed: ONEDRIVE_CLIENT_ID is not configured"
+            )
+            .contains("~/.config/onedrive-linux/config.env")
+        );
+        assert!(login_error_text("daemon unavailable").contains("daemon unavailable"));
+    }
 
     #[test]
     fn virtual_drafts_show_conflicts_and_manual_upload_summary() {
