@@ -39,18 +39,25 @@ jobs:
           echo "APPIMAGETOOL_RUNTIME_FILE=$RUNNER_TEMP/onedrive-tools/runtime-x86_64" >> "$GITHUB_ENV"
       - name: Smoke test AppImage
         run: sh scripts/smoke-appimage.sh
+      - name: Read application version
+        id: version
+        run: |
+          version=$(sh scripts/app-version.sh)
+          echo "value=$version" >> "$GITHUB_OUTPUT"
+          echo "APP_VERSION=$version" >> "$GITHUB_ENV"
       - name: Build release AppImage
-        run: sh scripts/build-appimage.sh target/dist/OneDriveForLinux-x86_64.AppImage
+        run: sh scripts/build-appimage.sh
       - name: Verify release startup and write checksum
         run: |
-          dbus-run-session -- sh scripts/smoke-appimage-runtime.sh target/dist/OneDriveForLinux-x86_64.AppImage
+          image="OneDriveForLinux-${APP_VERSION}-x86_64.AppImage"
+          dbus-run-session -- sh scripts/smoke-appimage-runtime.sh "target/dist/$image"
           cd target/dist
-          sha256sum OneDriveForLinux-x86_64.AppImage > OneDriveForLinux-x86_64.AppImage.sha256
-          sha256sum -c OneDriveForLinux-x86_64.AppImage.sha256
+          sha256sum "$image" > "$image.sha256"
+          sha256sum -c "$image.sha256"
       - uses: actions/upload-artifact@v4
         with:
-          name: OneDriveForLinux-x86_64
+          name: OneDriveForLinux-${{ steps.version.outputs.value }}-x86_64
           path: |
-            target/dist/OneDriveForLinux-x86_64.AppImage
-            target/dist/OneDriveForLinux-x86_64.AppImage.sha256
+            target/dist/OneDriveForLinux-${{ steps.version.outputs.value }}-x86_64.AppImage
+            target/dist/OneDriveForLinux-${{ steps.version.outputs.value }}-x86_64.AppImage.sha256
           if-no-files-found: error

@@ -1,15 +1,18 @@
 #!/bin/sh
 set -eu
 
-if [ "$#" -ne 1 ]; then
-    echo "Usage: LINUXDEPLOY=/path/to/linuxdeploy APPIMAGETOOL=/path/to/appimagetool $0 OUTPUT.AppImage" >&2
+if [ "$#" -gt 1 ]; then
+    echo "Usage: LINUXDEPLOY=/path/to/linuxdeploy APPIMAGETOOL=/path/to/appimagetool $0 [OUTPUT.AppImage]" >&2
     exit 2
 fi
 
 repo=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-case "$1" in
-    /*) output=$1 ;;
-    *) output="$PWD/$1" ;;
+version=$(sh "$repo/scripts/app-version.sh")
+export VERSION="$version"
+requested_output=${1:-"$repo/target/dist/OneDriveForLinux-$version-x86_64.AppImage"}
+case "$requested_output" in
+    /*) output=$requested_output ;;
+    *) output="$PWD/$requested_output" ;;
 esac
 output=$(realpath -m -- "$output")
 case "$output" in

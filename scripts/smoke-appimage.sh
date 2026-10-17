@@ -29,6 +29,8 @@ test -x "$extracted/usr/bin/onedrive-desktop"
 test -s "$extracted/usr/share/glib-2.0/schemas/gschemas.compiled"
 test -f "$extracted/usr/share/icons/Adwaita/index.theme"
 test -f "$extracted/usr/share/metainfo/io.github.onedrive_linux.appdata.xml"
+version=$(sh "$repo/scripts/app-version.sh")
+grep -qx "X-AppImage-Version=$version" "$extracted/io.github.onedrive_linux.desktop"
 test -s "$extracted/usr/share/licenses/onedrive-linux/native-libraries.json"
 cmp "$repo/LICENSE" "$extracted/usr/share/licenses/onedrive-linux/LICENSE"
 sh "$repo/scripts/audit-appdir-libs.sh" "$extracted" >"$scratch/audit.log"
