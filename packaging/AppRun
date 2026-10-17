@@ -2,6 +2,15 @@
 set -eu
 
 appdir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+bundled_lib_paths=
+for directory in "$appdir/usr/lib" "$appdir/usr/lib64" "$appdir/usr/lib/x86_64-linux-gnu"; do
+    if [ -d "$directory" ]; then
+        bundled_lib_paths="${bundled_lib_paths:+$bundled_lib_paths:}$directory"
+    fi
+done
+if [ -n "$bundled_lib_paths" ]; then
+    export LD_LIBRARY_PATH="$bundled_lib_paths${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+fi
 daemon_pid=
 desktop_pid=
 

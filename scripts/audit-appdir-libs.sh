@@ -15,8 +15,8 @@ for binary in onedrive-daemon onedrive-desktop; do
     fi
 done
 
-# Resolve libraries as AppRun would after a future bundling step. This audit
-# reports host dependencies; it does not certify AppImage portability.
+# Resolve libraries in the AppRun search paths. This audit reports host
+# dependencies; it does not certify AppImage portability.
 lib_paths="$appdir/usr/lib:$appdir/usr/lib64:$appdir/usr/lib/x86_64-linux-gnu"
 for binary in onedrive-daemon onedrive-desktop; do
     path="$appdir/usr/bin/$binary"
