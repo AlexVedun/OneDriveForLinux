@@ -270,6 +270,9 @@ OneDrive. Каталоги с конфликтом имени или регис�
 `ONEDRIVE_APPDIR_PROFILE=dev sh scripts/build-appdir.sh /tmp/OneDriveForLinux.AppDir`.
 Скрипт отказывается перезаписывать существующий каталог. `AppRun` запускает
 демон и окно вместе и завершает запущенный им демон при выходе из приложения.
+Он добавляет вложенные каталоги библиотек в `LD_LIBRARY_PATH`, сохраняя
+существующий путь. AppDir содержит лицензию приложения в
+`usr/share/licenses/onedrive-linux/LICENSE`.
 Структуру, desktop-файл и управление процессами проверяет
 `sh scripts/smoke-appdir.sh`. Команда
 `sh scripts/audit-appdir-libs.sh /tmp/OneDriveForLinux.AppDir` показывает
