@@ -80,6 +80,10 @@ dbus-run-session -- sh scripts/smoke-tray.sh
 ONEDRIVE_CLIENT_ID=ваш-client-id
 ```
 
+При запуске AppImage из другого каталога проектный `.env` не читается:
+скопируйте эту строку в `~/.config/onedrive-linux/config.env` и перезапустите
+приложение. Если ID не найден, окно показывает путь к нужному файлу.
+
 Файл `.env` исключён из Git. Демон ищет ID в таком порядке: переменная
 окружения `ONEDRIVE_CLIENT_ID`, XDG-конфигурация, `.env` в текущем каталоге,
 значение, переданное при сборке. Пустая переменная окружения явно отключает
@@ -307,8 +311,8 @@ APPIMAGETOOL_RUNTIME_FILE=/path/to/runtime-x86_64 \
 ```
 
 Версия берётся из `[workspace.package].version` в корневом `Cargo.toml`.
-Например, для `0.1.0` результат по умолчанию —
-`target/dist/OneDriveForLinux-0.1.0-x86_64.AppImage`; путь можно передать
+Например, для `1.0.0` результат по умолчанию —
+`target/dist/OneDriveForLinux-1.0.0-x86_64.AppImage`; путь можно передать
 аргументом скрипта. В CI версия входит также в имя артефакта и файла SHA-256.
 `APPIMAGETOOL_RUNTIME_FILE` необязателен, если `appimagetool` может сам скачать
 runtime. При ограниченной сети передайте заранее загруженный файл. Сборка

@@ -1590,7 +1590,7 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
 name = "onedrive-cache"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "libc",
  "rusqlite",
@@ -1600,7 +1600,7 @@ dependencies = [
 
 [[package]]
 name = "onedrive-catalog"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "rusqlite",
  "serde",
@@ -1611,11 +1611,11 @@ dependencies = [
 
 [[package]]
 name = "onedrive-core"
-version = "0.1.0"
+version = "1.0.0"
 
 [[package]]
 name = "onedrive-daemon"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "fuser",
  "keyring",
@@ -1638,7 +1638,7 @@ dependencies = [
 
 [[package]]
 name = "onedrive-desktop"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "gtk4",
  "libadwaita",
@@ -1651,7 +1651,7 @@ dependencies = [
 
 [[package]]
 name = "onedrive-mount"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "fuser",
  "libc",
@@ -1666,7 +1666,7 @@ dependencies = [
 
 [[package]]
 name = "onedrive-sync"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "libc",
  "onedrive-catalog",
