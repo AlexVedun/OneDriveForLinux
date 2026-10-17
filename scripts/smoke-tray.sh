@@ -3,6 +3,7 @@ set -eu
 
 command -v gtk4-broadwayd >/dev/null
 test -n "${DBUS_SESSION_BUS_ADDRESS:-}"
+binary_dir=${ONEDRIVE_SMOKE_BINARY_DIR:-target/debug}
 
 test_state=$(mktemp -d)
 display_number=$((300 + $$ % 1000))
@@ -15,7 +16,7 @@ mkdir "$XDG_STATE_HOME"
 gtk4-broadwayd --address=127.0.0.1 "$BROADWAY_DISPLAY" \
     >"$test_state/broadway.log" 2>&1 &
 broadway_pid=$!
-target/debug/onedrive-desktop >"$test_state/desktop.log" 2>&1 &
+"$binary_dir/onedrive-desktop" >"$test_state/desktop.log" 2>&1 &
 desktop_pid=$!
 daemon_pid=
 trap 'kill "$desktop_pid" "$broadway_pid" ${daemon_pid:+"$daemon_pid"} 2>/dev/null || true; rm -rf "$test_state"' EXIT HUP INT TERM
@@ -92,7 +93,7 @@ for interface in org.kde.StatusNotifierItem org.freedesktop.StatusNotifierItem; 
         --method "$interface".Activate 0 0 >/dev/null
 done
 
-target/debug/onedrive-daemon >"$test_state/daemon.log" 2>&1 &
+"$binary_dir/onedrive-daemon" >"$test_state/daemon.log" 2>&1 &
 daemon_pid=$!
 attempt=0
 while [ "$attempt" -lt 10 ]; do
