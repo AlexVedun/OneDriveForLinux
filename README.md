@@ -303,9 +303,13 @@ LINUXDEPLOY=/path/to/linuxdeploy-x86_64.AppImage \
 LINUXDEPLOY=/path/to/linuxdeploy-x86_64.AppImage \
 APPIMAGETOOL=/path/to/appimagetool \
 APPIMAGETOOL_RUNTIME_FILE=/path/to/runtime-x86_64 \
-  sh scripts/build-appimage.sh /tmp/OneDriveForLinux.AppImage
+  sh scripts/build-appimage.sh
 ```
 
+Версия берётся из `[workspace.package].version` в корневом `Cargo.toml`.
+Например, для `0.1.0` результат по умолчанию —
+`target/dist/OneDriveForLinux-0.1.0-x86_64.AppImage`; путь можно передать
+аргументом скрипта. В CI версия входит также в имя артефакта и файла SHA-256.
 `APPIMAGETOOL_RUNTIME_FILE` необязателен, если `appimagetool` может сам скачать
 runtime. При ограниченной сети передайте заранее загруженный файл. Сборка
 проверяет AppStream-описание локально через `appstreamcli`. Проверка
