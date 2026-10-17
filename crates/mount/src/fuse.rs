@@ -94,7 +94,8 @@ impl VirtualFuse {
         if self.draft_root.is_none() {
             options.mount_options.push(MountOption::RO);
         }
-        options.n_threads = Some(1);
+        // A cold file open can wait for Graph. Keep directory requests responsive meanwhile.
+        options.n_threads = Some(4);
         fuser::spawn_mount(self, mountpoint, &options)
     }
 
@@ -590,6 +591,7 @@ mod tests {
     use onedrive_catalog::CatalogItem;
     use std::fs;
     use std::sync::atomic::AtomicUsize;
+    use std::sync::{Condvar, mpsc};
 
     fn file_item() -> CatalogItem {
         CatalogItem {
@@ -834,6 +836,53 @@ mod tests {
         );
         assert_eq!(fs::read(mountpoint.join("текст.txt")).unwrap(), b"hello");
         assert!(fs::write(mountpoint.join("new.txt"), b"no").is_err());
+        session.umount_and_join().unwrap();
+    }
+
+    #[test]
+    fn directory_listing_stays_responsive_during_file_download() {
+        if std::env::var_os("ONEDRIVE_FUSE_SMOKE").is_none() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mountpoint = dir.path().join("mount");
+        fs::create_dir(&mountpoint).unwrap();
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let (started_tx, started_rx) = mpsc::channel();
+        let gate_for_loader = Arc::clone(&gate);
+        let loader: Arc<ContentLoader> = Arc::new(move |_| {
+            started_tx.send(()).unwrap();
+            let (lock, wake) = &*gate_for_loader;
+            let mut released = lock.lock().unwrap();
+            while !*released {
+                released = wake.wait(released).unwrap();
+            }
+            Err(io::ErrorKind::NotConnected.into())
+        });
+        let tree = VirtualTree::from_items("drive", "root", [file_item()]).unwrap();
+        let session = VirtualFuse::new(tree, dir.path().join("cache"), 10, loader)
+            .mount(&mountpoint)
+            .unwrap();
+        let file = mountpoint.join("текст.txt");
+        let reader = std::thread::spawn(move || fs::read(file));
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        let (listing_tx, listing_rx) = mpsc::channel();
+        let listing = std::thread::spawn(move || {
+            listing_tx
+                .send(fs::read_dir(mountpoint).unwrap().count())
+                .unwrap();
+        });
+        let listing_result = listing_rx.recv_timeout(Duration::from_secs(2));
+        let (lock, wake) = &*gate;
+        *lock.lock().unwrap() = true;
+        wake.notify_all();
+        assert_eq!(
+            reader.join().unwrap().unwrap_err().raw_os_error(),
+            Some(libc::ENETDOWN)
+        );
+        listing.join().unwrap();
+        assert_eq!(listing_result.unwrap(), 1);
         session.umount_and_join().unwrap();
     }
 }
