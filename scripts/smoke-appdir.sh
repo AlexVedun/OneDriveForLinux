@@ -15,6 +15,7 @@ test -r "$appdir/.DirIcon"
 cmp "$repo/LICENSE" "$appdir/usr/share/licenses/onedrive-linux/LICENSE"
 test "$(find "$appdir" -maxdepth 1 -name '*.desktop' | wc -l)" -eq 1
 desktop-file-validate "$appdir/io.github.onedrive_linux.desktop"
+appstreamcli validate --no-net "$appdir/usr/share/metainfo/io.github.onedrive_linux.appdata.xml"
 sh -n "$appdir/AppRun"
 sh "$repo/scripts/audit-appdir-libs.sh" "$appdir" > "$scratch/library-audit"
 grep -q '^onedrive-daemon:$' "$scratch/library-audit"

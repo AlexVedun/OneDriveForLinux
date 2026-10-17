@@ -29,11 +29,12 @@ esac
 mkdir -p "$(dirname -- "$output")"
 staging=$(mktemp -d "$(dirname -- "$output")/.onedrive-appdir.XXXXXX")
 trap 'rm -rf "$staging"' EXIT HUP INT TERM
-mkdir -p "$staging/usr/bin" "$staging/usr/share/applications" "$staging/usr/share/icons/hicolor/scalable/apps" "$staging/usr/share/licenses/onedrive-linux"
+mkdir -p "$staging/usr/bin" "$staging/usr/share/applications" "$staging/usr/share/icons/hicolor/scalable/apps" "$staging/usr/share/licenses/onedrive-linux" "$staging/usr/share/metainfo"
 install -m 755 "$repo/packaging/AppRun" "$staging/AppRun"
 install -m 755 "$target_dir/$binary_profile/onedrive-daemon" "$staging/usr/bin/onedrive-daemon"
 install -m 755 "$target_dir/$binary_profile/onedrive-desktop" "$staging/usr/bin/onedrive-desktop"
 install -m 644 "$repo/packaging/io.github.onedrive_linux.desktop" "$staging/usr/share/applications/io.github.onedrive_linux.desktop"
+install -m 644 "$repo/packaging/io.github.onedrive_linux.appdata.xml" "$staging/usr/share/metainfo/io.github.onedrive_linux.appdata.xml"
 install -m 644 "$repo/packaging/io.github.onedrive_linux.svg" "$staging/usr/share/icons/hicolor/scalable/apps/io.github.onedrive_linux.svg"
 install -m 644 "$repo/LICENSE" "$staging/usr/share/licenses/onedrive-linux/LICENSE"
 ln -s ../../AppRun "$staging/usr/bin/onedrive-linux"
