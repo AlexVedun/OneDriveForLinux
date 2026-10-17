@@ -71,10 +71,8 @@ def collect(input_dir, appdir):
     target = appdir / "usr/share/licenses/onedrive-linux"
     records = []
     packages = {}
-    for library in libraries:
-        source = sources.get(library.name)
-        if source is None:
-            raise RuntimeError(f"Cannot identify source of bundled library {library.name}")
+
+    def record_package(source):
         manager, package = package_for(source)
         key = (manager, package)
         if key not in packages:
@@ -88,9 +86,23 @@ def collect(input_dir, appdir):
                 copied.append(str(destination.relative_to(appdir)))
             packages[key] = {"manager": manager, "package": package,
                              "declared_license": declared, "license_files": copied}
+        return manager, package
+
+    for library in libraries:
+        source = sources.get(library.name)
+        if source is None:
+            raise RuntimeError(f"Cannot identify source of bundled library {library.name}")
+        manager, package = record_package(source)
         records.append({"library": library.name, "source": str(source),
                         "package": package, "manager": manager})
-    manifest = {"libraries": records, "packages": sorted(packages.values(),
+    icon_theme = appdir / "usr/share/icons/Adwaita/index.theme"
+    resources = []
+    if icon_theme.is_file():
+        manager, package = record_package(Path("/usr/share/icons/Adwaita/index.theme"))
+        resources.append({"resource": "usr/share/icons/Adwaita", "manager": manager,
+                          "package": package})
+    manifest = {"libraries": records, "resources": resources,
+                "packages": sorted(packages.values(),
                 key=lambda item: (item["manager"], item["package"]))}
     (target / "native-libraries.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")

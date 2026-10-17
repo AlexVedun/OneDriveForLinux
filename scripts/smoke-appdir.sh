@@ -60,6 +60,7 @@ cat > "$fake/usr/bin/onedrive-desktop" <<'EOF'
 #!/bin/sh
 printf '%s\n' "$LD_LIBRARY_PATH" > "$ONEDRIVE_APPDIR_SMOKE_LIBPATH"
 printf '%s\n' "$GSETTINGS_SCHEMA_DIR" > "$ONEDRIVE_APPDIR_SMOKE_SCHEMAS"
+printf '%s\n' "$XDG_DATA_DIRS" > "$ONEDRIVE_APPDIR_SMOKE_DATA_DIRS"
 sleep 1
 exit 7
 EOF
@@ -67,7 +68,9 @@ chmod +x "$fake/usr/bin/onedrive-daemon" "$fake/usr/bin/onedrive-desktop"
 export ONEDRIVE_APPDIR_SMOKE_MARKER="$scratch/daemon-stopped"
 export ONEDRIVE_APPDIR_SMOKE_LIBPATH="$scratch/library-path"
 export ONEDRIVE_APPDIR_SMOKE_SCHEMAS="$scratch/schema-path"
-if LD_LIBRARY_PATH="$scratch/host-lib" GSETTINGS_SCHEMA_DIR="$scratch/host-schemas" "$fake/AppRun"; then
+export ONEDRIVE_APPDIR_SMOKE_DATA_DIRS="$scratch/data-dirs"
+if LD_LIBRARY_PATH="$scratch/host-lib" GSETTINGS_SCHEMA_DIR="$scratch/host-schemas" \
+    XDG_DATA_DIRS="$scratch/host-data" "$fake/AppRun"; then
     echo "AppRun lost the desktop exit status" >&2
     exit 1
 else
@@ -79,3 +82,4 @@ expected_libpath="$fake/usr/lib:$fake/usr/lib64:$fake/usr/lib/x86_64-linux-gnu:$
 test "$(cat "$ONEDRIVE_APPDIR_SMOKE_LIBPATH")" = "$expected_libpath"
 expected_schemas="$fake/usr/share/glib-2.0/schemas:$scratch/host-schemas"
 test "$(cat "$ONEDRIVE_APPDIR_SMOKE_SCHEMAS")" = "$expected_schemas"
+test "$(cat "$ONEDRIVE_APPDIR_SMOKE_DATA_DIRS")" = "$fake/usr/share:$scratch/host-data"
