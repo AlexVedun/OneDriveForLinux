@@ -22,6 +22,26 @@ sh "$repo/scripts/bundle-appdir-libs.sh" "$scratch/input.AppDir" "$scratch/bundl
 bundled="$scratch/bundled.AppDir"
 test -x "$bundled/usr/bin/onedrive-desktop"
 cmp "$repo/LICENSE" "$bundled/usr/share/licenses/onedrive-linux/LICENSE"
+python3 - "$bundled" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+appdir = Path(sys.argv[1])
+licenses = appdir / "usr/share/licenses/onedrive-linux"
+manifest = json.loads((licenses / "native-libraries.json").read_text())
+bundled = {path.name for path in (appdir / "usr/lib").iterdir()
+           if path.is_file() and ".so" in path.name}
+assert {item["library"] for item in manifest["libraries"]} == bundled
+packages = {(item["manager"], item["package"]): item for item in manifest["packages"]}
+libraries = {item["library"]: item for item in manifest["libraries"]}
+for library in ("libgtk-4.so.1", "libadwaita-1.so.0", "libglib-2.0.so.0"):
+    owner = libraries[library]
+    assert packages[(owner["manager"], owner["package"])]["license_files"], library
+for package in manifest["packages"]:
+    for name in package["license_files"]:
+        assert (appdir / name).is_file(), name
+PY
 desktop-file-validate "$bundled/io.github.onedrive_linux.desktop"
 schema_dir="$bundled/usr/share/glib-2.0/schemas"
 test -s "$schema_dir/gschemas.compiled"
