@@ -287,13 +287,14 @@ LINUXDEPLOY=/path/to/linuxdeploy-x86_64.AppImage \
   sh scripts/bundle-appdir-libs.sh /tmp/OneDriveForLinux.AppDir /tmp/OneDriveForLinux-bundled.AppDir
 ```
 
-Скрипт не меняет исходный каталог, сохраняет `AppRun` и проверяет, что GTK,
-libadwaita и GLib берутся из результата. Для проверки выполните
+Скрипт не меняет исходный каталог, сохраняет `AppRun`, вкладывает и компилирует
+схемы GSettings для GTK 4 и проверяет, что GTK, libadwaita и GLib берутся из
+результата. Для проверки выполните
 `LINUXDEPLOY=/path/to/linuxdeploy-x86_64.AppImage sh scripts/smoke-bundle-appdir.sh`.
 Локальный тест окна и трея из собранного каталога запускается командой
 `ONEDRIVE_SMOKE_BINARY_DIR=/path/to/bundled.AppDir/usr/bin dbus-run-session -- sh scripts/smoke-tray.sh`.
-Этот этап ещё не упаковывает ресурсы GTK, загружаемые во время работы, и
-лицензии сторонних библиотек. Переносимость AppImage и запуск на целевых
+Другие ресурсы GTK, которые могут загружаться во время работы, и лицензии
+сторонних библиотек ещё не упакованы. Переносимость AppImage и запуск на целевых
 дистрибутивах остаются непроверенными; релиз нужно собирать на выбранной
 минимальной версии Linux.
 Демон записывает точку виртуального диска в `XDG_STATE_HOME/onedrive-linux/virtual-mount-path`.

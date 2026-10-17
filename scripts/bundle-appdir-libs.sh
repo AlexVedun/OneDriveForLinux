@@ -53,6 +53,23 @@ printf '%s\n' "$audit" | grep -q '^  BUNDLED libadwaita-1.so.0 '
 printf '%s\n' "$audit" | grep -q '^  BUNDLED libgio-2.0.so.0 '
 printf '%s\n' "$audit" | grep -q '^  BUNDLED libglib-2.0.so.0 '
 cmp "$repo/packaging/AppRun" "$staging/AppRun"
+
+schema_source=$(pkg-config --variable=schemasdir gio-2.0)
+if [ ! -d "$schema_source" ]; then
+    echo "GSettings schema directory is unavailable: $schema_source" >&2
+    exit 2
+fi
+set -- "$schema_source"/org.gtk.gtk4.*.gschema.xml
+if [ ! -f "$1" ]; then
+    echo "GTK 4 GSettings schemas are unavailable in $schema_source" >&2
+    exit 2
+fi
+schema_target="$staging/usr/share/glib-2.0/schemas"
+mkdir -p "$schema_target"
+install -m 644 "$@" "$schema_target/"
+glib-compile-schemas --strict "$schema_target"
+test -s "$schema_target/gschemas.compiled"
+
 mv -T --no-clobber "$staging" "$output"
 if [ -e "$staging" ]; then
     echo "AppDir appeared during bundling: $output" >&2
