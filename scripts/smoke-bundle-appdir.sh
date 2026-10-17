@@ -38,6 +38,10 @@ libraries = {item["library"]: item for item in manifest["libraries"]}
 for library in ("libgtk-4.so.1", "libadwaita-1.so.0", "libglib-2.0.so.0"):
     owner = libraries[library]
     assert packages[(owner["manager"], owner["package"])]["license_files"], library
+assert (appdir / "usr/share/icons/Adwaita/index.theme").is_file()
+theme = next(item for item in manifest["resources"]
+             if item["resource"] == "usr/share/icons/Adwaita")
+assert packages[(theme["manager"], theme["package"])]["license_files"]
 for package in manifest["packages"]:
     for name in package["license_files"]:
         assert (appdir / name).is_file(), name

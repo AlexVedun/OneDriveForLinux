@@ -70,6 +70,14 @@ install -m 644 "$@" "$schema_target/"
 glib-compile-schemas --strict "$schema_target"
 test -s "$schema_target/gschemas.compiled"
 
+icon_theme=/usr/share/icons/Adwaita
+if [ ! -f "$icon_theme/index.theme" ]; then
+    echo "Adwaita icon theme is unavailable: $icon_theme" >&2
+    exit 2
+fi
+mkdir -p "$staging/usr/share/icons"
+cp -a "$icon_theme" "$staging/usr/share/icons/"
+
 python3 "$repo/scripts/collect-appdir-licenses.py" "$input" "$staging"
 
 mv -T --no-clobber "$staging" "$output"
