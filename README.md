@@ -310,6 +310,14 @@ APPIMAGETOOL_RUNTIME_FILE=/path/to/runtime-x86_64 \
   sh scripts/build-appimage.sh
 ```
 
+Для повторной сборки из RustRover выберите конфигурацию **Build AppImage**
+в верхней панели и нажмите Run. Она запускает `scripts/rebuild-appimage.sh`:
+при первом запуске скрипт загружает и проверяет упаковщики в
+`target/appimage-tools`, а после успешной сборки заменяет файл в `target/dist`.
+При ошибке предыдущий AppImage сохраняется. Тот же скрипт можно запускать из
+терминала командой `sh scripts/rebuild-appimage.sh`. Если конфигурация не видна
+в RustRover, включите плагин **Shell Script** и повторно откройте проект.
+
 Версия берётся из `[workspace.package].version` в корневом `Cargo.toml`.
 Например, для `1.0.0` результат по умолчанию —
 `target/dist/OneDriveForLinux-1.0.0-x86_64.AppImage`; путь можно передать
