@@ -3,6 +3,7 @@
 pub mod directory;
 pub mod draft;
 pub mod fuse;
+pub mod mutation;
 pub mod preflight;
 
 use onedrive_cache::{CacheError, CacheKey, CacheStore};

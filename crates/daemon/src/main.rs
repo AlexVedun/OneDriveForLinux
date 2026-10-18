@@ -8,8 +8,8 @@ mod virtual_upload;
 use auth::LoginAttempt;
 use graph::{
     CreatedVirtualExpectation, FolderCreateError, GraphClient, GraphUpload, QueuedDownloadError,
-    QueuedDownloadTarget, RemoteDeleteError, RemoteRenameError, RemoteRenameInput,
-    VirtualDownloadError,
+    QueuedDownloadTarget, RemoteDeleteError, RemoteDeleteInput, RemoteRenameError,
+    RemoteRenameInput, VirtualDownloadError,
 };
 use keyring::v1::Entry;
 use oauth2::{TokenResponse, basic::BasicTokenResponse};
@@ -20,6 +20,7 @@ use onedrive_mount::{DownloadRequest, VirtualTree};
 use onedrive_mount::{
     draft::{DraftStore, DraftUploadFailure, DraftUploadIssue},
     fuse::VirtualFuse,
+    mutation::{Mutation, MutationKind, MutationStatus, MutationStore},
     preflight,
 };
 use onedrive_sync::{
@@ -395,6 +396,32 @@ impl Daemon {
 
 #[zbus::interface(name = "io.github.onedrive_linux.Daemon")]
 impl Daemon {
+    fn virtual_mutations(&self) -> zbus::fdo::Result<String> {
+        let root = state_directory()
+            .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?
+            .join("virtual-drafts");
+        let mutations = if root.exists() {
+            MutationStore::open(&root)
+                .and_then(|store| store.list())
+                .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?
+        } else {
+            Vec::new()
+        };
+        serde_json::to_string(&mutations)
+            .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))
+    }
+
+    fn confirm_virtual_mass_delete(&self, expected_count: u64) -> zbus::fdo::Result<()> {
+        let root = state_directory()
+            .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?
+            .join("virtual-drafts");
+        let count = usize::try_from(expected_count)
+            .map_err(|_| zbus::fdo::Error::InvalidArgs("invalid deletion count".to_owned()))?;
+        MutationStore::open(&root)
+            .and_then(|store| store.approve_deletions(count))
+            .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))
+    }
+
     /// UI capability flag only; RunVirtualDraftUpload repeats all safety checks.
     fn virtual_draft_upload_enabled(&self) -> bool {
         std::env::var("ONEDRIVE_EXPERIMENTAL_VIRTUAL_UPLOAD").as_deref() == Ok("1")
@@ -3216,6 +3243,201 @@ async fn poll_virtual_drafts(daemon: Daemon) {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MutationAttempt {
+    Applied,
+    Conflict,
+    Retry,
+}
+
+fn virtual_mutation_matches_catalog(catalog: &Catalog, mutation: &Mutation) -> bool {
+    if catalog.active_drive_id().ok().flatten().as_deref() != Some(&mutation.drive_id)
+        || !catalog.is_complete(&mutation.drive_id).unwrap_or(false)
+    {
+        return false;
+    }
+    let Ok(Some(item)) = catalog.item(&mutation.drive_id, &mutation.item_id) else {
+        return false;
+    };
+    !item.deleted
+        && item.parent_id.as_deref() == Some(&mutation.parent_id)
+        && item.name.as_deref() == Some(&mutation.name)
+        && item.etag.as_deref() == Some(&mutation.etag)
+        && (item.kind == "folder") == mutation.directory
+}
+
+async fn run_virtual_mutation(
+    daemon: &Daemon,
+    mutation: &Mutation,
+    client_id: &str,
+) -> MutationAttempt {
+    let token = match access_token_detailed(client_id).await {
+        Ok(token) => token,
+        Err(_) => return MutationAttempt::Retry,
+    };
+    let graph = match GraphClient::new() {
+        Ok(graph) => graph,
+        Err(_) => return MutationAttempt::Retry,
+    };
+    let live_drive = match graph.drive_id(&token).await {
+        Ok(drive) => drive,
+        Err(_) => return MutationAttempt::Retry,
+    };
+    if live_drive != mutation.drive_id {
+        return MutationAttempt::Conflict;
+    }
+    {
+        let catalog = daemon.catalog.lock().unwrap();
+        if !virtual_mutation_matches_catalog(&catalog, mutation) {
+            return MutationAttempt::Conflict;
+        }
+        if let MutationKind::Rename {
+            target_parent_id,
+            target_name,
+        } = &mutation.kind
+        {
+            let parent_exists = catalog
+                .root_id(&mutation.drive_id)
+                .ok()
+                .flatten()
+                .as_deref()
+                == Some(target_parent_id)
+                || catalog
+                    .item(&mutation.drive_id, target_parent_id)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|item| !item.deleted && item.kind == "folder");
+            let occupied = catalog.items(&mutation.drive_id).ok().is_some_and(|items| {
+                items.iter().any(|item| {
+                    !item.deleted
+                        && item.item_id != mutation.item_id
+                        && item.parent_id.as_deref() == Some(target_parent_id)
+                        && item.name.as_deref() == Some(target_name)
+                })
+            });
+            if !parent_exists || occupied {
+                return MutationAttempt::Conflict;
+            }
+        }
+    }
+    match &mutation.kind {
+        MutationKind::Delete => {
+            if mutation.directory {
+                match graph
+                    .remote_folder_is_empty(&mutation.drive_id, &mutation.item_id, &token)
+                    .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => return MutationAttempt::Conflict,
+                    Err(_) => return MutationAttempt::Retry,
+                }
+            }
+            match graph
+                .delete_remote_item(
+                    &mutation.drive_id,
+                    &RemoteDeleteInput {
+                        item_id: &mutation.item_id,
+                        parent_id: &mutation.parent_id,
+                        name: &mutation.name,
+                        etag: &mutation.etag,
+                    },
+                    mutation.directory,
+                    &token,
+                )
+                .await
+            {
+                Ok(()) => MutationAttempt::Applied,
+                Err(RemoteDeleteError::Conflict) => MutationAttempt::Conflict,
+                Err(RemoteDeleteError::Retry | RemoteDeleteError::NeedsReconcile) => {
+                    MutationAttempt::Retry
+                }
+            }
+        }
+        MutationKind::Rename {
+            target_parent_id,
+            target_name,
+        } => {
+            let input = RemoteRenameInput {
+                item_id: &mutation.item_id,
+                source_parent_id: &mutation.parent_id,
+                source_name: &mutation.name,
+                target_parent_id,
+                target_name,
+                etag: &mutation.etag,
+            };
+            match graph
+                .rename_remote_item(&mutation.drive_id, &input, mutation.directory, &token)
+                .await
+            {
+                Ok(_) => MutationAttempt::Applied,
+                Err(RemoteRenameError::Conflict) => MutationAttempt::Conflict,
+                Err(RemoteRenameError::Retry | RemoteRenameError::NeedsReconcile) => {
+                    MutationAttempt::Retry
+                }
+            }
+        }
+    }
+}
+
+async fn poll_virtual_mutations(daemon: Daemon, state_root: PathBuf, client_id: String) {
+    let mut interval = tokio::time::interval(Duration::from_secs(15));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        interval.tick().await;
+        if !matches!(
+            *daemon.state.lock().unwrap(),
+            EngineState::Connected | EngineState::Synced
+        ) || daemon.sync_paused().unwrap_or(true)
+            || daemon.scan_in_progress.load(Ordering::SeqCst)
+            || daemon.download_in_progress.load(Ordering::SeqCst)
+            || daemon
+                .upload_in_progress
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+        {
+            continue;
+        }
+        let _busy = BusyFlagGuard(Arc::clone(&daemon.upload_in_progress));
+        let root = state_root.join("virtual-drafts");
+        if !root.exists() {
+            continue;
+        }
+        let store = match MutationStore::open(&root) {
+            Ok(store) => store,
+            Err(error) => {
+                eprintln!("cannot open virtual mutation queue: {error}");
+                continue;
+            }
+        };
+        let mutations = match store.list() {
+            Ok(mutations) => mutations,
+            Err(error) => {
+                eprintln!("cannot read virtual mutation queue: {error}");
+                continue;
+            }
+        };
+        // A large deletion batch needs explicit review before any remote removal.
+        if !store.deletions_approved(&mutations).unwrap_or(false) {
+            continue;
+        }
+        let Some(mutation) = mutations
+            .into_iter()
+            .find(|entry| entry.status == MutationStatus::Pending)
+        else {
+            continue;
+        };
+        let result = run_virtual_mutation(&daemon, &mutation, &client_id).await;
+        let status = match result {
+            MutationAttempt::Applied => MutationStatus::Applied,
+            MutationAttempt::Conflict => MutationStatus::Conflict,
+            MutationAttempt::Retry => continue,
+        };
+        if let Err(error) = store.update_status(&mutation, status) {
+            eprintln!("cannot update virtual mutation: {error}");
+        }
+    }
+}
+
 fn catalog_ready_for_drive(catalog: &Catalog, drive_id: &str) -> bool {
     catalog.active_drive_id().ok().flatten().as_deref() == Some(drive_id)
         && catalog.is_complete(drive_id).unwrap_or(false)
@@ -3404,12 +3626,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let automatic_upload = daemon.clone();
     let automatic_mount = daemon.clone();
+    let automatic_mutations = daemon.clone();
     let _connection = Builder::session()?
         .name(BUS_NAME)?
         .serve_at(OBJECT_PATH, daemon)?
         .build()
         .await?;
     if let Some(client_id) = client_id() {
+        if std::env::var("ONEDRIVE_SMOKE_NO_RESTORE").as_deref() != Ok("1") {
+            tokio::spawn(poll_virtual_mutations(
+                automatic_mutations,
+                state_path.clone(),
+                client_id.clone(),
+            ));
+        }
         let configured_mount = match mount_record::configured(&state_path) {
             Ok(path) => path.is_some(),
             Err(error) => {
