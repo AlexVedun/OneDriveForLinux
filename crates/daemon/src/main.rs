@@ -712,6 +712,17 @@ impl Daemon {
             .unwrap_or_default()
     }
 
+    fn virtual_configured_mount_path(&self) -> zbus::fdo::Result<String> {
+        let root =
+            state_directory().map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
+        mount_record::configured(&root)
+            .map(|path| {
+                path.map(|path| path.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            })
+            .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))
+    }
+
     fn virtual_mount_recovery_path(&self) -> zbus::fdo::Result<String> {
         if self.virtual_mount.lock().unwrap().is_some()
             || self.mount_in_progress.load(Ordering::SeqCst)
@@ -779,6 +790,9 @@ impl Daemon {
                 .map_err(|error| zbus::fdo::Error::InvalidArgs(error.to_string()))?;
         onedrive_core::validate_distinct_paths(&[&mount_path, &draft_root])
             .map_err(|error| zbus::fdo::Error::InvalidArgs(error.to_string()))?;
+        mount_record::configure(&state_root, &mount_path).map_err(|error| {
+            zbus::fdo::Error::Failed(format!("cannot save virtual mount path: {error}"))
+        })?;
         preflight::check_fuse_device()
             .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
         let tree = {
@@ -3202,6 +3216,88 @@ async fn poll_virtual_drafts(daemon: Daemon) {
     }
 }
 
+fn catalog_ready_for_drive(catalog: &Catalog, drive_id: &str) -> bool {
+    catalog.active_drive_id().ok().flatten().as_deref() == Some(drive_id)
+        && catalog.is_complete(drive_id).unwrap_or(false)
+        && catalog.root_id(drive_id).ok().flatten().is_some()
+}
+
+/// A saved mount path is attempted once the account and its catalog are ready.
+/// A failed FUSE mount is left for the user to inspect rather than retried over a busy path.
+async fn auto_mount_configured(daemon: Daemon, state_root: PathBuf, client_id: String) {
+    let mut interval = tokio::time::interval(Duration::from_secs(5));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        interval.tick().await;
+        let path = match mount_record::configured(&state_root) {
+            Ok(Some(path)) => path,
+            Ok(None) => return,
+            Err(error) => {
+                eprintln!("cannot read configured virtual mount path: {error}");
+                return;
+            }
+        };
+        if daemon.virtual_mount.lock().unwrap().is_some() {
+            return;
+        }
+        if !matches!(
+            *daemon.state.lock().unwrap(),
+            EngineState::Connected | EngineState::Synced
+        ) {
+            continue;
+        }
+        if daemon.mount_in_progress.load(Ordering::SeqCst)
+            || daemon.upload_in_progress.load(Ordering::SeqCst)
+            || daemon.scan_in_progress.load(Ordering::SeqCst)
+        {
+            continue;
+        }
+        let token = match access_token_detailed(&client_id).await {
+            Ok(token) => token,
+            Err(_) => {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                continue;
+            }
+        };
+        let graph = match GraphClient::new() {
+            Ok(graph) => graph,
+            Err(_) => return,
+        };
+        let drive_id = match graph.drive_id(&token).await {
+            Ok(drive_id) => drive_id,
+            Err(_) => {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                continue;
+            }
+        };
+        if !catalog_ready_for_drive(&daemon.catalog.lock().unwrap(), &drive_id) {
+            if daemon
+                .scan_in_progress
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+            {
+                continue;
+            }
+            let _busy = BusyFlagGuard(Arc::clone(&daemon.scan_in_progress));
+            let result = scan_catalog(Arc::clone(&daemon.catalog), client_id.clone()).await;
+            drop(_busy);
+            if let Err(error) = result {
+                eprintln!("cannot prepare catalog for automatic virtual mount: {error:?}");
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+            continue;
+        }
+        let Some(path) = path.to_str() else {
+            eprintln!("configured virtual mount path is not UTF-8");
+            return;
+        };
+        if let Err(error) = daemon.mount_virtual_drive(path).await {
+            eprintln!("cannot automatically mount virtual drive at {path}: {error}");
+        }
+        return;
+    }
+}
+
 fn virtual_upload_issue(error: &zbus::fdo::Error) -> DraftUploadIssue {
     let message = error.to_string();
     if message.contains("login is required") {
@@ -3307,12 +3403,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         mount_in_progress: Arc::new(AtomicBool::new(false)),
     };
     let automatic_upload = daemon.clone();
+    let automatic_mount = daemon.clone();
     let _connection = Builder::session()?
         .name(BUS_NAME)?
         .serve_at(OBJECT_PATH, daemon)?
         .build()
         .await?;
     if let Some(client_id) = client_id() {
+        let configured_mount = match mount_record::configured(&state_path) {
+            Ok(path) => path.is_some(),
+            Err(error) => {
+                eprintln!("cannot read configured virtual mount path: {error}");
+                false
+            }
+        };
+        if configured_mount && std::env::var("ONEDRIVE_SMOKE_NO_RESTORE").as_deref() != Ok("1") {
+            tokio::spawn(auto_mount_configured(
+                automatic_mount,
+                state_path.clone(),
+                client_id.clone(),
+            ));
+        }
         if automatic_upload.virtual_draft_auto_upload_enabled() {
             tokio::spawn(poll_virtual_drafts(automatic_upload));
         }
@@ -3346,10 +3457,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::{
         Baseline, CatalogItem, QueuedOperation, ScanCatalogError, VIRTUAL_CACHE_BYTES,
-        VirtualDownloadContext, client_config_path, client_id_from_dotenv, client_id_from_sources,
-        inspect_virtual_cache, is_network_failure, local_delete_candidate, prepare_virtual_request,
-        publish_virtual_file, remote_delete_candidate, remote_folder_candidate,
-        remote_rename_candidate, scan_outcome_state, virtual_upload_issue,
+        VirtualDownloadContext, catalog_ready_for_drive, client_config_path, client_id_from_dotenv,
+        client_id_from_sources, inspect_virtual_cache, is_network_failure, local_delete_candidate,
+        prepare_virtual_request, publish_virtual_file, remote_delete_candidate,
+        remote_folder_candidate, remote_rename_candidate, scan_outcome_state, virtual_upload_issue,
     };
     use onedrive_cache::{CacheError, CacheStore};
     use onedrive_catalog::{Catalog, DeltaPage};
@@ -3359,6 +3470,29 @@ mod tests {
     use std::io;
     use std::path::Path;
     use std::sync::{Arc, Mutex, atomic::AtomicBool};
+
+    #[test]
+    fn automatic_mount_waits_for_matching_complete_catalog() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut catalog = Catalog::open(&dir.path().join("catalog.sqlite")).unwrap();
+        catalog.set_active_drive_id("drive").unwrap();
+        assert!(!catalog_ready_for_drive(&catalog, "drive"));
+        catalog.set_root_id("drive", "root").unwrap();
+        catalog
+            .apply_page(
+                "drive",
+                &DeltaPage {
+                    value: Vec::new(),
+                    next_link: None,
+                    delta_link: Some(
+                        "https://graph.microsoft.com/v1.0/me/drive/root/delta?done=1".into(),
+                    ),
+                },
+            )
+            .unwrap();
+        assert!(catalog_ready_for_drive(&catalog, "drive"));
+        assert!(!catalog_ready_for_drive(&catalog, "other-drive"));
+    }
 
     #[test]
     fn upload_failure_record_uses_only_known_codes() {

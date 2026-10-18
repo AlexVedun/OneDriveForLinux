@@ -334,6 +334,10 @@ fn read_virtual_mount_path() -> zbus::Result<String> {
     daemon_call("VirtualMountPath")
 }
 
+fn read_virtual_configured_mount_path() -> zbus::Result<String> {
+    daemon_call("VirtualConfiguredMountPath")
+}
+
 fn read_virtual_mount_recovery_path() -> zbus::Result<String> {
     daemon_call("VirtualMountRecoveryPath")
 }
@@ -450,10 +454,11 @@ fn fuse_diagnostics_label(device: &str, helper: bool) -> &'static str {
     }
 }
 
-fn virtual_mount_paths() -> zbus::Result<(String, String)> {
+fn virtual_mount_paths() -> zbus::Result<(String, String, String)> {
     let current = read_virtual_mount_path()?;
     let recovery = read_virtual_mount_recovery_path()?;
-    Ok((current, recovery))
+    let configured = read_virtual_configured_mount_path()?;
+    Ok((current, recovery, configured))
 }
 
 fn mount_virtual_drive(path: &str) -> zbus::Result<String> {
@@ -807,19 +812,26 @@ impl VirtualMountControls {
         }
     }
 
-    fn show_path(&self, paths: Option<(&str, &str)>) {
+    fn show_path(&self, paths: Option<(&str, &str, &str)>) {
         match paths {
-            Some(("", "")) => {
+            Some(("", "", "")) => {
                 self.label.set_text("Виртуальный диск не подключён");
                 self.mount.set_sensitive(true);
                 self.unmount.set_sensitive(false);
             }
-            Some(("", recovery)) => {
+            Some(("", recovery, _)) if !recovery.is_empty() => {
                 self.label.set_text(&format!("Прежняя точка монтирования занята: {recovery}. Проверьте её и отключите через fusermount3 -u"));
                 self.mount.set_sensitive(false);
                 self.unmount.set_sensitive(false);
             }
-            Some((path, _)) => {
+            Some(("", "", configured)) => {
+                self.label.set_text(&format!(
+                    "Виртуальный диск не подключён. Настроена папка: {configured}"
+                ));
+                self.mount.set_sensitive(true);
+                self.unmount.set_sensitive(false);
+            }
+            Some((path, _, _)) => {
                 self.label.set_text(&format!("Виртуальный диск: {path}"));
                 self.mount.set_sensitive(false);
                 self.unmount.set_sensitive(true);
@@ -862,7 +874,9 @@ impl VirtualMountControls {
                     .0
                     .as_ref()
                     .ok()
-                    .map(|(current, recovery)| (current.as_str(), recovery.as_str())),
+                    .map(|(current, recovery, configured)| {
+                        (current.as_str(), recovery.as_str(), configured.as_str())
+                    }),
             );
             controls.show_diagnostics(result.1);
             controls.show_drafts(result.2);
@@ -913,7 +927,9 @@ impl VirtualMountControls {
                     .1
                     .as_ref()
                     .ok()
-                    .map(|(current, recovery)| (current.as_str(), recovery.as_str())),
+                    .map(|(current, recovery, configured)| {
+                        (current.as_str(), recovery.as_str(), configured.as_str())
+                    }),
             );
             controls.show_diagnostics(result.2);
             controls.show_drafts(result.3);

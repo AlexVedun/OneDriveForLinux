@@ -6,14 +6,14 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 
 const FILE_NAME: &str = "virtual-mount-path";
+const CONFIG_FILE_NAME: &str = "virtual-mount-configured-path";
 
 fn record_path(state_root: &Path) -> PathBuf {
     state_root.join(FILE_NAME)
 }
 
-fn read(state_root: &Path) -> io::Result<Option<PathBuf>> {
-    let file = record_path(state_root);
-    let metadata = match fs::symlink_metadata(&file) {
+fn read_path(file: &Path) -> io::Result<Option<PathBuf>> {
+    let metadata = match fs::symlink_metadata(file) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
@@ -34,6 +34,25 @@ fn read(state_root: &Path) -> io::Result<Option<PathBuf>> {
     Ok(Some(PathBuf::from(OsString::from_vec(bytes))))
 }
 
+fn read(state_root: &Path) -> io::Result<Option<PathBuf>> {
+    read_path(&record_path(state_root))
+}
+
+/// User-selected mount directory, separate from the current mount intent record.
+pub fn configured(state_root: &Path) -> io::Result<Option<PathBuf>> {
+    read_path(&state_root.join(CONFIG_FILE_NAME))
+}
+
+pub fn configure(state_root: &Path, path: &Path) -> io::Result<()> {
+    if !path.is_absolute() || path.as_os_str().as_bytes().contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid configured mount path",
+        ));
+    }
+    write_path(state_root, &state_root.join(CONFIG_FILE_NAME), path)
+}
+
 /// Return an occupied mount left by an earlier daemon. Clear an unused intent record.
 pub fn pending(state_root: &Path) -> io::Result<Option<PathBuf>> {
     let Some(path) = read(state_root)? else {
@@ -49,10 +68,14 @@ pub fn pending(state_root: &Path) -> io::Result<Option<PathBuf>> {
 
 /// Record intent before mounting so a daemon crash cannot lose the mount path.
 pub fn write(state_root: &Path, path: &Path) -> io::Result<()> {
+    write_path(state_root, &record_path(state_root), path)
+}
+
+fn write_path(state_root: &Path, destination: &Path, path: &Path) -> io::Result<()> {
     let mut temporary = tempfile::NamedTempFile::new_in(state_root)?;
     temporary.write_all(path.as_os_str().as_bytes())?;
     temporary.as_file().sync_all()?;
-    temporary.persist(record_path(state_root))?;
+    temporary.persist(destination)?;
     File::open(state_root)?.sync_all()?;
     Ok(())
 }
@@ -103,6 +126,12 @@ mod tests {
             read(state.path()).unwrap_err().kind(),
             io::ErrorKind::InvalidData
         );
+        let configured_file = state.path().join(CONFIG_FILE_NAME);
+        std::os::unix::fs::symlink("/etc/passwd", &configured_file).unwrap();
+        assert_eq!(
+            configured(state.path()).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
     }
 
     #[test]
@@ -111,5 +140,25 @@ mod tests {
         write(state.path(), Path::new("/")).unwrap();
         assert_eq!(pending(state.path()).unwrap(), Some(PathBuf::from("/")));
         assert_eq!(read(state.path()).unwrap(), Some(PathBuf::from("/")));
+    }
+
+    #[test]
+    fn configured_path_survives_unmount_record_cleanup() {
+        let state = tempfile::tempdir().unwrap();
+        let mount = state.path().join("One Drive");
+        configure(state.path(), &mount).unwrap();
+        write(state.path(), &mount).unwrap();
+        clear(state.path()).unwrap();
+        assert_eq!(configured(state.path()).unwrap(), Some(mount));
+        assert_eq!(read(state.path()).unwrap(), None);
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(state.path().join(CONFIG_FILE_NAME))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
     }
 }

@@ -41,7 +41,10 @@ tray_ready=false
 while [ "$attempt" -lt 25 ]; do
     if gdbus call --session --dest io.github.onedrive_linux.Daemon \
         --object-path /io/github/onedrive_linux/Daemon \
-        --method io.github.onedrive_linux.Daemon.SyncPaused >/dev/null 2>&1; then
+        --method io.github.onedrive_linux.Daemon.SyncPaused >/dev/null 2>&1 && \
+       gdbus call --session --dest io.github.onedrive_linux.Daemon \
+        --object-path /io/github/onedrive_linux/Daemon \
+        --method io.github.onedrive_linux.Daemon.VirtualConfiguredMountPath >/dev/null 2>&1; then
         daemon_ready=true
     fi
     names=$(gdbus call --session --dest org.freedesktop.DBus \
