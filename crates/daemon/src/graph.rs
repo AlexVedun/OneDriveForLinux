@@ -48,6 +48,46 @@ struct UploadedItem {
 }
 
 #[derive(Deserialize)]
+struct CreatedVirtualFile {
+    id: String,
+    name: String,
+    size: u64,
+    #[serde(rename = "eTag")]
+    etag: Option<String>,
+    file: Option<serde_json::Value>,
+    #[serde(rename = "parentReference")]
+    parent_reference: Option<FolderParent>,
+}
+
+pub struct CreatedVirtualExpectation<'a> {
+    pub item_id: &'a str,
+    pub parent_id: &'a str,
+    pub name: &'a str,
+    pub etag: &'a str,
+    pub size: u64,
+}
+
+fn created_virtual_file_matches(
+    item: &CreatedVirtualFile,
+    id: &str,
+    parent: &str,
+    name: &str,
+    etag: &str,
+    size: u64,
+) -> bool {
+    item.id == id
+        && item.name == name
+        && item.size == size
+        && item.etag.as_deref() == Some(etag)
+        && item.file.is_some()
+        && item
+            .parent_reference
+            .as_ref()
+            .and_then(|value| value.id.as_deref())
+            == Some(parent)
+}
+
+#[derive(Deserialize)]
 struct UploadedEmptyItem {
     id: String,
     #[serde(rename = "eTag")]
@@ -274,6 +314,39 @@ impl<'a> GraphUpload<'a> {
                     .build()
                     .map_err(|_| UploadError::InvalidResponse)
             }
+            "UploadNewByParent" => {
+                let parent_id = operation
+                    .remote_id
+                    .as_deref()
+                    .filter(|id| !id.is_empty())
+                    .ok_or(UploadError::InvalidResponse)?;
+                let name = operation.path.as_str();
+                if operation.expected_etag.is_some() || !valid_new_file_name(name) || size == 0 {
+                    return Err(UploadError::InvalidResponse);
+                }
+                url.path_segments_mut()
+                    .map_err(|_| UploadError::InvalidResponse)?
+                    .pop_if_empty()
+                    .extend([
+                        "drives",
+                        self.drive_id,
+                        "items",
+                        &format!("{parent_id}:"),
+                        &format!("{name}:"),
+                        "createUploadSession",
+                    ]);
+                self.graph
+                    .http
+                    .post(url)
+                    .bearer_auth(self.access_token)
+                    .json(&serde_json::json!({"item": {
+                        "@microsoft.graph.conflictBehavior": "fail",
+                        "name": name,
+                        "fileSize": size,
+                    }}))
+                    .build()
+                    .map_err(|_| UploadError::InvalidResponse)
+            }
             _ => Err(UploadError::InvalidResponse),
         }
     }
@@ -384,7 +457,7 @@ fn item_metadata_url(drive_id: &str, item_id: &str) -> Result<reqwest::Url, Fetc
         .map_err(|_| FetchError::Failed)?
         .pop();
     url.query_pairs_mut()
-        .append_pair("$select", "id,eTag,size,file");
+        .append_pair("$select", "id,name,parentReference,eTag,size,file");
     Ok(url)
 }
 
@@ -969,6 +1042,29 @@ impl GraphClient {
         )
     }
 
+    pub async fn matches_created_virtual_file(
+        &self,
+        drive_id: &str,
+        expected: &CreatedVirtualExpectation<'_>,
+        access_token: &str,
+    ) -> Result<bool, FetchError> {
+        let url = item_metadata_url(drive_id, expected.item_id)?;
+        let item: CreatedVirtualFile = self
+            .get_with_retry(url.as_str(), access_token)
+            .await?
+            .json()
+            .await
+            .map_err(transport_fetch_error)?;
+        Ok(created_virtual_file_matches(
+            &item,
+            expected.item_id,
+            expected.parent_id,
+            expected.name,
+            expected.etag,
+            expected.size,
+        ))
+    }
+
     async fn content_response(
         &self,
         drive_id: &str,
@@ -1305,5 +1401,49 @@ mod tests {
         operation.path = "new.txt".into();
         operation.remote_id = Some("existing".into());
         assert!(upload.create_session_request(&operation, 42).is_err());
+    }
+
+    #[test]
+    fn virtual_new_upload_uses_parent_id_and_fails_on_conflict() {
+        let graph = GraphClient::new().unwrap();
+        let upload = GraphUpload::new(&graph, "drive", "test-token").unwrap();
+        let mut operation = QueuedOperation {
+            id: 0,
+            kind: "UploadNewByParent".into(),
+            path: "new file.txt".into(),
+            from_path: None,
+            remote_id: Some("parent-id".into()),
+            expected_etag: None,
+            local_fingerprint: None,
+            attempts: 0,
+        };
+        let request = upload.create_session_request(&operation, 42).unwrap();
+        assert_eq!(
+            request.url().path(),
+            "/v1.0/drives/drive/items/parent-id:/new%20file.txt:/createUploadSession"
+        );
+        let body: serde_json::Value =
+            serde_json::from_slice(request.body().unwrap().as_bytes().unwrap()).unwrap();
+        assert_eq!(body["item"]["@microsoft.graph.conflictBehavior"], "fail");
+        operation.path = "invalid:name".into();
+        assert!(upload.create_session_request(&operation, 42).is_err());
+    }
+
+    #[test]
+    fn uploaded_virtual_file_must_match_parent_name_and_version() {
+        let item: CreatedVirtualFile = serde_json::from_value(serde_json::json!({
+            "id": "new-id", "name": "new.txt", "size": 3, "eTag": "v1",
+            "file": {}, "parentReference": {"id": "parent"}
+        }))
+        .unwrap();
+        assert!(created_virtual_file_matches(
+            &item, "new-id", "parent", "new.txt", "v1", 3
+        ));
+        assert!(!created_virtual_file_matches(
+            &item, "new-id", "other", "new.txt", "v1", 3
+        ));
+        assert!(!created_virtual_file_matches(
+            &item, "new-id", "parent", "new.txt", "v2", 3
+        ));
     }
 }

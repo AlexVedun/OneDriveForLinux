@@ -7,8 +7,9 @@ mod virtual_upload;
 
 use auth::LoginAttempt;
 use graph::{
-    FolderCreateError, GraphClient, GraphUpload, QueuedDownloadError, QueuedDownloadTarget,
-    RemoteDeleteError, RemoteRenameError, RemoteRenameInput, VirtualDownloadError,
+    CreatedVirtualExpectation, FolderCreateError, GraphClient, GraphUpload, QueuedDownloadError,
+    QueuedDownloadTarget, RemoteDeleteError, RemoteRenameError, RemoteRenameInput,
+    VirtualDownloadError,
 };
 use keyring::v1::Entry;
 use oauth2::{TokenResponse, basic::BasicTokenResponse};
@@ -292,19 +293,72 @@ impl Daemon {
         drafts
             .iter()
             .map(|draft| {
-                let item = if active_drive.as_deref() == Some(draft.drive_id.as_str()) && complete {
+                let item = if active_drive.as_deref() == Some(draft.drive_id.as_str())
+                    && complete
+                    && draft.new_file.is_none()
+                {
                     catalog
                         .item(&draft.drive_id, &draft.item_id)
                         .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?
                 } else {
                     None
                 };
-                let mut status = virtual_drafts::classify(
-                    draft,
-                    active_drive.as_deref(),
-                    complete,
-                    item.as_ref(),
-                );
+                let mut status = if let Some(location) = &draft.new_file {
+                    let status = if active_drive.as_deref() != Some(draft.drive_id.as_str()) {
+                        "other-drive"
+                    } else if !complete {
+                        "catalog-incomplete"
+                    } else {
+                        let parent_exists = catalog
+                            .root_id(&draft.drive_id)
+                            .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?
+                            .as_deref()
+                            == Some(&location.parent_id)
+                            || catalog
+                                .item(&draft.drive_id, &location.parent_id)
+                                .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?
+                                .is_some_and(|parent| parent.kind == "folder" && !parent.deleted);
+                        let name_taken = catalog
+                            .items(&draft.drive_id)
+                            .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?
+                            .iter()
+                            .any(|item| {
+                                !item.deleted
+                                    && item.parent_id.as_deref() == Some(&location.parent_id)
+                                    && item.name.as_deref() == Some(&location.name)
+                            });
+                        if !parent_exists {
+                            "remote-missing"
+                        } else if name_taken {
+                            "remote-changed"
+                        } else if store
+                            .recover(draft)
+                            .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?
+                            .ok_or_else(|| zbus::fdo::Error::Failed("draft is missing".to_owned()))?
+                            .len()
+                            .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?
+                            == 0
+                        {
+                            "new-empty"
+                        } else {
+                            "ready-new"
+                        }
+                    };
+                    virtual_drafts::VirtualDraftStatus {
+                        drive_id: draft.drive_id.clone(),
+                        item_id: draft.item_id.clone(),
+                        name: Some(location.name.clone()),
+                        status,
+                        last_upload_issue: None,
+                    }
+                } else {
+                    virtual_drafts::classify(
+                        draft,
+                        active_drive.as_deref(),
+                        complete,
+                        item.as_ref(),
+                    )
+                };
                 status.last_upload_issue = store
                     .upload_failure(draft)
                     .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?
@@ -334,7 +388,7 @@ impl Daemon {
         let item_id = virtual_drafts::next_ready_item_id(&statuses, after)?;
         statuses
             .iter()
-            .find(|draft| draft.item_id == item_id && draft.status == "ready")
+            .find(|draft| draft.item_id == item_id && matches!(draft.status, "ready" | "ready-new"))
             .map(|draft| (draft.drive_id.clone(), draft.item_id.clone()))
     }
 }
@@ -459,10 +513,32 @@ impl Daemon {
             let remote = catalog
                 .item(&drive_id, &item_id)
                 .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
-            if virtual_drafts::classify(draft.identity(), Some(&drive_id), true, remote.as_ref())
-                .status
-                != "ready"
-            {
+            let ready = if let Some(location) = &draft.identity().new_file {
+                let parent_exists = catalog
+                    .root_id(&drive_id)
+                    .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?
+                    .as_deref()
+                    == Some(&location.parent_id)
+                    || catalog
+                        .item(&drive_id, &location.parent_id)
+                        .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?
+                        .is_some_and(|parent| parent.kind == "folder" && !parent.deleted);
+                let name_taken = catalog
+                    .items(&drive_id)
+                    .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?
+                    .iter()
+                    .any(|item| {
+                        !item.deleted
+                            && item.parent_id.as_deref() == Some(&location.parent_id)
+                            && item.name.as_deref() == Some(&location.name)
+                    });
+                parent_exists && !name_taken
+            } else {
+                virtual_drafts::classify(draft.identity(), Some(&drive_id), true, remote.as_ref())
+                    .status
+                    == "ready"
+            };
+            if !ready {
                 return Err(zbus::fdo::Error::Failed(
                     "draft needs review before upload".to_owned(),
                 ));
@@ -484,6 +560,12 @@ impl Daemon {
                 .map_err(|_| zbus::fdo::Error::Failed("draft snapshot task failed".to_owned()))?
                 .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?
                 .ok_or_else(|| zbus::fdo::Error::Failed("draft is missing".to_owned()))?;
+        if snapshot.size == 0 && snapshot.identity.new_file.is_some() {
+            return Err(zbus::fdo::Error::Failed(
+                "upload of an empty new virtual file is not supported yet; local draft retained"
+                    .to_owned(),
+            ));
+        }
         if snapshot.size == 0
             && std::env::var("ONEDRIVE_EXPERIMENTAL_EMPTY_UPLOAD").as_deref() != Ok("1")
         {
@@ -493,10 +575,16 @@ impl Daemon {
         }
         let graph = GraphClient::new()
             .map_err(|_| zbus::fdo::Error::Failed("cannot create Graph client".to_owned()))?;
-        if !graph
-            .matches_remote_file_version(&drive_id, &item_id, &snapshot.identity.base_etag, &token)
-            .await
-            .map_err(|_| zbus::fdo::Error::Failed("cannot verify remote version".to_owned()))?
+        if snapshot.identity.new_file.is_none()
+            && !graph
+                .matches_remote_file_version(
+                    &drive_id,
+                    &item_id,
+                    &snapshot.identity.base_etag,
+                    &token,
+                )
+                .await
+                .map_err(|_| zbus::fdo::Error::Failed("cannot verify remote version".to_owned()))?
         {
             return Err(zbus::fdo::Error::Failed(
                 "remote file changed; local draft retained".to_owned(),
@@ -510,12 +598,14 @@ impl Daemon {
         let checkpoint_store = DraftStore::open(&checkpoint_root)
             .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
         let mut transfer_state = TransferStateGuard::start(&self.state);
-        let result = virtual_upload::upload_snapshot(&transport, &checkpoint_store, &snapshot)
-            .await
-            .map_err(|_| {
-                zbus::fdo::Error::Failed("upload failed; local draft retained".to_owned())
-            })?;
+        let result = if snapshot.identity.new_file.is_some() {
+            virtual_upload::upload_new_snapshot(&transport, &checkpoint_store, &snapshot).await
+        } else {
+            virtual_upload::upload_snapshot(&transport, &checkpoint_store, &snapshot).await
+        }
+        .map_err(|_| zbus::fdo::Error::Failed("upload failed; local draft retained".to_owned()))?;
         let UploadStep::Complete {
+            remote_id: uploaded_id,
             etag: Some(uploaded_etag),
             ..
         } = result
@@ -524,21 +614,51 @@ impl Daemon {
                 "upload result needs review; local draft retained".to_owned(),
             ));
         };
-        if !self
-            .catalog
-            .lock()
-            .unwrap()
-            .record_uploaded_version(
+        let catalog_recorded = if let Some(location) = &snapshot.identity.new_file {
+            if !graph
+                .matches_created_virtual_file(
+                    &drive_id,
+                    &CreatedVirtualExpectation {
+                        item_id: &uploaded_id,
+                        parent_id: &location.parent_id,
+                        name: &location.name,
+                        etag: &uploaded_etag,
+                        size: snapshot.size,
+                    },
+                    &token,
+                )
+                .await
+                .map_err(|_| {
+                    zbus::fdo::Error::Failed(
+                        "cannot verify created file; draft retained".to_owned(),
+                    )
+                })?
+            {
+                return Err(zbus::fdo::Error::Failed(
+                    "created file needs review; draft retained".to_owned(),
+                ));
+            }
+            self.catalog.lock().unwrap().record_created_file(
+                &drive_id,
+                &uploaded_id,
+                &location.parent_id,
+                &location.name,
+                &uploaded_etag,
+                snapshot.size,
+            )
+        } else {
+            self.catalog.lock().unwrap().record_uploaded_version(
                 &drive_id,
                 &item_id,
                 &snapshot.identity.base_etag,
                 &uploaded_etag,
                 snapshot.size,
             )
-            .map_err(|_| {
-                zbus::fdo::Error::Failed("catalog update failed; draft retained".to_owned())
-            })?
-        {
+        }
+        .map_err(|_| {
+            zbus::fdo::Error::Failed("catalog update failed; draft retained".to_owned())
+        })?;
+        if !catalog_recorded {
             return Err(zbus::fdo::Error::Failed(
                 "catalog changed during upload; local draft retained".to_owned(),
             ));

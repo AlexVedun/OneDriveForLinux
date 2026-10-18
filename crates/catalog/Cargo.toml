@@ -12,3 +12,4 @@ url = "2.5"
 
 [dev-dependencies]
 tokio = { version = "1.53", features = ["macros", "rt"] }
+tempfile = "3.27"
