@@ -204,24 +204,28 @@ impl DraftStore {
         fs::set_permissions(root, fs::Permissions::from_mode(0o700))?;
         let _lock = lock_store(root)?;
         let store = Self { root: root.into() };
-        store.cleanup_uploaded()?;
+        store.cleanup_removed()?;
         Ok(store)
     }
 
-    /// A marker is written only after Graph has confirmed the uploaded item.
-    fn cleanup_uploaded(&self) -> io::Result<()> {
+    /// Finish cleanup after a confirmed upload or a local-only file removal.
+    fn cleanup_removed(&self) -> io::Result<()> {
         for entry in fs::read_dir(&self.root)? {
             let entry = entry?;
-            if entry.path().extension().is_none_or(|ext| ext != "uploaded") {
+            if entry
+                .path()
+                .extension()
+                .is_none_or(|ext| ext != "uploaded" && ext != "removed")
+            {
                 continue;
             }
             let identity = read_metadata(&entry.path())?;
             identity.validate()?;
             let (metadata_path, data_path) = self.paths(&identity);
-            if metadata_path.with_extension("uploaded") != entry.path() {
+            if metadata_path.with_extension(entry.path().extension().unwrap()) != entry.path() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "uploaded marker filename mismatch",
+                    "removed marker filename mismatch",
                 ));
             }
             if !metadata_path.exists() {
@@ -402,6 +406,60 @@ impl DraftStore {
 
     pub fn begin_empty(&self, identity: DraftIdentity) -> io::Result<DraftFile> {
         self.begin_with_source(identity, None)
+    }
+
+    /// Change the visible location of a file that has never existed in Graph.
+    pub fn relocate_new(
+        &self,
+        drive_id: &str,
+        item_id: &str,
+        location: NewFileLocation,
+    ) -> io::Result<()> {
+        let _lock = lock_store(&self.root)?;
+        let draft = self
+            .recover_item(drive_id, item_id)?
+            .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
+        let mut identity = draft.identity().clone();
+        if identity.new_file.is_none() {
+            return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+        }
+        identity.new_file = Some(location);
+        identity.validate()?;
+        self.clear_stale_upload_state(&identity)?;
+        let mut temporary = tempfile::NamedTempFile::new_in(&self.root)?;
+        serde_json::to_writer(&mut temporary, &identity)?;
+        temporary.flush()?;
+        temporary.as_file().sync_all()?;
+        temporary
+            .persist(self.paths(&identity).0)
+            .map_err(|error| error.error)?;
+        File::open(&self.root)?.sync_all()
+    }
+
+    /// Discard a local-only file; a marker completes data cleanup after a crash.
+    pub fn remove_new(&self, drive_id: &str, item_id: &str) -> io::Result<()> {
+        let _lock = lock_store(&self.root)?;
+        let draft = self
+            .recover_item(drive_id, item_id)?
+            .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
+        if draft.identity().new_file.is_none() {
+            return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+        }
+        let metadata = self.paths(draft.identity()).0;
+        fs::rename(&metadata, metadata.with_extension("removed"))?;
+        File::open(&self.root)?.sync_all()?;
+        self.cleanup_removed()
+    }
+
+    fn clear_stale_upload_state(&self, identity: &DraftIdentity) -> io::Result<()> {
+        for path in [self.checkpoint_path(identity), self.failure_path(identity)] {
+            match fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+        File::open(&self.root)?.sync_all()
     }
 
     fn begin_with_source(
@@ -729,6 +787,79 @@ mod tests {
             base_etag: "v1".into(),
             new_file: None,
         }
+    }
+
+    #[test]
+    fn new_file_move_and_removal_survive_reopening_store() {
+        let root = tempfile::tempdir().unwrap();
+        let store = DraftStore::open(root.path()).unwrap();
+        let new_file = DraftIdentity {
+            drive_id: "drive".into(),
+            item_id: "local:one".into(),
+            base_etag: "local-new".into(),
+            new_file: Some(NewFileLocation {
+                parent_id: "root".into(),
+                name: "first.txt".into(),
+            }),
+        };
+        let draft = store.begin_empty(new_file).unwrap();
+        draft.write_at(0, b"keep me").unwrap();
+        store
+            .relocate_new(
+                "drive",
+                "local:one",
+                NewFileLocation {
+                    parent_id: "other".into(),
+                    name: "second.txt".into(),
+                },
+            )
+            .unwrap();
+        let reopened = DraftStore::open(root.path()).unwrap();
+        let moved = reopened
+            .recover_item("drive", "local:one")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            moved.identity().new_file.as_ref().unwrap().parent_id,
+            "other"
+        );
+        assert_eq!(
+            moved.identity().new_file.as_ref().unwrap().name,
+            "second.txt"
+        );
+        let mut content = [0; 7];
+        assert_eq!(moved.read_at(0, &mut content).unwrap(), 7);
+        assert_eq!(&content, b"keep me");
+        reopened.remove_new("drive", "local:one").unwrap();
+        assert!(
+            DraftStore::open(root.path())
+                .unwrap()
+                .list()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn remove_new_finishes_interrupted_cleanup() {
+        let root = tempfile::tempdir().unwrap();
+        let store = DraftStore::open(root.path()).unwrap();
+        let new_file = DraftIdentity {
+            drive_id: "drive".into(),
+            item_id: "local:two".into(),
+            base_etag: "local-new".into(),
+            new_file: Some(NewFileLocation {
+                parent_id: "root".into(),
+                name: "draft.txt".into(),
+            }),
+        };
+        store.begin_empty(new_file.clone()).unwrap();
+        let metadata = store.paths(&new_file).0;
+        fs::rename(&metadata, metadata.with_extension("removed")).unwrap();
+        assert!(store.paths(&new_file).1.exists());
+        let reopened = DraftStore::open(root.path()).unwrap();
+        assert!(reopened.list().unwrap().is_empty());
+        assert!(!store.paths(&new_file).1.exists());
     }
 
     #[test]

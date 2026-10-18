@@ -296,6 +296,98 @@ impl VirtualFuse {
         Ok((node, handle))
     }
 
+    fn remove_local_file(&self, parent: u64, name: &str) -> Result<(), Errno> {
+        let Some(root) = &self.draft_root else {
+            return Err(Errno::EROFS);
+        };
+        let mut local = self.local_files.lock().unwrap();
+        let node = local
+            .values()
+            .find(|node| node.parent_inode == parent && node.name == name)
+            .cloned()
+            .or_else(|| self.tree.lookup(parent, name).cloned())
+            .ok_or(Errno::ENOENT)?;
+        if node.kind != NodeKind::File {
+            return Err(Errno::EISDIR);
+        }
+        if !node.item_id.starts_with("local:") {
+            return Err(Errno::EROFS);
+        }
+        if self
+            .files
+            .lock()
+            .unwrap()
+            .values()
+            .any(|open| open.inode == node.inode)
+        {
+            return Err(Errno::EBUSY);
+        }
+        DraftStore::open(root)
+            .and_then(|store| store.remove_new(self.tree.drive_id(), &node.item_id))
+            .map_err(map_draft_error)?;
+        local.remove(&node.inode);
+        Ok(())
+    }
+
+    fn rename_local_file(
+        &self,
+        parent: u64,
+        name: &str,
+        new_parent: u64,
+        new_name: &str,
+        flags: fuser::RenameFlags,
+    ) -> Result<(), Errno> {
+        let Some(root) = &self.draft_root else {
+            return Err(Errno::EROFS);
+        };
+        if flags.bits() & !libc::RENAME_NOREPLACE != 0 {
+            return Err(Errno::EINVAL);
+        }
+        if !NewFileLocation::valid_name(new_name) {
+            return Err(Errno::EINVAL);
+        }
+        let parent_node = self.node(new_parent).ok_or(Errno::ENOENT)?;
+        if parent_node.kind != NodeKind::Directory {
+            return Err(Errno::ENOTDIR);
+        }
+        let mut local = self.local_files.lock().unwrap();
+        let node = local
+            .values()
+            .find(|node| node.parent_inode == parent && node.name == name)
+            .cloned()
+            .or_else(|| self.tree.lookup(parent, name).cloned())
+            .ok_or(Errno::ENOENT)?;
+        if !node.item_id.starts_with("local:") {
+            return Err(Errno::EROFS);
+        }
+        if parent == new_parent && name == new_name {
+            return Ok(());
+        }
+        if self.tree.lookup(new_parent, new_name).is_some()
+            || local
+                .values()
+                .any(|node| node.parent_inode == new_parent && node.name == new_name)
+        {
+            return Err(Errno::EEXIST);
+        }
+        DraftStore::open(root)
+            .and_then(|store| {
+                store.relocate_new(
+                    self.tree.drive_id(),
+                    &node.item_id,
+                    NewFileLocation {
+                        parent_id: parent_node.item_id,
+                        name: new_name.to_owned(),
+                    },
+                )
+            })
+            .map_err(map_draft_error)?;
+        let moved = local.get_mut(&node.inode).ok_or(Errno::EIO)?;
+        moved.parent_inode = new_parent;
+        moved.name = new_name.to_owned();
+        Ok(())
+    }
+
     fn directory_entries(&self, inode: u64) -> Option<Vec<(u64, FileType, String)>> {
         let directory = self.node(inode)?;
         let children = self.tree.readdir(inode)?;
@@ -677,6 +769,40 @@ impl Filesystem for VirtualFuse {
         }
     }
 
+    fn unlink(&self, _request: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        match name
+            .to_str()
+            .ok_or(Errno::EINVAL)
+            .and_then(|name| self.remove_local_file(parent.0, name))
+        {
+            Ok(()) => reply.ok(),
+            Err(error) => reply.error(error),
+        }
+    }
+
+    fn rename(
+        &self,
+        _request: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        new_parent: INodeNo,
+        new_name: &OsStr,
+        flags: fuser::RenameFlags,
+        reply: ReplyEmpty,
+    ) {
+        let result = name
+            .to_str()
+            .zip(new_name.to_str())
+            .ok_or(Errno::EINVAL)
+            .and_then(|(name, new_name)| {
+                self.rename_local_file(parent.0, name, new_parent.0, new_name, flags)
+            });
+        match result {
+            Ok(()) => reply.ok(),
+            Err(error) => reply.error(error),
+        }
+    }
+
     fn open(&self, _request: &Request, inode: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
         match self.open_file(inode.0, flags) {
             Ok(handle) => reply.opened(
@@ -807,6 +933,77 @@ mod tests {
             modified: None,
             deleted: false,
         }
+    }
+
+    #[test]
+    fn new_file_can_be_renamed_and_removed_without_leaving_draft() {
+        let dir = tempfile::tempdir().unwrap();
+        let draft_root = dir.path().join("drafts");
+        let tree = VirtualTree::from_items("drive", "root", [file_item()]).unwrap();
+        let fuse = VirtualFuse::new_writable(
+            tree,
+            dir.path().join("cache"),
+            draft_root.clone(),
+            10,
+            Arc::new(|_| Err(io::ErrorKind::NotConnected.into())),
+        );
+        let (node, handle) = fuse
+            .create_file(ROOT_INODE, "first.txt", OpenFlags(libc::O_RDWR))
+            .unwrap();
+        fuse.write_file(node.inode, handle, 0, b"local").unwrap();
+        fuse.rename_local_file(
+            ROOT_INODE,
+            "first.txt",
+            ROOT_INODE,
+            "second.txt",
+            fuser::RenameFlags::empty(),
+        )
+        .unwrap();
+        assert!(fuse.lookup_node(ROOT_INODE, "first.txt").is_none());
+        assert_eq!(
+            fuse.lookup_node(ROOT_INODE, "second.txt").unwrap().inode,
+            node.inode
+        );
+        assert_eq!(
+            fuse.remove_local_file(ROOT_INODE, "second.txt"),
+            Err(Errno::EBUSY)
+        );
+        fuse.files.lock().unwrap().remove(&handle);
+        drop(fuse);
+
+        let tree = VirtualTree::from_items("drive", "root", [file_item()]).unwrap();
+        let fuse = VirtualFuse::new_writable(
+            tree,
+            dir.path().join("cache"),
+            draft_root.clone(),
+            10,
+            Arc::new(|_| Err(io::ErrorKind::NotConnected.into())),
+        );
+        fuse.load_local_files().unwrap();
+        assert!(fuse.lookup_node(ROOT_INODE, "first.txt").is_none());
+        assert!(fuse.lookup_node(ROOT_INODE, "second.txt").is_some());
+        assert_eq!(
+            fuse.rename_local_file(
+                ROOT_INODE,
+                "second.txt",
+                ROOT_INODE,
+                "текст.txt",
+                fuser::RenameFlags::empty(),
+            ),
+            Err(Errno::EEXIST)
+        );
+        fuse.remove_local_file(ROOT_INODE, "second.txt").unwrap();
+        assert!(
+            DraftStore::open(&draft_root)
+                .unwrap()
+                .list()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            fuse.remove_local_file(ROOT_INODE, "текст.txt"),
+            Err(Errno::EROFS)
+        );
     }
 
     #[test]
@@ -994,6 +1191,51 @@ mod tests {
         assert_eq!(
             fs::read(mountpoint.join("copied.txt")).unwrap(),
             b"copied bytes"
+        );
+        session.umount_and_join().unwrap();
+    }
+
+    #[test]
+    fn mounted_new_file_rename_and_delete_survive_remount() {
+        if std::env::var_os("ONEDRIVE_FUSE_SMOKE").is_none() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mountpoint = dir.path().join("mount");
+        let draft_root = dir.path().join("drafts");
+        fs::create_dir(&mountpoint).unwrap();
+        let loader: Arc<ContentLoader> = Arc::new(|_| Err(io::ErrorKind::NotConnected.into()));
+        let mount = || {
+            VirtualFuse::new_writable(
+                VirtualTree::from_items("drive", "root", [file_item()]).unwrap(),
+                dir.path().join("cache"),
+                draft_root.clone(),
+                10,
+                Arc::clone(&loader),
+            )
+            .mount(&mountpoint)
+            .unwrap()
+        };
+        let session = mount();
+        fs::write(mountpoint.join("before.txt"), b"persistent").unwrap();
+        fs::rename(mountpoint.join("before.txt"), mountpoint.join("after.txt")).unwrap();
+        session.umount_and_join().unwrap();
+        let session = mount();
+        assert!(!mountpoint.join("before.txt").exists());
+        assert_eq!(
+            fs::read(mountpoint.join("after.txt")).unwrap(),
+            b"persistent"
+        );
+        fs::remove_file(mountpoint.join("after.txt")).unwrap();
+        session.umount_and_join().unwrap();
+        let session = mount();
+        assert!(!mountpoint.join("after.txt").exists());
+        assert!(
+            DraftStore::open(&draft_root)
+                .unwrap()
+                .list()
+                .unwrap()
+                .is_empty()
         );
         session.umount_and_join().unwrap();
     }
