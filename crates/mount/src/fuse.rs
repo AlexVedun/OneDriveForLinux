@@ -716,6 +716,74 @@ impl VirtualFuse {
         if parent == new_parent && name == new_name {
             return Ok(());
         }
+        let target = local
+            .values()
+            .find(|entry| entry.parent_inode == new_parent && entry.name == new_name)
+            .cloned()
+            .or_else(|| {
+                self.tree
+                    .lookup(new_parent, new_name)
+                    .and_then(|entry| self.remote_node(entry))
+            });
+        if let Some(target) = target
+            && node.item_id.starts_with("local:")
+            && target.kind == NodeKind::File
+            && !target.item_id.starts_with("local:")
+            && flags.bits() & libc::RENAME_NOREPLACE == 0
+        {
+            if self
+                .files
+                .lock()
+                .unwrap()
+                .values()
+                .any(|open| open.inode == node.inode)
+            {
+                return Err(Errno::EBUSY);
+            }
+            if self.draft_for_node(&target)?.is_some()
+                || self
+                    .remote_changes
+                    .lock()
+                    .unwrap()
+                    .contains_key(&target.inode)
+            {
+                return Err(Errno::EEXIST);
+            }
+            let store = DraftStore::open(root).map_err(map_draft_error)?;
+            let source = store
+                .recover_item(self.tree.drive_id(), &node.item_id)
+                .map_err(map_draft_error)?
+                .ok_or(Errno::EIO)?;
+            let snapshot = store
+                .snapshot(source.identity())
+                .map_err(map_draft_error)?
+                .ok_or(Errno::EIO)?;
+            let request = self
+                .tree
+                .request_for_item(&target.item_id)
+                .map_err(map_open_error)?;
+            store
+                .begin_from_file(
+                    DraftIdentity {
+                        drive_id: request.drive_id,
+                        item_id: request.item_id,
+                        base_etag: request.etag,
+                        new_file: None,
+                    },
+                    snapshot.file.as_file(),
+                )
+                .map_err(map_draft_error)?;
+            store
+                .remove_new(self.tree.drive_id(), &node.item_id)
+                .map_err(map_draft_error)?;
+            let replacement = local.get_mut(&node.inode).ok_or(Errno::EIO)?;
+            replacement.parent_inode = new_parent;
+            replacement.name = new_name.to_owned();
+            replacement.item_id = target.item_id;
+            replacement.size = snapshot.size;
+            replacement.etag = target.etag;
+            return Ok(());
+        }
         if self.tree.lookup(new_parent, new_name).is_some()
             || self.remote_target_taken(&parent_node.item_id, new_name)
             || local
@@ -837,24 +905,30 @@ impl VirtualFuse {
                 ));
             }
         }
-        entries.extend(
-            self.local_files
-                .lock()
-                .unwrap()
-                .values()
-                .filter(|node| node.parent_inode == inode)
-                .map(|node| {
-                    (
-                        node.inode,
-                        if node.kind == NodeKind::Directory {
-                            FileType::Directory
-                        } else {
-                            FileType::RegularFile
-                        },
-                        node.name.clone(),
-                    )
-                }),
-        );
+        let local_entries: Vec<_> = self
+            .local_files
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|node| node.parent_inode == inode)
+            .map(|node| {
+                (
+                    node.inode,
+                    if node.kind == NodeKind::Directory {
+                        FileType::Directory
+                    } else {
+                        FileType::RegularFile
+                    },
+                    node.name.clone(),
+                )
+            })
+            .collect();
+        entries.retain(|entry| {
+            entry.2 == "."
+                || entry.2 == ".."
+                || !local_entries.iter().any(|local| local.2 == entry.2)
+        });
+        entries.extend(local_entries);
         entries[2..].sort_by(|left, right| left.2.cmp(&right.2));
         Some(entries)
     }
@@ -1462,7 +1536,7 @@ mod tests {
                 "second.txt",
                 ROOT_INODE,
                 "текст.txt",
-                fuser::RenameFlags::empty(),
+                fuser::RenameFlags::from_bits_truncate(libc::RENAME_NOREPLACE),
             ),
             Err(Errno::EEXIST)
         );
@@ -1484,6 +1558,69 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn editor_style_rename_replaces_remote_file_with_durable_draft() {
+        let dir = tempfile::tempdir().unwrap();
+        let draft_root = dir.path().join("drafts");
+        let tree = VirtualTree::from_items("drive", "root", [file_item()]).unwrap();
+        let fuse = VirtualFuse::new_writable(
+            tree,
+            dir.path().join("cache"),
+            draft_root.clone(),
+            10,
+            Arc::new(|_| Err(io::ErrorKind::NotConnected.into())),
+        );
+        let (temporary, handle) = fuse
+            .create_file(ROOT_INODE, "swap.tmp", OpenFlags(libc::O_RDWR))
+            .unwrap();
+        fuse.write_file(temporary.inode, handle, 0, b"replacement")
+            .unwrap();
+        assert_eq!(
+            fuse.rename_local_file(
+                ROOT_INODE,
+                "swap.tmp",
+                ROOT_INODE,
+                "текст.txt",
+                fuser::RenameFlags::empty(),
+            ),
+            Err(Errno::EBUSY)
+        );
+        fuse.files.lock().unwrap().remove(&handle);
+        assert_eq!(
+            fuse.rename_local_file(
+                ROOT_INODE,
+                "swap.tmp",
+                ROOT_INODE,
+                "текст.txt",
+                fuser::RenameFlags::from_bits_truncate(libc::RENAME_NOREPLACE),
+            ),
+            Err(Errno::EEXIST)
+        );
+        fuse.rename_local_file(
+            ROOT_INODE,
+            "swap.tmp",
+            ROOT_INODE,
+            "текст.txt",
+            fuser::RenameFlags::empty(),
+        )
+        .unwrap();
+        assert!(fuse.lookup_node(ROOT_INODE, "swap.tmp").is_none());
+        let drafts = DraftStore::open(&draft_root).unwrap().list().unwrap();
+        assert_eq!(drafts.len(), 1);
+        assert_eq!(
+            (drafts[0].item_id.as_str(), drafts[0].base_etag.as_str()),
+            ("file", "v1")
+        );
+        let draft = DraftStore::open(&draft_root)
+            .unwrap()
+            .recover(&drafts[0])
+            .unwrap()
+            .unwrap();
+        let mut bytes = [0; 11];
+        assert_eq!(draft.read_at(0, &mut bytes).unwrap(), 11);
+        assert_eq!(&bytes, b"replacement");
     }
 
     #[test]
@@ -1858,6 +1995,54 @@ mod tests {
             fs::read_dir(&mountpoint)
                 .unwrap()
                 .all(|entry| entry.unwrap().file_name() != "renamed")
+        );
+        session.umount_and_join().unwrap();
+    }
+
+    #[test]
+    fn mounted_editor_rename_replaces_remote_content_without_network() {
+        if std::env::var_os("ONEDRIVE_FUSE_SMOKE").is_none() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mountpoint = dir.path().join("mount");
+        let draft_root = dir.path().join("drafts");
+        fs::create_dir(&mountpoint).unwrap();
+        let mount = || {
+            VirtualFuse::new_writable(
+                VirtualTree::from_items("drive", "root", [file_item()]).unwrap(),
+                dir.path().join("cache"),
+                draft_root.clone(),
+                10,
+                Arc::new(|_| Err(io::ErrorKind::NotConnected.into())),
+            )
+            .mount(&mountpoint)
+            .unwrap()
+        };
+        let session = mount();
+        fs::write(mountpoint.join("swap.tmp"), b"offline edit").unwrap();
+        fs::rename(mountpoint.join("swap.tmp"), mountpoint.join("текст.txt")).unwrap();
+        assert_eq!(
+            fs::read(mountpoint.join("текст.txt")).unwrap(),
+            b"offline edit"
+        );
+        assert_eq!(
+            fs::read_dir(&mountpoint)
+                .unwrap()
+                .filter(|entry| entry.as_ref().unwrap().file_name() == "текст.txt")
+                .count(),
+            1
+        );
+        session.umount_and_join().unwrap();
+        let session = mount();
+        assert!(!mountpoint.join("swap.tmp").exists());
+        assert_eq!(
+            fs::read(mountpoint.join("текст.txt")).unwrap(),
+            b"offline edit"
+        );
+        assert_eq!(
+            DraftStore::open(&draft_root).unwrap().list().unwrap().len(),
+            1
         );
         session.umount_and_join().unwrap();
     }
