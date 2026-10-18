@@ -60,6 +60,13 @@ struct UiVirtualDraft {
     last_upload_issue: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct UiVirtualMutation {
+    name: String,
+    status: String,
+    kind: serde_json::Value,
+}
+
 #[derive(Deserialize)]
 struct UiOperationSummary {
     id: i64,
@@ -349,6 +356,52 @@ fn read_virtual_fuse_diagnostics() -> zbus::Result<(String, bool)> {
 fn read_virtual_drafts() -> Result<Vec<UiVirtualDraft>, String> {
     let json: String = daemon_call("VirtualDrafts").map_err(|error| error.to_string())?;
     serde_json::from_str(&json).map_err(|error| error.to_string())
+}
+
+fn read_virtual_mutations() -> Result<Vec<UiVirtualMutation>, String> {
+    let json: String = daemon_call("VirtualMutations").map_err(|error| error.to_string())?;
+    serde_json::from_str(&json).map_err(|error| error.to_string())
+}
+
+fn confirm_virtual_mass_delete(count: u64) -> Result<(), String> {
+    let connection = zbus::blocking::Connection::session().map_err(|error| error.to_string())?;
+    let proxy = zbus::blocking::Proxy::new(&connection, BUS_NAME, OBJECT_PATH, INTERFACE_NAME)
+        .map_err(|error| error.to_string())?;
+    proxy
+        .call("ConfirmVirtualMassDelete", &(count))
+        .map_err(|error| error.to_string())
+}
+
+fn virtual_mutations_text(mutations: &[UiVirtualMutation]) -> String {
+    if mutations.is_empty() {
+        return String::new();
+    }
+    let pending = mutations
+        .iter()
+        .filter(|item| item.status == "pending")
+        .count();
+    let conflicts = mutations
+        .iter()
+        .filter(|item| item.status == "conflict")
+        .count();
+    let applied = mutations
+        .iter()
+        .filter(|item| item.status == "applied")
+        .count();
+    let deletes = mutations
+        .iter()
+        .filter(|item| item.status == "pending" && item.kind == "delete")
+        .count();
+    let mut text = format!(
+        "Операции с облачными объектами: {pending} ожидают, {applied} выполнены, {conflicts} требуют сверки."
+    );
+    if deletes > 10 {
+        text.push_str(" Массовое удаление приостановлено.");
+    }
+    if let Some(issue) = mutations.iter().find(|item| item.status == "conflict") {
+        text.push_str(&format!(" Конфликт: {}.", issue.name));
+    }
+    text
 }
 
 fn read_virtual_draft_upload_enabled() -> Result<bool, String> {
@@ -803,9 +856,23 @@ impl VirtualMountControls {
         }
     }
 
-    fn show_drafts(&self, result: Result<Vec<UiVirtualDraft>, String>) {
+    fn show_drafts(
+        &self,
+        result: Result<Vec<UiVirtualDraft>, String>,
+        mutations: Result<Vec<UiVirtualMutation>, String>,
+    ) {
         match result {
-            Ok(drafts) => self.drafts.set_text(&virtual_drafts_text(&drafts)),
+            Ok(drafts) => {
+                let mut text = virtual_drafts_text(&drafts);
+                if let Ok(mutations) = mutations {
+                    let summary = virtual_mutations_text(&mutations);
+                    if !summary.is_empty() {
+                        text.push('\n');
+                        text.push_str(&summary);
+                    }
+                }
+                self.drafts.set_text(&text);
+            }
             Err(_) => self
                 .drafts
                 .set_text("Не удалось проверить локальные изменения"),
@@ -854,6 +921,7 @@ impl VirtualMountControls {
                 virtual_mount_paths(),
                 read_virtual_fuse_diagnostics(),
                 read_virtual_drafts(),
+                read_virtual_mutations(),
             ));
         });
         let controls = self.clone();
@@ -879,7 +947,7 @@ impl VirtualMountControls {
                     }),
             );
             controls.show_diagnostics(result.1);
-            controls.show_drafts(result.2);
+            controls.show_drafts(result.2, result.3);
             controls.busy.set(false);
             gtk::glib::ControlFlow::Break
         });
@@ -905,7 +973,8 @@ impl VirtualMountControls {
             let path = virtual_mount_paths();
             let diagnostics = read_virtual_fuse_diagnostics();
             let drafts = read_virtual_drafts();
-            let _ = sender.send((result, path, diagnostics, drafts));
+            let mutations = read_virtual_mutations();
+            let _ = sender.send((result, path, diagnostics, drafts, mutations));
         });
         let controls = self.clone();
         let status = status.clone();
@@ -932,7 +1001,7 @@ impl VirtualMountControls {
                     }),
             );
             controls.show_diagnostics(result.2);
-            controls.show_drafts(result.3);
+            controls.show_drafts(result.3, result.4);
             match result.0 {
                 Ok(message) => status.set_text(message),
                 Err(error) => status.set_text(&format!("Виртуальный диск: {error}")),
@@ -1612,6 +1681,7 @@ fn main() {
         let mount = gtk::Button::with_label("Подключить виртуальный диск");
         let unmount = gtk::Button::with_label("Отключить виртуальный диск");
         let show_drafts = gtk::Button::with_label("Все локальные изменения…");
+        let confirm_deletes = gtk::Button::with_label("Подтвердить массовое удаление…");
         mount.set_sensitive(false);
         unmount.set_sensitive(false);
         let mount_label = gtk::Label::new(Some("Виртуальный диск: проверка состояния…"));
@@ -1670,6 +1740,7 @@ fn main() {
         virtual_actions.append(&unmount);
         virtual_actions.append(&show_drafts);
         virtual_controls.append(&virtual_actions);
+        virtual_controls.append(&confirm_deletes);
         virtual_controls.append(&offline_label);
         virtual_controls.append(&offline_button);
         virtual_controls.append(&cache_label);
@@ -1843,6 +1914,63 @@ fn main() {
                     }
                 }
                 button.set_sensitive(true);
+                gtk::glib::ControlFlow::Break
+            });
+        });
+        let window_for_deletes = window.clone();
+        let status_for_deletes = status.clone();
+        let controls_for_deletes = mount_controls.clone();
+        confirm_deletes.connect_clicked(move |button| {
+            button.set_sensitive(false);
+            let (sender, receiver) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let result = read_virtual_mutations().map(|mutations| {
+                    mutations.iter().filter(|item| item.status == "pending" && item.kind == "delete").count() as u64
+                });
+                let _ = sender.send(result);
+            });
+            let button = button.clone();
+            let window = window_for_deletes.clone();
+            let status = status_for_deletes.clone();
+            let controls = controls_for_deletes.clone();
+            gtk::glib::timeout_add_local(Duration::from_millis(100), move || {
+                let result = match receiver.try_recv() {
+                    Ok(result) => result,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => return gtk::glib::ControlFlow::Continue,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => Err("Демон недоступен".to_owned()),
+                };
+                button.set_sensitive(true);
+                match result {
+                    Ok(count) if count > 10 => {
+                        let dialog = gtk::AlertDialog::builder()
+                            .message(format!("Удалить {count} объектов из OneDrive?"))
+                            .detail("Будут выполнены только операции, прошедшие повторную проверку версии и расположения в облаке.")
+                            .build();
+                        dialog.set_buttons(&["Отмена", "Подтвердить удаление"]);
+                        dialog.set_cancel_button(0);
+                        dialog.set_default_button(0);
+                        let status = status.clone();
+                        let controls = controls.clone();
+                        dialog.choose(Some(&window), None::<&gio::Cancellable>, move |response| {
+                            if !matches!(response, Ok(1)) { return; }
+                            let (sender, receiver) = std::sync::mpsc::channel();
+                            std::thread::spawn(move || { let _ = sender.send(confirm_virtual_mass_delete(count)); });
+                            let status = status.clone();
+                            let controls = controls.clone();
+                            gtk::glib::timeout_add_local(Duration::from_millis(100), move || {
+                                match receiver.try_recv() {
+                                    Ok(Ok(())) => { status.set_text("Массовое удаление подтверждено"); controls.refresh(); },
+                                    Ok(Err(error)) => status.set_text(&format!("Не удалось подтвердить удаление: {error}")),
+                                    Err(std::sync::mpsc::TryRecvError::Empty) => return gtk::glib::ControlFlow::Continue,
+                                    Err(std::sync::mpsc::TryRecvError::Disconnected) => status.set_text("Не удалось подтвердить удаление"),
+                                }
+                                gtk::glib::ControlFlow::Break
+                            });
+                        });
+                    }
+                    Ok(_) => status.set_text("Массового удаления нет"),
+                    Err(error) => status.set_text(&format!("Не удалось проверить очередь: {error}")),
+                }
                 gtk::glib::ControlFlow::Break
             });
         });
@@ -2131,6 +2259,25 @@ mod tests {
         assert!(text.contains("note.txt (drive) — версия в каталоге совпадает"));
         assert!(text.contains("2 (drive) — версия в каталоге изменилась"));
         assert!(text.contains("Откройте полный список для проверки"));
+    }
+
+    #[test]
+    fn virtual_mutation_summary_flags_conflicts_and_mass_delete() {
+        let mut mutations = (0..11)
+            .map(|index| UiVirtualMutation {
+                name: format!("file-{index}"),
+                status: "pending".into(),
+                kind: serde_json::json!("delete"),
+            })
+            .collect::<Vec<_>>();
+        mutations.push(UiVirtualMutation {
+            name: "changed.txt".into(),
+            status: "conflict".into(),
+            kind: serde_json::json!({"rename": {"target_parent_id":"root", "target_name":"new.txt"}}),
+        });
+        let text = virtual_mutations_text(&mutations);
+        assert!(text.contains("Массовое удаление приостановлено"));
+        assert!(text.contains("Конфликт: changed.txt"));
     }
 
     #[test]

@@ -133,20 +133,36 @@ struct MovedFile {
     #[serde(rename = "eTag")]
     etag: Option<String>,
     file: Option<serde_json::Value>,
+    folder: Option<serde_json::Value>,
     #[serde(rename = "parentReference")]
     parent_reference: Option<FolderParent>,
 }
 
-fn moved_file_matches(item: &MovedFile, id: &str, parent_id: &str, name: &str) -> bool {
+fn moved_item_matches(
+    item: &MovedFile,
+    id: &str,
+    parent_id: &str,
+    name: &str,
+    directory: bool,
+) -> bool {
     item.id == id
         && item.name == name
-        && item.file.is_some()
+        && if directory {
+            item.folder.is_some()
+        } else {
+            item.file.is_some()
+        }
         && item.etag.as_deref().is_some_and(|etag| !etag.is_empty())
         && item
             .parent_reference
             .as_ref()
             .and_then(|parent| parent.id.as_deref())
             == Some(parent_id)
+}
+
+fn folder_page_is_empty(page: &serde_json::Value) -> Option<bool> {
+    let children = page.get("value")?.as_array()?;
+    Some(children.is_empty() && page.get("@odata.nextLink").is_none())
 }
 
 fn created_folder_matches(folder: &CreatedFolder, name: &str, parent_id: &str) -> bool {
@@ -187,6 +203,13 @@ pub struct RemoteRenameInput<'a> {
     pub source_name: &'a str,
     pub target_parent_id: &'a str,
     pub target_name: &'a str,
+    pub etag: &'a str,
+}
+
+pub struct RemoteDeleteInput<'a> {
+    pub item_id: &'a str,
+    pub parent_id: &'a str,
+    pub name: &'a str,
     pub etag: &'a str,
 }
 
@@ -658,7 +681,7 @@ impl GraphClient {
             .pop_if_empty()
             .extend(["drives", drive_id, "items", item_id]);
         url.query_pairs_mut()
-            .append_pair("$select", "id,name,eTag,file,parentReference");
+            .append_pair("$select", "id,name,eTag,file,folder,parentReference");
         self.http
             .get(url)
             .bearer_auth(access_token)
@@ -670,6 +693,17 @@ impl GraphClient {
         &self,
         drive_id: &str,
         input: &RemoteRenameInput<'_>,
+        access_token: &str,
+    ) -> Result<String, RemoteRenameError> {
+        self.rename_remote_item(drive_id, input, false, access_token)
+            .await
+    }
+
+    pub async fn rename_remote_item(
+        &self,
+        drive_id: &str,
+        input: &RemoteRenameInput<'_>,
+        directory: bool,
         access_token: &str,
     ) -> Result<String, RemoteRenameError> {
         let source_request =
@@ -689,11 +723,12 @@ impl GraphClient {
             .json()
             .await
             .map_err(|_| RemoteRenameError::Retry)?;
-        if !moved_file_matches(
+        if !moved_item_matches(
             &source,
             input.item_id,
             input.source_parent_id,
             input.source_name,
+            directory,
         ) || source.etag.as_deref() != Some(input.etag)
         {
             return Err(RemoteRenameError::Conflict);
@@ -717,11 +752,12 @@ impl GraphClient {
                     .json()
                     .await
                     .map_err(|_| RemoteRenameError::NeedsReconcile)?;
-                if !moved_file_matches(
+                if !moved_item_matches(
                     &item,
                     input.item_id,
                     input.target_parent_id,
                     input.target_name,
+                    directory,
                 ) {
                     return Err(RemoteRenameError::NeedsReconcile);
                 }
@@ -768,8 +804,29 @@ impl GraphClient {
         etag: &str,
         access_token: &str,
     ) -> Result<(), RemoteDeleteError> {
+        self.delete_remote_item(
+            drive_id,
+            &RemoteDeleteInput {
+                item_id,
+                parent_id,
+                name,
+                etag,
+            },
+            false,
+            access_token,
+        )
+        .await
+    }
+
+    pub async fn delete_remote_item(
+        &self,
+        drive_id: &str,
+        input: &RemoteDeleteInput<'_>,
+        directory: bool,
+        access_token: &str,
+    ) -> Result<(), RemoteDeleteError> {
         let source_request = self
-            .remote_rename_source_request(drive_id, item_id, access_token)
+            .remote_rename_source_request(drive_id, input.item_id, access_token)
             .map_err(|_| RemoteDeleteError::Retry)?;
         let source_response = self
             .http
@@ -786,12 +843,18 @@ impl GraphClient {
             .json()
             .await
             .map_err(|_| RemoteDeleteError::Retry)?;
-        if !moved_file_matches(&source, item_id, parent_id, name)
-            || source.etag.as_deref() != Some(etag)
+        if !moved_item_matches(
+            &source,
+            input.item_id,
+            input.parent_id,
+            input.name,
+            directory,
+        ) || source.etag.as_deref() != Some(input.etag)
         {
             return Err(RemoteDeleteError::Conflict);
         }
-        let request = self.remote_delete_request(drive_id, item_id, etag, access_token)?;
+        let request =
+            self.remote_delete_request(drive_id, input.item_id, input.etag, access_token)?;
         let response = self
             .http
             .execute(request)
@@ -805,6 +868,38 @@ impl GraphClient {
             }
             _ => Err(RemoteDeleteError::Retry),
         }
+    }
+
+    pub async fn remote_folder_is_empty(
+        &self,
+        drive_id: &str,
+        item_id: &str,
+        access_token: &str,
+    ) -> Result<bool, RemoteDeleteError> {
+        let mut url = reqwest::Url::parse("https://graph.microsoft.com/v1.0/")
+            .map_err(|_| RemoteDeleteError::Retry)?;
+        url.path_segments_mut()
+            .map_err(|_| RemoteDeleteError::Retry)?
+            .pop_if_empty()
+            .extend(["drives", drive_id, "items", item_id, "children"]);
+        url.query_pairs_mut()
+            .append_pair("$select", "id")
+            .append_pair("$top", "1");
+        let response = self
+            .http
+            .get(url)
+            .bearer_auth(access_token)
+            .send()
+            .await
+            .map_err(|_| RemoteDeleteError::Retry)?;
+        if !response.status().is_success() {
+            return Err(RemoteDeleteError::Retry);
+        }
+        let page: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|_| RemoteDeleteError::Retry)?;
+        folder_page_is_empty(&page).ok_or(RemoteDeleteError::Retry)
     }
 
     fn create_folder_request(
@@ -1173,7 +1268,7 @@ mod tests {
         assert_eq!(source.url().path(), "/v1.0/drives/drive/items/item");
         assert_eq!(
             source.url().query(),
-            Some("%24select=id%2Cname%2CeTag%2Cfile%2CparentReference")
+            Some("%24select=id%2Cname%2CeTag%2Cfile%2Cfolder%2CparentReference")
         );
         let request = graph
             .remote_rename_request("drive", "item", "parent", "new.txt", "v1", "token")
@@ -1200,16 +1295,41 @@ mod tests {
             "parentReference": { "id": "parent" },
         }))
         .unwrap();
-        assert!(moved_file_matches(&item, "item", "parent", "new.txt"));
-        assert!(!moved_file_matches(&item, "other", "parent", "new.txt"));
-        assert!(!moved_file_matches(&item, "item", "other", "new.txt"));
-        assert!(!moved_file_matches(&item, "item", "parent", "other.txt"));
+        assert!(moved_item_matches(
+            &item, "item", "parent", "new.txt", false
+        ));
+        assert!(!moved_item_matches(
+            &item, "other", "parent", "new.txt", false
+        ));
+        assert!(!moved_item_matches(
+            &item, "item", "other", "new.txt", false
+        ));
+        assert!(!moved_item_matches(
+            &item,
+            "item",
+            "parent",
+            "other.txt",
+            false
+        ));
         let no_etag: MovedFile = serde_json::from_value(serde_json::json!({
             "id": "item", "name": "new.txt", "file": {},
             "parentReference": { "id": "parent" },
         }))
         .unwrap();
-        assert!(!moved_file_matches(&no_etag, "item", "parent", "new.txt"));
+        assert!(!moved_item_matches(
+            &no_etag, "item", "parent", "new.txt", false
+        ));
+        let folder: MovedFile = serde_json::from_value(serde_json::json!({
+            "id": "folder", "name": "renamed", "eTag": "v2", "folder": {},
+            "parentReference": { "id": "parent" },
+        }))
+        .unwrap();
+        assert!(moved_item_matches(
+            &folder, "folder", "parent", "renamed", true
+        ));
+        assert!(!moved_item_matches(
+            &folder, "folder", "parent", "renamed", false
+        ));
     }
 
     #[test]
@@ -1228,6 +1348,23 @@ mod tests {
                 .remote_delete_request("drive", "item", "", "token")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn remote_folder_is_empty_only_after_complete_empty_page() {
+        assert_eq!(
+            folder_page_is_empty(&serde_json::json!({"value": []})),
+            Some(true)
+        );
+        assert_eq!(
+            folder_page_is_empty(&serde_json::json!({"value": [{"id":"child"}]})),
+            Some(false)
+        );
+        assert_eq!(
+            folder_page_is_empty(&serde_json::json!({"value": [], "@odata.nextLink":"more"})),
+            Some(false)
+        );
+        assert_eq!(folder_page_is_empty(&serde_json::json!({})), None);
     }
 
     #[test]
