@@ -62,6 +62,7 @@ mod tests {
             drive_id: "drive".into(),
             item_id: "item".into(),
             base_etag: "old".into(),
+            new_file: None,
         }
     }
 

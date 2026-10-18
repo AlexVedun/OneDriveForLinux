@@ -13,6 +13,15 @@ pub struct DraftIdentity {
     pub item_id: String,
     /// Remote version that the local edit started from.
     pub base_etag: String,
+    /// Location of a file created in the virtual drive, before Graph assigns an ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_file: Option<NewFileLocation>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NewFileLocation {
+    pub parent_id: String,
+    pub name: String,
 }
 
 impl DraftIdentity {
@@ -21,6 +30,20 @@ impl DraftIdentity {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "empty draft identity",
+            ));
+        }
+        if let Some(location) = &self.new_file
+            && (!self.item_id.starts_with("local:")
+                || self.base_etag != "local-new"
+                || location.parent_id.is_empty()
+                || location.name.is_empty()
+                || location.name == "."
+                || location.name == ".."
+                || location.name.contains(['/', '\0']))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid new file",
             ));
         }
         Ok(())
@@ -463,6 +486,7 @@ impl DraftStore {
             drive_id: drive_id.to_owned(),
             item_id: item_id.to_owned(),
             base_etag: "lookup".to_owned(),
+            new_file: None,
         })
     }
 
@@ -694,6 +718,7 @@ mod tests {
             drive_id: "drive".into(),
             item_id: "file".into(),
             base_etag: "v1".into(),
+            new_file: None,
         }
     }
 
