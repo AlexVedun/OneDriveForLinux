@@ -18,6 +18,7 @@ use onedrive_catalog::{Catalog, CatalogItem, FetchError};
 use onedrive_core::{BUS_NAME, EngineState, OBJECT_PATH};
 use onedrive_mount::{DownloadRequest, VirtualTree};
 use onedrive_mount::{
+    directory::DirectoryStore,
     draft::{DraftStore, DraftUploadFailure, DraftUploadIssue},
     fuse::VirtualFuse,
     mutation::{Mutation, MutationKind, MutationStatus, MutationStore},
@@ -265,7 +266,135 @@ fn virtual_request_for_item(
         .map_err(|error| zbus::fdo::Error::InvalidArgs(error.to_string()))
 }
 
+fn resolved_virtual_parent(root: &std::path::Path, parent_id: &str) -> io::Result<String> {
+    if !parent_id.starts_with("local-dir:") {
+        return Ok(parent_id.to_owned());
+    }
+    DirectoryStore::open(root)?
+        .remote_parent_id(parent_id)?
+        .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))
+}
+
 impl Daemon {
+    async fn run_virtual_directory_upload(&self, item_id: String) -> zbus::fdo::Result<String> {
+        if self
+            .sync
+            .lock()
+            .unwrap()
+            .root()
+            .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?
+            .is_some()
+        {
+            return Err(zbus::fdo::Error::Failed(
+                "virtual upload cannot run while folder sync is configured".to_owned(),
+            ));
+        }
+        if item_id.is_empty()
+            || self.virtual_mount.lock().unwrap().is_some()
+            || self.mount_in_progress.load(Ordering::SeqCst)
+            || self.sync_paused()?
+            || self.scan_in_progress.load(Ordering::SeqCst)
+            || self
+                .upload_in_progress
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+        {
+            return Err(zbus::fdo::Error::Failed(
+                "virtual directory upload is busy or unavailable".to_owned(),
+            ));
+        }
+        let _busy = BusyFlagGuard(Arc::clone(&self.upload_in_progress));
+        if self.virtual_mount.lock().unwrap().is_some() {
+            return Err(zbus::fdo::Error::Failed(
+                "unmount the virtual drive first".to_owned(),
+            ));
+        }
+        let root = state_directory()
+            .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?
+            .join("virtual-drafts");
+        let store = DirectoryStore::open(&root)
+            .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
+        let directory = store
+            .list()
+            .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?
+            .into_iter()
+            .find(|directory| directory.item_id == item_id && directory.remote_id.is_none())
+            .ok_or_else(|| {
+                zbus::fdo::Error::InvalidArgs("local directory is missing".to_owned())
+            })?;
+        let parent_id = if directory.parent_id.starts_with("local-dir:") {
+            store
+                .list()
+                .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?
+                .into_iter()
+                .find(|parent| {
+                    parent.item_id == directory.parent_id && parent.drive_id == directory.drive_id
+                })
+                .and_then(|parent| parent.remote_id)
+                .ok_or_else(|| {
+                    zbus::fdo::Error::Failed("parent directory has not been uploaded".to_owned())
+                })?
+        } else {
+            directory.parent_id.clone()
+        };
+        {
+            let catalog = self.catalog.lock().unwrap();
+            if catalog.active_drive_id().ok().flatten().as_deref() != Some(&directory.drive_id)
+                || !catalog.is_complete(&directory.drive_id).unwrap_or(false)
+            {
+                return Err(zbus::fdo::Error::Failed("catalog is not ready".to_owned()));
+            }
+            let parent_exists = catalog
+                .root_id(&directory.drive_id)
+                .ok()
+                .flatten()
+                .as_deref()
+                == Some(&parent_id)
+                || catalog
+                    .item(&directory.drive_id, &parent_id)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|item| !item.deleted && item.kind == "folder");
+            let name_taken = catalog
+                .items(&directory.drive_id)
+                .ok()
+                .is_some_and(|items| {
+                    items.iter().any(|item| {
+                        !item.deleted
+                            && item.parent_id.as_deref() == Some(&parent_id)
+                            && item.name.as_deref() == Some(&directory.name)
+                    })
+                });
+            if !parent_exists || name_taken {
+                return Err(zbus::fdo::Error::Failed(
+                    "directory needs review before upload".to_owned(),
+                ));
+            }
+        }
+        let client_id = client_id()
+            .ok_or_else(|| zbus::fdo::Error::Failed("client ID is missing".to_owned()))?;
+        let token = access_token_detailed(&client_id)
+            .await
+            .map_err(|_| zbus::fdo::Error::Failed("login is required".to_owned()))?;
+        let graph = GraphClient::new()
+            .map_err(|_| zbus::fdo::Error::Failed("Graph client failed".to_owned()))?;
+        if graph.drive_id(&token).await.ok().as_deref() != Some(&directory.drive_id) {
+            return Err(zbus::fdo::Error::Failed("active drive changed".to_owned()));
+        }
+        let remote_id = graph
+            .create_remote_folder(&directory.drive_id, &parent_id, &directory.name, &token)
+            .await
+            .map_err(|error| {
+                zbus::fdo::Error::Failed(format!("cannot create remote directory: {error:?}"))
+            })?;
+        store
+            .mark_uploaded(&directory, &remote_id)
+            .map_err(|error| {
+                zbus::fdo::Error::Failed(format!("folder created but mapping not saved: {error}"))
+            })?;
+        Ok(remote_id)
+    }
+
     fn virtual_draft_auto_upload_enabled(&self) -> bool {
         self.virtual_draft_upload_enabled()
             && std::env::var("ONEDRIVE_EXPERIMENTAL_VIRTUAL_AUTO_UPLOAD").as_deref() == Ok("1")
@@ -305,6 +434,8 @@ impl Daemon {
                     None
                 };
                 let mut status = if let Some(location) = &draft.new_file {
+                    let parent_id = resolved_virtual_parent(&root, &location.parent_id)
+                        .unwrap_or_else(|_| location.parent_id.clone());
                     let status = if active_drive.as_deref() != Some(draft.drive_id.as_str()) {
                         "other-drive"
                     } else if !complete {
@@ -314,9 +445,9 @@ impl Daemon {
                             .root_id(&draft.drive_id)
                             .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?
                             .as_deref()
-                            == Some(&location.parent_id)
+                            == Some(&parent_id)
                             || catalog
-                                .item(&draft.drive_id, &location.parent_id)
+                                .item(&draft.drive_id, &parent_id)
                                 .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?
                                 .is_some_and(|parent| parent.kind == "folder" && !parent.deleted);
                         let name_taken = catalog
@@ -325,7 +456,7 @@ impl Daemon {
                             .iter()
                             .any(|item| {
                                 !item.deleted
-                                    && item.parent_id.as_deref() == Some(&location.parent_id)
+                                    && item.parent_id.as_deref() == Some(&parent_id)
                                     && item.name.as_deref() == Some(&location.name)
                             });
                         if !parent_exists {
@@ -516,7 +647,7 @@ impl Daemon {
                 "unmount the virtual drive before uploading its draft".to_owned(),
             ));
         }
-        let (drive_id, draft) = {
+        let (drive_id, draft, resolved_parent) = {
             let catalog = self.catalog.lock().unwrap();
             let drive_id = catalog
                 .active_drive_id()
@@ -540,14 +671,24 @@ impl Daemon {
             let remote = catalog
                 .item(&drive_id, &item_id)
                 .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
+            let resolved_parent = draft
+                .identity()
+                .new_file
+                .as_ref()
+                .map(|location| resolved_virtual_parent(&root, &location.parent_id))
+                .transpose()
+                .map_err(|_| {
+                    zbus::fdo::Error::Failed("parent directory has not been uploaded".to_owned())
+                })?;
             let ready = if let Some(location) = &draft.identity().new_file {
+                let parent_id = resolved_parent.as_ref().expect("new file has parent");
                 let parent_exists = catalog
                     .root_id(&drive_id)
                     .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?
                     .as_deref()
-                    == Some(&location.parent_id)
+                    == Some(parent_id)
                     || catalog
-                        .item(&drive_id, &location.parent_id)
+                        .item(&drive_id, parent_id)
                         .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?
                         .is_some_and(|parent| parent.kind == "folder" && !parent.deleted);
                 let name_taken = catalog
@@ -556,7 +697,7 @@ impl Daemon {
                     .iter()
                     .any(|item| {
                         !item.deleted
-                            && item.parent_id.as_deref() == Some(&location.parent_id)
+                            && item.parent_id.as_deref() == Some(parent_id)
                             && item.name.as_deref() == Some(&location.name)
                     });
                 parent_exists && !name_taken
@@ -570,7 +711,7 @@ impl Daemon {
                     "draft needs review before upload".to_owned(),
                 ));
             }
-            (drive_id, draft.identity().clone())
+            (drive_id, draft.identity().clone(), resolved_parent)
         };
         let client_id = client_id().ok_or_else(|| {
             zbus::fdo::Error::Failed("ONEDRIVE_CLIENT_ID is not configured".to_owned())
@@ -625,8 +766,14 @@ impl Daemon {
         let checkpoint_store = DraftStore::open(&checkpoint_root)
             .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
         let mut transfer_state = TransferStateGuard::start(&self.state);
-        let result = if snapshot.identity.new_file.is_some() {
-            virtual_upload::upload_new_snapshot(&transport, &checkpoint_store, &snapshot).await
+        let result = if let Some(parent_id) = resolved_parent.as_deref() {
+            virtual_upload::upload_new_snapshot_to_parent(
+                &transport,
+                &checkpoint_store,
+                &snapshot,
+                parent_id,
+            )
+            .await
         } else {
             virtual_upload::upload_snapshot(&transport, &checkpoint_store, &snapshot).await
         }
@@ -647,7 +794,7 @@ impl Daemon {
                     &drive_id,
                     &CreatedVirtualExpectation {
                         item_id: &uploaded_id,
-                        parent_id: &location.parent_id,
+                        parent_id: resolved_parent.as_deref().unwrap_or(&location.parent_id),
                         name: &location.name,
                         etag: &uploaded_etag,
                         size: snapshot.size,
@@ -668,7 +815,7 @@ impl Daemon {
             self.catalog.lock().unwrap().record_created_file(
                 &drive_id,
                 &uploaded_id,
-                &location.parent_id,
+                resolved_parent.as_deref().unwrap_or(&location.parent_id),
                 &location.name,
                 &uploaded_etag,
                 snapshot.size,
@@ -3438,6 +3585,74 @@ async fn poll_virtual_mutations(daemon: Daemon, state_root: PathBuf, client_id: 
     }
 }
 
+async fn poll_virtual_directories(daemon: Daemon, state_root: PathBuf, client_id: String) {
+    let mut interval = tokio::time::interval(Duration::from_secs(30));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut reported = std::collections::HashSet::new();
+    loop {
+        interval.tick().await;
+        if !matches!(
+            *daemon.state.lock().unwrap(),
+            EngineState::Connected | EngineState::Synced
+        ) || daemon.virtual_mount.lock().unwrap().is_some()
+            || daemon.upload_in_progress.load(Ordering::SeqCst)
+            || daemon.scan_in_progress.load(Ordering::SeqCst)
+        {
+            continue;
+        }
+        let root = state_root.join("virtual-drafts");
+        if !root.exists() {
+            continue;
+        }
+        let directories = match DirectoryStore::open(&root).and_then(|store| store.list()) {
+            Ok(directories) => directories,
+            Err(error) => {
+                eprintln!("cannot read local virtual directories: {error}");
+                continue;
+            }
+        };
+        let mapped: std::collections::HashSet<_> = directories
+            .iter()
+            .filter(|entry| entry.remote_id.is_some())
+            .map(|entry| (entry.drive_id.clone(), entry.item_id.clone()))
+            .collect();
+        let Some(directory) = directories.into_iter().find(|directory| {
+            directory.remote_id.is_none()
+                && (!directory.parent_id.starts_with("local-dir:")
+                    || mapped.contains(&(directory.drive_id.clone(), directory.parent_id.clone())))
+        }) else {
+            continue;
+        };
+        match daemon
+            .run_virtual_directory_upload(directory.item_id.clone())
+            .await
+        {
+            Ok(_) => {
+                reported.remove(&directory.item_id);
+                if daemon
+                    .scan_in_progress
+                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+                {
+                    *daemon.state.lock().unwrap() = EngineState::Checking;
+                    let outcome =
+                        scan_catalog(Arc::clone(&daemon.catalog), client_id.clone()).await;
+                    *daemon.state.lock().unwrap() = scan_outcome_state(&outcome);
+                    daemon.scan_in_progress.store(false, Ordering::SeqCst);
+                }
+            }
+            Err(error) => {
+                if reported.insert(directory.item_id.clone()) {
+                    eprintln!(
+                        "cannot upload virtual directory {}: {error}",
+                        directory.item_id
+                    );
+                }
+            }
+        }
+    }
+}
+
 fn catalog_ready_for_drive(catalog: &Catalog, drive_id: &str) -> bool {
     catalog.active_drive_id().ok().flatten().as_deref() == Some(drive_id)
         && catalog.is_complete(drive_id).unwrap_or(false)
@@ -3627,6 +3842,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let automatic_upload = daemon.clone();
     let automatic_mount = daemon.clone();
     let automatic_mutations = daemon.clone();
+    let automatic_directories = daemon.clone();
     let _connection = Builder::session()?
         .name(BUS_NAME)?
         .serve_at(OBJECT_PATH, daemon)?
@@ -3636,6 +3852,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if std::env::var("ONEDRIVE_SMOKE_NO_RESTORE").as_deref() != Ok("1") {
             tokio::spawn(poll_virtual_mutations(
                 automatic_mutations,
+                state_path.clone(),
+                client_id.clone(),
+            ));
+            tokio::spawn(poll_virtual_directories(
+                automatic_directories,
                 state_path.clone(),
                 client_id.clone(),
             ));

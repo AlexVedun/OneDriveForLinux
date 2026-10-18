@@ -14,6 +14,10 @@ pub struct LocalDirectory {
     pub item_id: String,
     pub parent_id: String,
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_id: Option<String>,
+    #[serde(default)]
+    pub seen_remote: bool,
 }
 
 impl LocalDirectory {
@@ -22,6 +26,8 @@ impl LocalDirectory {
             || !self.item_id.starts_with("local-dir:")
             || self.parent_id.is_empty()
             || !NewFileLocation::valid_name(&self.name)
+            || self.remote_id.as_deref() == Some("")
+            || (self.seen_remote && self.remote_id.is_none())
         {
             return Err(io::Error::from(io::ErrorKind::InvalidData));
         }
@@ -58,6 +64,13 @@ impl DirectoryStore {
         let mut entries = Vec::new();
         for entry in fs::read_dir(&self.root)? {
             let entry = entry?;
+            if entry
+                .path()
+                .extension()
+                .is_none_or(|extension| extension != "json")
+            {
+                continue;
+            }
             let mut file = OpenOptions::new()
                 .read(true)
                 .custom_flags(libc::O_NOFOLLOW)
@@ -90,6 +103,8 @@ impl DirectoryStore {
             item_id: format!("local-dir:{random}"),
             parent_id: parent_id.to_owned(),
             name: name.to_owned(),
+            remote_id: None,
+            seen_remote: false,
         };
         directory.validate()?;
         drop(temporary);
@@ -103,6 +118,9 @@ impl DirectoryStore {
         parent_id: &str,
         name: &str,
     ) -> io::Result<()> {
+        if directory.remote_id.is_some() {
+            return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+        }
         let mut changed = directory.clone();
         changed.parent_id = parent_id.to_owned();
         changed.name = name.to_owned();
@@ -111,8 +129,37 @@ impl DirectoryStore {
     }
 
     pub fn remove(&self, directory: &LocalDirectory) -> io::Result<()> {
+        if directory.remote_id.is_some() {
+            return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+        }
         fs::remove_file(self.path(&directory.item_id))?;
         File::open(&self.root)?.sync_all()
+    }
+
+    pub fn mark_uploaded(&self, directory: &LocalDirectory, remote_id: &str) -> io::Result<()> {
+        if directory.remote_id.is_some() || remote_id.is_empty() {
+            return Err(io::Error::from(io::ErrorKind::InvalidInput));
+        }
+        let mut uploaded = directory.clone();
+        uploaded.remote_id = Some(remote_id.to_owned());
+        self.save(&uploaded, false)
+    }
+
+    pub fn mark_seen(&self, directory: &LocalDirectory) -> io::Result<()> {
+        if directory.remote_id.is_none() {
+            return Err(io::Error::from(io::ErrorKind::InvalidInput));
+        }
+        let mut seen = directory.clone();
+        seen.seen_remote = true;
+        self.save(&seen, false)
+    }
+
+    pub fn remote_parent_id(&self, item_id: &str) -> io::Result<Option<String>> {
+        Ok(self
+            .list()?
+            .into_iter()
+            .find(|directory| directory.item_id == item_id)
+            .and_then(|directory| directory.remote_id))
     }
 
     fn save(&self, directory: &LocalDirectory, new: bool) -> io::Result<()> {
@@ -168,5 +215,31 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn uploaded_directory_mapping_survives_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let store = DirectoryStore::open(root.path()).unwrap();
+        let local = store.create("drive", "root", "folder").unwrap();
+        store.mark_uploaded(&local, "remote-folder").unwrap();
+        let store = DirectoryStore::open(root.path()).unwrap();
+        assert_eq!(
+            store.remote_parent_id(&local.item_id).unwrap().as_deref(),
+            Some("remote-folder")
+        );
+        let uploaded = store.list().unwrap().remove(0);
+        assert!(store.remove(&uploaded).is_err());
+        store.mark_seen(&uploaded).unwrap();
+        assert!(store.list().unwrap()[0].seen_remote);
+    }
+
+    #[test]
+    fn ignores_uncommitted_temporary_directory_record() {
+        let root = tempfile::tempdir().unwrap();
+        let store = DirectoryStore::open(root.path()).unwrap();
+        let pending = tempfile::NamedTempFile::new_in(root.path().join("directories")).unwrap();
+        std::fs::write(pending.path(), b"partial").unwrap();
+        assert!(store.list().unwrap().is_empty());
     }
 }
