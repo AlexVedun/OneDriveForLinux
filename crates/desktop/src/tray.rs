@@ -234,6 +234,7 @@ enum IconKind {
     Offline,
     Paused,
     Transferring,
+    Checking,
     Synced,
     Idle,
 }
@@ -252,9 +253,13 @@ fn presentation(state: &str) -> Presentation {
             status: "Active",
             icon: IconKind::Paused,
         },
-        "transferring" | "checking" => Presentation {
+        "transferring" => Presentation {
             status: "Active",
             icon: IconKind::Transferring,
+        },
+        "checking" => Presentation {
+            status: "Active",
+            icon: IconKind::Checking,
         },
         "synced" => Presentation {
             status: "Active",
@@ -267,108 +272,123 @@ fn presentation(state: &str) -> Presentation {
     }
 }
 
-const ICON_SIZE: i32 = 22;
-
 fn icon_pixmap(kind: IconKind) -> Vec<(i32, i32, Vec<u8>)> {
-    let color = match kind {
-        IconKind::Attention => [0xcf, 0x42, 0x37],
-        IconKind::Offline => [0x74, 0x7a, 0x83],
-        IconKind::Paused => [0xb4, 0x72, 0x12],
-        IconKind::Transferring => [0x17, 0x64, 0xc2],
-        IconKind::Synced => [0x22, 0x85, 0x4c],
-        IconKind::Idle => [0x17, 0x64, 0xc2],
-    };
-    // StatusNotifierItem requires straight ARGB32 in network byte order.
-    let mut pixels = vec![0; (ICON_SIZE * ICON_SIZE * 4) as usize];
-    for y in 0..ICON_SIZE {
-        for x in 0..ICON_SIZE {
-            let dx = x - 11;
-            let dy = y - 11;
-            if dx * dx + dy * dy <= 100 {
-                set_pixel(&mut pixels, x, y, [255, color[0], color[1], color[2]]);
+    [22, 32]
+        .into_iter()
+        .map(|size| (size, size, render_icon(kind, size)))
+        .collect()
+}
+
+fn render_icon(kind: IconKind, size: i32) -> Vec<u8> {
+    // Four samples per axis keep the cloud and badge legible in a 22 px panel.
+    // StatusNotifierItem expects straight ARGB32 bytes in network byte order.
+    let mut pixels = vec![0; (size * size * 4) as usize];
+    for y in 0..size {
+        for x in 0..size {
+            let mut alpha = 0_u32;
+            let mut rgb = [0_u32; 3];
+            for sy in 0..4 {
+                for sx in 0..4 {
+                    let px = (x as f32 + (sx as f32 + 0.5) / 4.0) * 32.0 / size as f32;
+                    let py = (y as f32 + (sy as f32 + 0.5) / 4.0) * 32.0 / size as f32;
+                    if let Some(color) = icon_sample(kind, px, py) {
+                        alpha += 1;
+                        for channel in 0..3 {
+                            rgb[channel] += u32::from(color[channel]);
+                        }
+                    }
+                }
+            }
+            let offset = ((y * size + x) * 4) as usize;
+            pixels[offset] = (alpha * 255 / 16) as u8;
+            for channel in 0..3 {
+                pixels[offset + channel + 1] = rgb[channel].checked_div(alpha).unwrap_or(0) as u8;
             }
         }
     }
+    pixels
+}
+
+fn circle(x: f32, y: f32, cx: f32, cy: f32, radius: f32) -> bool {
+    (x - cx).powi(2) + (y - cy).powi(2) <= radius.powi(2)
+}
+
+fn line(x: f32, y: f32, ax: f32, ay: f32, bx: f32, by: f32, width: f32) -> bool {
+    let dx = bx - ax;
+    let dy = by - ay;
+    let projection = (((x - ax) * dx + (y - ay) * dy) / (dx * dx + dy * dy)).clamp(0.0, 1.0);
+    circle(
+        x,
+        y,
+        ax + projection * dx,
+        ay + projection * dy,
+        width / 2.0,
+    )
+}
+
+fn badge_symbol(kind: IconKind, x: f32, y: f32) -> bool {
     match kind {
         IconKind::Attention => {
-            fill_rect(&mut pixels, 10, 5, 12, 13);
-            fill_rect(&mut pixels, 10, 15, 12, 17);
+            (23.1..24.9).contains(&x) && (19.6..25.1).contains(&y) || circle(x, y, 24.0, 27.6, 1.0)
         }
         IconKind::Offline => {
-            for offset in 0..10 {
-                fill_rect(&mut pixels, 6 + offset, 6 + offset, 8 + offset, 8 + offset);
-                fill_rect(
-                    &mut pixels,
-                    15 - offset,
-                    6 + offset,
-                    17 - offset,
-                    8 + offset,
-                );
-            }
+            line(x, y, 21.0, 21.0, 27.0, 27.0, 2.0) || line(x, y, 27.0, 21.0, 21.0, 27.0, 2.0)
         }
         IconKind::Paused => {
-            fill_rect(&mut pixels, 7, 6, 10, 17);
-            fill_rect(&mut pixels, 13, 6, 16, 17);
+            ((21.0..23.0).contains(&x) || (25.0..27.0).contains(&x)) && (20.3..27.7).contains(&y)
         }
         IconKind::Transferring => {
-            fill_rect(&mut pixels, 10, 7, 12, 17);
-            for offset in 0..4 {
-                fill_rect(
-                    &mut pixels,
-                    7 + offset,
-                    10 - offset,
-                    9 + offset,
-                    12 - offset,
-                );
-                fill_rect(
-                    &mut pixels,
-                    13 - offset,
-                    7 + offset,
-                    15 - offset,
-                    9 + offset,
-                );
-            }
+            line(x, y, 22.0, 26.8, 22.0, 21.0, 1.7)
+                || line(x, y, 22.0, 21.0, 20.1, 23.0, 1.7)
+                || line(x, y, 22.0, 21.0, 23.9, 23.0, 1.7)
+                || line(x, y, 26.0, 21.2, 26.0, 27.0, 1.7)
+                || line(x, y, 26.0, 27.0, 24.1, 25.0, 1.7)
+                || line(x, y, 26.0, 27.0, 27.9, 25.0, 1.7)
+        }
+        IconKind::Checking => {
+            let distance = ((x - 23.0).powi(2) + (y - 23.0).powi(2)).sqrt();
+            (2.2..3.8).contains(&distance) || line(x, y, 25.2, 25.2, 28.0, 28.0, 1.8)
         }
         IconKind::Synced => {
-            for offset in 0..5 {
-                fill_rect(
-                    &mut pixels,
-                    5 + offset,
-                    11 + offset,
-                    7 + offset,
-                    13 + offset,
-                );
-                fill_rect(
-                    &mut pixels,
-                    9 + offset,
-                    15 - offset,
-                    11 + offset,
-                    17 - offset,
-                );
-            }
+            line(x, y, 20.5, 24.0, 23.0, 26.5, 2.2) || line(x, y, 23.0, 26.5, 27.7, 21.2, 2.2)
         }
-        IconKind::Idle => {
-            fill_rect(&mut pixels, 6, 10, 16, 15);
-            fill_rect(&mut pixels, 8, 8, 12, 15);
-            fill_rect(&mut pixels, 12, 9, 15, 15);
-        }
-    }
-    vec![(ICON_SIZE, ICON_SIZE, pixels)]
-}
-
-fn fill_rect(pixels: &mut [u8], left: i32, top: i32, right: i32, bottom: i32) {
-    for y in top..bottom {
-        for x in left..right {
-            set_pixel(pixels, x, y, [255, 255, 255, 255]);
-        }
+        IconKind::Idle => false,
     }
 }
 
-fn set_pixel(pixels: &mut [u8], x: i32, y: i32, argb: [u8; 4]) {
-    if (0..ICON_SIZE).contains(&x) && (0..ICON_SIZE).contains(&y) {
-        let offset = ((y * ICON_SIZE + x) * 4) as usize;
-        pixels[offset..offset + 4].copy_from_slice(&argb);
+fn icon_sample(kind: IconKind, x: f32, y: f32) -> Option<[u8; 3]> {
+    // Rounded blue tile and white cloud follow the packaged application icon.
+    let bx = x.clamp(6.0, 26.0);
+    let by = y.clamp(6.0, 26.0);
+    let mut color = circle(x, y, bx, by, 5.0).then_some([0x17, 0x64, 0xc2]);
+    let cloud = (circle(x, y, 11.0, 18.2, 5.0)
+        || circle(x, y, 18.0, 14.3, 6.5)
+        || circle(x, y, 24.0, 17.8, 4.7)
+        || (8.0..27.8).contains(&x) && (17.7..23.0).contains(&y))
+        && (8.0..27.8).contains(&x)
+        && y < 23.0;
+    if cloud {
+        color = Some([255, 255, 255]);
     }
+    if kind != IconKind::Idle {
+        if circle(x, y, 24.0, 24.0, 8.5) {
+            color = Some([255, 255, 255]);
+        }
+        if circle(x, y, 24.0, 24.0, 7.0) {
+            color = Some(match kind {
+                IconKind::Attention => [0xcc, 0x35, 0x35],
+                IconKind::Offline => [0x67, 0x6f, 0x78],
+                IconKind::Paused => [0xad, 0x67, 0x09],
+                IconKind::Synced => [0x1b, 0x83, 0x4b],
+                IconKind::Transferring | IconKind::Checking => [0x17, 0x64, 0xc2],
+                IconKind::Idle => unreachable!(),
+            });
+        }
+        if badge_symbol(kind, x, y) {
+            color = Some([255, 255, 255]);
+        }
+    }
+    color
 }
 
 fn interface_xml(name: &str) -> String {
@@ -407,7 +427,7 @@ fn property_value(name: &str, state: &str, label: &str) -> glib::Variant {
         "WindowId" => 0_u32.to_variant(),
         "IconName" | "AttentionIconName" => "".to_variant(),
         "IconPixmap" => icon_pixmap(presentation(state).icon).to_variant(),
-        "AttentionIconPixmap" => icon_pixmap(IconKind::Attention).to_variant(),
+        "AttentionIconPixmap" => icon_pixmap(presentation(state).icon).to_variant(),
         "ToolTip" => (
             "",
             icon_pixmap(presentation(state).icon),
@@ -636,6 +656,7 @@ mod tests {
         assert_eq!(presentation("offline").icon, IconKind::Offline);
         assert_eq!(presentation("paused").icon, IconKind::Paused);
         assert_eq!(presentation("transferring").status, "Active");
+        assert_eq!(presentation("checking").icon, IconKind::Checking);
         assert_eq!(presentation("connected").icon, IconKind::Idle);
         assert_eq!(presentation("synced").icon, IconKind::Synced);
     }
@@ -648,17 +669,19 @@ mod tests {
             IconKind::Offline,
             IconKind::Paused,
             IconKind::Transferring,
+            IconKind::Checking,
             IconKind::Synced,
             IconKind::Idle,
         ] {
             let pixmaps = icon_pixmap(kind);
-            assert_eq!(pixmaps.len(), 1);
-            let (width, height, pixels) = &pixmaps[0];
-            assert_eq!((*width, *height), (22, 22));
-            assert_eq!(pixels.len(), 22 * 22 * 4);
-            assert_eq!(&pixels[..4], &[0, 0, 0, 0]);
-            assert_eq!(pixels[(11 * 22 + 11) * 4], 255);
-            images.push(pixels.clone());
+            assert_eq!(pixmaps.len(), 2);
+            for (size, (width, height, pixels)) in [22, 32].into_iter().zip(&pixmaps) {
+                assert_eq!((*width, *height), (size, size));
+                assert_eq!(pixels.len(), (size * size * 4) as usize);
+                assert_eq!(&pixels[..4], &[0, 0, 0, 0]);
+                assert_eq!(pixels[((size / 2 * size + size / 2) * 4) as usize], 255);
+            }
+            images.push(pixmaps[1].2.clone());
         }
         for (index, image) in images.iter().enumerate() {
             assert!(images.iter().skip(index + 1).all(|other| other != image));
@@ -675,6 +698,37 @@ mod tests {
                 .as_str(),
             "a(iiay)"
         );
+        assert_ne!(
+            property_value("AttentionIconPixmap", "offline", "offline"),
+            property_value("AttentionIconPixmap", "error", "error")
+        );
+    }
+
+    #[test]
+    fn cloud_and_status_symbols_have_expected_colors() {
+        assert_eq!(
+            icon_sample(IconKind::Idle, 16.0, 13.0),
+            Some([255, 255, 255])
+        );
+        assert_eq!(
+            icon_sample(IconKind::Idle, 4.0, 4.0),
+            Some([0x17, 0x64, 0xc2])
+        );
+        assert_eq!(icon_sample(IconKind::Idle, 0.0, 0.0), None);
+        for kind in [
+            IconKind::Attention,
+            IconKind::Offline,
+            IconKind::Paused,
+            IconKind::Transferring,
+            IconKind::Checking,
+            IconKind::Synced,
+        ] {
+            assert_ne!(
+                icon_sample(kind, 24.0, 19.0),
+                icon_sample(IconKind::Idle, 24.0, 19.0)
+            );
+            assert!((19..29).any(|y| (19..29).any(|x| badge_symbol(kind, x as f32, y as f32))));
+        }
     }
 
     #[test]

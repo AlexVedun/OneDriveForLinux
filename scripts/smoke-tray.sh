@@ -48,14 +48,14 @@ for interface in org.kde.StatusNotifierItem org.freedesktop.StatusNotifierItem; 
         --object-path /StatusNotifierItem \
         --method org.freedesktop.DBus.Properties.Get "$interface" IconPixmap)
     case "$pixmap" in
-        *"(22, 22,"*) ;;
+        *"(22, 22,"*"(32, 32,"*) ;;
         *) exit 1 ;;
     esac
     attention=$(gdbus call --session --dest "$service" \
         --object-path /StatusNotifierItem \
         --method org.freedesktop.DBus.Properties.Get "$interface" AttentionIconPixmap)
     case "$attention" in
-        *"(22, 22,"*) ;;
+        *"(22, 22,"*"(32, 32,"*) ;;
         *) exit 1 ;;
     esac
     tooltip=$(gdbus call --session --dest "$service" \
