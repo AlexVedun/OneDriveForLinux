@@ -194,15 +194,29 @@ impl VirtualFuse {
                         .getattr(crate::ROOT_INODE)
                         .filter(|node| node.item_id == location.parent_id)
                 });
-            let Some(parent) = parent.filter(|node| node.kind == NodeKind::Directory) else {
-                continue;
+            let (parent, orphaned) = match parent.filter(|node| node.kind == NodeKind::Directory) {
+                Some(parent) => (parent, false),
+                None => (
+                    self.tree.getattr(crate::ROOT_INODE).expect("virtual root"),
+                    true,
+                ),
             };
-            if self.tree.lookup(parent.inode, &location.name).is_some()
+            let mut visible_name = location.name.clone();
+            if orphaned
+                || self.tree.lookup(parent.inode, &visible_name).is_some()
                 || local
                     .values()
-                    .any(|node| node.parent_inode == parent.inode && node.name == location.name)
+                    .any(|node| node.parent_inode == parent.inode && node.name == visible_name)
             {
-                continue;
+                let short_id = identity
+                    .item_id
+                    .strip_prefix("local:")
+                    .unwrap_or(&identity.item_id);
+                let prefix = if orphaned { "orphan" } else { "conflict" };
+                visible_name = format!(
+                    ".{prefix}-{short_id}-{}",
+                    location.name.chars().take(120).collect::<String>()
+                );
             }
             let inode = crate::stable_inode(&identity.drive_id, &identity.item_id);
             if self.tree.getattr(inode).is_some() || local.contains_key(&inode) {
@@ -214,7 +228,7 @@ impl VirtualFuse {
                     inode,
                     parent_inode: parent.inode,
                     item_id: identity.item_id,
-                    name: location.name.clone(),
+                    name: visible_name,
                     kind: NodeKind::File,
                     size: 0,
                     etag: None,
@@ -229,7 +243,7 @@ impl VirtualFuse {
         let Some(root) = &self.draft_root else {
             return Err(Errno::EROFS);
         };
-        if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\0']) {
+        if !NewFileLocation::valid_name(name) {
             return Err(Errno::EINVAL);
         }
         let parent_node = self.tree.getattr(parent).ok_or(Errno::ENOENT)?;
@@ -581,15 +595,28 @@ impl Filesystem for VirtualFuse {
         flags: Option<fuser::BsdFileFlags>,
         reply: ReplyAttr,
     ) {
-        if mode.is_some() || uid.is_some() || gid.is_some() || flags.is_some() {
+        if uid.is_some() || gid.is_some() || flags.is_some() {
             reply.error(Errno::EROFS);
             return;
         }
-        let Some(size) = size else {
+        if mode.is_some()
+            && (self.draft_root.is_none()
+                || self
+                    .node(inode.0)
+                    .is_none_or(|node| node.kind != NodeKind::File))
+        {
             reply.error(Errno::EROFS);
             return;
+        }
+        let result = if let Some(size) = size {
+            self.truncate_file(inode.0, handle.map(|handle| handle.0), size)
+        } else if mode.is_some() && self.draft_root.is_some() {
+            // OneDrive has no Unix mode metadata; accept the copy tool's chmod.
+            Ok(())
+        } else {
+            Err(Errno::EROFS)
         };
-        match self.truncate_file(inode.0, handle.map(|handle| handle.0), size) {
+        match result {
             Ok(()) => match self.node(inode.0).and_then(|node| self.attr(&node).ok()) {
                 Some(attr) => reply.attr(&TTL, &attr),
                 None => reply.error(Errno::EIO),
@@ -938,6 +965,13 @@ mod tests {
         let created = mountpoint.join("новый файл.txt");
         fs::write(&created, b"local content").unwrap();
         assert_eq!(fs::read(&created).unwrap(), b"local content");
+        let copy_source = dir.path().join("copy-source");
+        fs::write(&copy_source, b"copied bytes").unwrap();
+        fs::copy(&copy_source, mountpoint.join("copied.txt")).unwrap();
+        assert_eq!(
+            fs::read(mountpoint.join("copied.txt")).unwrap(),
+            b"copied bytes"
+        );
         assert!(
             fs::read_dir(&mountpoint)
                 .unwrap()
@@ -945,13 +979,22 @@ mod tests {
         );
         session.umount_and_join().unwrap();
         let drafts = DraftStore::open(&draft_root).unwrap().list().unwrap();
-        assert_eq!(drafts.len(), 1);
-        assert_eq!(drafts[0].new_file.as_ref().unwrap().name, "новый файл.txt");
+        assert_eq!(drafts.len(), 2);
+        assert!(drafts.iter().any(|draft| {
+            draft
+                .new_file
+                .as_ref()
+                .is_some_and(|file| file.name == "новый файл.txt")
+        }));
         let tree = VirtualTree::from_items("drive", "root", [file_item()]).unwrap();
         let session = VirtualFuse::new_writable(tree, cache_root, draft_root, 10, loader)
             .mount(&mountpoint)
             .unwrap();
         assert_eq!(fs::read(&created).unwrap(), b"local content");
+        assert_eq!(
+            fs::read(mountpoint.join("copied.txt")).unwrap(),
+            b"copied bytes"
+        );
         session.umount_and_join().unwrap();
     }
 
@@ -984,6 +1027,44 @@ mod tests {
             fuse.read_file(created.inode, handle, 0, 4).unwrap(),
             b"data"
         );
+    }
+
+    #[test]
+    fn remote_name_collision_keeps_local_file_visible_after_remount() {
+        let dir = tempfile::tempdir().unwrap();
+        let draft_root = dir.path().join("drafts");
+        let identity = DraftIdentity {
+            drive_id: "drive".into(),
+            item_id: "local:pending".into(),
+            base_etag: "local-new".into(),
+            new_file: Some(NewFileLocation {
+                parent_id: "root".into(),
+                name: "текст.txt".into(),
+            }),
+        };
+        DraftStore::open(&draft_root)
+            .unwrap()
+            .begin_empty(identity)
+            .unwrap()
+            .write_at(0, b"my copy")
+            .unwrap();
+        let tree = VirtualTree::from_items("drive", "root", [file_item()]).unwrap();
+        let fuse = VirtualFuse::new_writable(
+            tree,
+            dir.path().join("cache"),
+            draft_root,
+            10,
+            Arc::new(|_| Err(io::ErrorKind::NotConnected.into())),
+        );
+        fuse.load_local_files().unwrap();
+        let entries = fuse.directory_entries(ROOT_INODE).unwrap();
+        let conflict = entries
+            .iter()
+            .find(|entry| entry.2.starts_with(".conflict-"))
+            .unwrap();
+        let inode = fuse.lookup_node(ROOT_INODE, &conflict.2).unwrap().inode;
+        let handle = fuse.open_file(inode, OpenFlags(libc::O_RDONLY)).unwrap();
+        assert_eq!(fuse.read_file(inode, handle, 0, 7).unwrap(), b"my copy");
     }
 
     #[test]

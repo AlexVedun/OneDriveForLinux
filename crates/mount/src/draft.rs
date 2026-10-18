@@ -24,6 +24,18 @@ pub struct NewFileLocation {
     pub name: String,
 }
 
+impl NewFileLocation {
+    pub fn valid_name(name: &str) -> bool {
+        !name.is_empty()
+            && name != "."
+            && name != ".."
+            && !name.ends_with([' ', '.'])
+            && !name
+                .chars()
+                .any(|character| "\"*:<>?/\\|".contains(character) || character.is_control())
+    }
+}
+
 impl DraftIdentity {
     fn validate(&self) -> io::Result<()> {
         if self.drive_id.is_empty() || self.item_id.is_empty() || self.base_etag.is_empty() {
@@ -36,10 +48,7 @@ impl DraftIdentity {
             && (!self.item_id.starts_with("local:")
                 || self.base_etag != "local-new"
                 || location.parent_id.is_empty()
-                || location.name.is_empty()
-                || location.name == "."
-                || location.name == ".."
-                || location.name.contains(['/', '\0']))
+                || !NewFileLocation::valid_name(&location.name))
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -719,6 +728,24 @@ mod tests {
             item_id: "file".into(),
             base_etag: "v1".into(),
             new_file: None,
+        }
+    }
+
+    #[test]
+    fn new_file_names_must_be_accepted_by_onedrive() {
+        assert!(NewFileLocation::valid_name("новый файл.txt"));
+        for name in [
+            "",
+            ".",
+            "..",
+            "trailing.",
+            "trailing ",
+            "bad:name",
+            "a/b",
+            "a\\b",
+            "line\n",
+        ] {
+            assert!(!NewFileLocation::valid_name(name), "{name:?}");
         }
     }
 

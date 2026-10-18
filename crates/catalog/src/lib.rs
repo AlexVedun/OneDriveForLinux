@@ -408,6 +408,35 @@ impl Catalog {
             params![drive_id, item_id, expected_etag, uploaded_etag, size],
         )? == 1)
     }
+
+    /// Publish a verified Graph creation so the next virtual mount sees the file immediately.
+    pub fn record_created_file(
+        &self,
+        drive_id: &str,
+        item_id: &str,
+        parent_id: &str,
+        name: &str,
+        etag: &str,
+        size: u64,
+    ) -> Result<bool, CatalogError> {
+        if [drive_id, item_id, parent_id, name, etag]
+            .iter()
+            .any(|part| part.is_empty())
+        {
+            return Err(CatalogError::InvalidPage);
+        }
+        let size = i64::try_from(size).map_err(|_| CatalogError::InvalidPage)?;
+        Ok(self.connection.execute(
+            "INSERT INTO remote_item
+             (drive_id, item_id, parent_id, name, kind, size, etag, deleted)
+             SELECT ?1, ?2, ?3, ?4, 'file', ?6, ?5, 0
+             WHERE (EXISTS (SELECT 1 FROM drive_root WHERE drive_id = ?1 AND item_id = ?3)
+                    OR EXISTS (SELECT 1 FROM remote_item WHERE drive_id = ?1 AND item_id = ?3 AND kind = 'folder' AND deleted = 0))
+               AND NOT EXISTS (SELECT 1 FROM remote_item WHERE drive_id = ?1 AND parent_id = ?3 AND name = ?4 AND deleted = 0)
+             ON CONFLICT(drive_id, item_id) DO NOTHING",
+            params![drive_id, item_id, parent_id, name, etag, size],
+        )? == 1)
+    }
 }
 
 impl CatalogItem {
@@ -452,6 +481,36 @@ mod tests {
 
     const NEXT: &str = "https://graph.microsoft.com/v1.0/me/drive/root/delta?token=next";
     const CURSOR: &str = "https://graph.microsoft.com/v1.0/me/drive/root/delta?token=done";
+
+    #[test]
+    fn recorded_virtual_creation_requires_parent_and_free_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = Catalog::open(&dir.path().join("catalog.sqlite")).unwrap();
+        catalog.set_root_id("drive", "root").unwrap();
+        assert!(
+            !catalog
+                .record_created_file("drive", "id", "missing", "new.txt", "v1", 3)
+                .unwrap()
+        );
+        assert!(
+            catalog
+                .record_created_file("drive", "id", "root", "new.txt", "v1", 3)
+                .unwrap()
+        );
+        assert!(
+            !catalog
+                .record_created_file("drive", "another", "root", "new.txt", "v1", 3)
+                .unwrap()
+        );
+        assert!(
+            !catalog
+                .record_created_file("drive", "id", "root", "other.txt", "v1", 3)
+                .unwrap()
+        );
+        let item = catalog.item("drive", "id").unwrap().unwrap();
+        assert_eq!(item.parent_id.as_deref(), Some("root"));
+        assert_eq!(item.size, Some(3));
+    }
 
     fn page(json: &str) -> DeltaPage {
         serde_json::from_str(json).unwrap()

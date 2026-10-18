@@ -22,12 +22,55 @@ pub async fn upload_snapshot<T: UploadTransport>(
         local_fingerprint: Some(snapshot.sha256.clone()),
         attempts: 0,
     };
+    upload_operation_snapshot(
+        transport,
+        store,
+        snapshot,
+        operation,
+        Some(&snapshot.identity.item_id),
+    )
+    .await
+}
+
+pub async fn upload_new_snapshot<T: UploadTransport>(
+    transport: &T,
+    store: &DraftStore,
+    snapshot: &DraftSnapshot,
+) -> Result<UploadStep, UploadError> {
+    let location = snapshot
+        .identity
+        .new_file
+        .as_ref()
+        .ok_or(UploadError::InvalidResponse)?;
+    if snapshot.size == 0 {
+        return Err(UploadError::InvalidResponse);
+    }
+    let operation = QueuedOperation {
+        id: 0,
+        kind: "UploadNewByParent".to_owned(),
+        path: location.name.clone(),
+        from_path: None,
+        remote_id: Some(location.parent_id.clone()),
+        expected_etag: None,
+        local_fingerprint: Some(snapshot.sha256.clone()),
+        attempts: 0,
+    };
+    upload_operation_snapshot(transport, store, snapshot, operation, None).await
+}
+
+async fn upload_operation_snapshot<T: UploadTransport>(
+    transport: &T,
+    store: &DraftStore,
+    snapshot: &DraftSnapshot,
+    operation: QueuedOperation,
+    expected_id: Option<&str>,
+) -> Result<UploadStep, UploadError> {
     if snapshot.size == 0 {
         store.clear_upload_checkpoint(&snapshot.identity)?;
         let result = transport.upload_empty(&operation).await?;
         return match result {
             UploadStep::Complete { remote_id, etag }
-                if remote_id == snapshot.identity.item_id
+                if Some(remote_id.as_str()) == expected_id
                     && etag.as_ref().is_some_and(|etag| !etag.is_empty()) =>
             {
                 Ok(UploadStep::Complete { remote_id, etag })
@@ -78,7 +121,8 @@ pub async fn upload_snapshot<T: UploadTransport>(
             }
             UploadStep::Complete { remote_id, etag }
                 if offset + length as u64 == snapshot.size
-                    && remote_id == snapshot.identity.item_id
+                    && !remote_id.is_empty()
+                    && expected_id.is_none_or(|expected| remote_id == expected)
                     && etag.as_ref().is_some_and(|etag| !etag.is_empty()) =>
             {
                 return Ok(UploadStep::Complete { remote_id, etag });
@@ -108,7 +152,7 @@ async fn create_checkpoint<T: UploadTransport>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use onedrive_mount::draft::{DraftIdentity, DraftStore};
+    use onedrive_mount::draft::{DraftIdentity, DraftStore, NewFileLocation};
     use std::sync::{
         Mutex,
         atomic::{AtomicUsize, Ordering},
@@ -164,6 +208,67 @@ mod tests {
                 Ok(UploadStep::More(sent.len() as u64))
             }
         }
+    }
+
+    struct NewTransport;
+
+    impl UploadTransport for NewTransport {
+        async fn create_session(
+            &self,
+            operation: &QueuedOperation,
+            size: u64,
+        ) -> Result<String, UploadError> {
+            assert_eq!(operation.kind, "UploadNewByParent");
+            assert_eq!(operation.remote_id.as_deref(), Some("parent"));
+            assert_eq!(operation.path, "new.txt");
+            assert!(operation.expected_etag.is_none());
+            assert_eq!(size, 3);
+            Ok("https://upload.example/new".into())
+        }
+        async fn session_offset(&self, _: &str) -> Result<u64, UploadError> {
+            Ok(0)
+        }
+        async fn send_range(
+            &self,
+            _: &str,
+            start: u64,
+            total: u64,
+            bytes: Vec<u8>,
+        ) -> Result<UploadStep, UploadError> {
+            assert_eq!((start, total, bytes.as_slice()), (0, 3, b"abc".as_slice()));
+            Ok(UploadStep::Complete {
+                remote_id: "remote-created".into(),
+                etag: Some("v1".into()),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn new_virtual_file_upload_uses_parent_and_returns_remote_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DraftStore::open(&dir.path().join("drafts")).unwrap();
+        let identity = DraftIdentity {
+            drive_id: "drive".into(),
+            item_id: "local:one".into(),
+            base_etag: "local-new".into(),
+            new_file: Some(NewFileLocation {
+                parent_id: "parent".into(),
+                name: "new.txt".into(),
+            }),
+        };
+        store
+            .begin_empty(identity.clone())
+            .unwrap()
+            .write_at(0, b"abc")
+            .unwrap();
+        let snapshot = store.snapshot(&identity).unwrap().unwrap();
+        let result = upload_new_snapshot(&NewTransport, &store, &snapshot)
+            .await
+            .unwrap();
+        assert!(
+            matches!(result, UploadStep::Complete { remote_id, etag: Some(etag) }
+            if remote_id == "remote-created" && etag == "v1")
+        );
     }
 
     #[tokio::test]

@@ -2,7 +2,7 @@ use onedrive_catalog::CatalogItem;
 use onedrive_mount::draft::{DraftIdentity, DraftUploadIssue};
 use serde::Serialize;
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct VirtualDraftStatus {
     pub drive_id: String,
     pub item_id: String,
@@ -18,9 +18,14 @@ pub fn next_ready_item_id<'a>(
     statuses
         .iter()
         .find(|draft| {
-            draft.status == "ready" && after.is_some_and(|id| draft.item_id.as_str() > id)
+            matches!(draft.status, "ready" | "ready-new")
+                && after.is_some_and(|id| draft.item_id.as_str() > id)
         })
-        .or_else(|| statuses.iter().find(|draft| draft.status == "ready"))
+        .or_else(|| {
+            statuses
+                .iter()
+                .find(|draft| matches!(draft.status, "ready" | "ready-new"))
+        })
         .map(|draft| draft.item_id.as_str())
 }
 
@@ -156,5 +161,8 @@ mod tests {
         ];
         assert_eq!(next_ready_item_id(&statuses, Some("item")), Some("second"));
         assert_eq!(next_ready_item_id(&statuses, Some("second")), Some("item"));
+        let mut new = statuses[1].clone();
+        new.status = "ready-new";
+        assert_eq!(next_ready_item_id(&[new], None), Some("second"));
     }
 }

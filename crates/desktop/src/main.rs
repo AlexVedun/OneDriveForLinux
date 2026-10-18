@@ -372,6 +372,8 @@ fn export_virtual_draft(drive_id: &str, item_id: &str, destination: &str) -> Res
 fn virtual_draft_status_label(status: &str) -> &'static str {
     match status {
         "ready" => "версия в каталоге совпадает",
+        "ready-new" => "новый файл сохранён локально; ожидает отправки",
+        "new-empty" => "пустой новый файл сохранён локально; отправка пока недоступна",
         "other-drive" => "другая учётная запись или диск",
         "catalog-incomplete" => "каталог ещё не сверён",
         "remote-missing" => "файл отсутствует в каталоге",
@@ -1304,7 +1306,7 @@ fn present_virtual_drafts_dialog(
                 },
             );
         });
-        if upload_enabled && draft.status == "ready" {
+        if upload_enabled && matches!(draft.status.as_str(), "ready" | "ready-new") {
             let send = gtk::Button::with_label("Отправить в OneDrive");
             row.append(&send);
             let item_id = draft.item_id;
