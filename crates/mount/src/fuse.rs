@@ -290,30 +290,64 @@ impl VirtualFuse {
         }
         drop(changes);
         let mut local = self.local_files.lock().unwrap();
-        let mut directories: Vec<_> = DirectoryStore::open(root)?
+        let directory_store = DirectoryStore::open(root)?;
+        let mut directories: Vec<_> = directory_store
             .list()?
             .into_iter()
             .filter(|directory| directory.drive_id == self.tree.drive_id())
             .collect();
+        let mappings: HashMap<_, _> = directories
+            .iter()
+            .filter_map(|directory| {
+                directory
+                    .remote_id
+                    .as_ref()
+                    .map(|remote| (directory.item_id.clone(), remote.clone()))
+            })
+            .collect();
+        for directory in &directories {
+            if let Some(remote_id) = &directory.remote_id
+                && !directory.seen_remote
+                && self
+                    .tree
+                    .getattr(crate::stable_inode(&directory.drive_id, remote_id))
+                    .is_some()
+            {
+                directory_store.mark_seen(directory)?;
+            }
+        }
+        directories.retain(|directory| {
+            !directory.seen_remote
+                && directory.remote_id.as_ref().is_none_or(|remote_id| {
+                    self.tree
+                        .getattr(crate::stable_inode(&directory.drive_id, remote_id))
+                        .is_none()
+                })
+        });
         while !directories.is_empty() {
             let before = directories.len();
             directories.retain(|directory| {
+                let parent_id = mappings
+                    .get(&directory.parent_id)
+                    .filter(|remote_id| {
+                        self.tree
+                            .getattr(crate::stable_inode(&directory.drive_id, remote_id))
+                            .is_some()
+                    })
+                    .unwrap_or(&directory.parent_id);
                 let parent = self
                     .tree
-                    .getattr(crate::stable_inode(
-                        &directory.drive_id,
-                        &directory.parent_id,
-                    ))
+                    .getattr(crate::stable_inode(&directory.drive_id, parent_id))
                     .or_else(|| {
                         self.tree
                             .getattr(crate::ROOT_INODE)
-                            .filter(|node| node.item_id == directory.parent_id)
+                            .filter(|node| node.item_id == *parent_id)
                     })
                     .cloned()
                     .or_else(|| {
                         local
                             .values()
-                            .find(|node| node.item_id == directory.parent_id)
+                            .find(|node| node.item_id == *parent_id)
                             .cloned()
                     });
                 let Some(parent) = parent.filter(|node| node.kind == NodeKind::Directory) else {
@@ -372,19 +406,27 @@ impl VirtualFuse {
             if identity.drive_id != self.tree.drive_id() {
                 continue;
             }
+            let parent_id = mappings
+                .get(&location.parent_id)
+                .filter(|remote_id| {
+                    self.tree
+                        .getattr(crate::stable_inode(&identity.drive_id, remote_id))
+                        .is_some()
+                })
+                .unwrap_or(&location.parent_id);
             let parent = self
                 .tree
-                .getattr(crate::stable_inode(&identity.drive_id, &location.parent_id))
+                .getattr(crate::stable_inode(&identity.drive_id, parent_id))
                 .or_else(|| {
                     self.tree
                         .getattr(crate::ROOT_INODE)
-                        .filter(|node| node.item_id == location.parent_id)
+                        .filter(|node| node.item_id == *parent_id)
                 })
                 .cloned()
                 .or_else(|| {
                     local
                         .values()
-                        .find(|node| node.item_id == location.parent_id)
+                        .find(|node| node.item_id == *parent_id)
                         .cloned()
                 });
             let (parent, orphaned) = match parent
@@ -1487,6 +1529,48 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    #[test]
+    fn uploaded_directory_mapping_keeps_nested_draft_visible() {
+        let dir = tempfile::tempdir().unwrap();
+        let draft_root = dir.path().join("drafts");
+        DraftStore::open(&draft_root).unwrap();
+        let directories = DirectoryStore::open(&draft_root).unwrap();
+        let local_dir = directories.create("drive", "root", "new folder").unwrap();
+        let identity = DraftIdentity {
+            drive_id: "drive".into(),
+            item_id: "local:child".into(),
+            base_etag: "local-new".into(),
+            new_file: Some(NewFileLocation {
+                parent_id: local_dir.item_id.clone(),
+                name: "inside.txt".into(),
+            }),
+        };
+        DraftStore::open(&draft_root)
+            .unwrap()
+            .begin_empty(identity)
+            .unwrap();
+        directories
+            .mark_uploaded(&local_dir, "remote-folder")
+            .unwrap();
+        let mut remote_folder = file_item();
+        remote_folder.item_id = "remote-folder".into();
+        remote_folder.name = Some("new folder".into());
+        remote_folder.kind = "folder".into();
+        let tree = VirtualTree::from_items("drive", "root", [remote_folder]).unwrap();
+        let fuse = VirtualFuse::new_writable(
+            tree,
+            dir.path().join("cache"),
+            draft_root.clone(),
+            10,
+            Arc::new(|_| Err(io::ErrorKind::NotConnected.into())),
+        );
+        fuse.load_local_files().unwrap();
+        let folder = fuse.lookup_node(ROOT_INODE, "new folder").unwrap();
+        assert_eq!(folder.item_id, "remote-folder");
+        assert!(fuse.lookup_node(folder.inode, "inside.txt").is_some());
+        assert!(DirectoryStore::open(&draft_root).unwrap().list().unwrap()[0].seen_remote);
     }
 
     #[test]

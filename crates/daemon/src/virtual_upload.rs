@@ -32,10 +32,11 @@ pub async fn upload_snapshot<T: UploadTransport>(
     .await
 }
 
-pub async fn upload_new_snapshot<T: UploadTransport>(
+pub async fn upload_new_snapshot_to_parent<T: UploadTransport>(
     transport: &T,
     store: &DraftStore,
     snapshot: &DraftSnapshot,
+    remote_parent_id: &str,
 ) -> Result<UploadStep, UploadError> {
     let location = snapshot
         .identity
@@ -50,7 +51,7 @@ pub async fn upload_new_snapshot<T: UploadTransport>(
         kind: "UploadNewByParent".to_owned(),
         path: location.name.clone(),
         from_path: None,
-        remote_id: Some(location.parent_id.clone()),
+        remote_id: Some(remote_parent_id.to_owned()),
         expected_etag: None,
         local_fingerprint: Some(snapshot.sha256.clone()),
         attempts: 0,
@@ -210,7 +211,7 @@ mod tests {
         }
     }
 
-    struct NewTransport;
+    struct NewTransport(&'static str);
 
     impl UploadTransport for NewTransport {
         async fn create_session(
@@ -219,7 +220,7 @@ mod tests {
             size: u64,
         ) -> Result<String, UploadError> {
             assert_eq!(operation.kind, "UploadNewByParent");
-            assert_eq!(operation.remote_id.as_deref(), Some("parent"));
+            assert_eq!(operation.remote_id.as_deref(), Some(self.0));
             assert_eq!(operation.path, "new.txt");
             assert!(operation.expected_etag.is_none());
             assert_eq!(size, 3);
@@ -262,13 +263,41 @@ mod tests {
             .write_at(0, b"abc")
             .unwrap();
         let snapshot = store.snapshot(&identity).unwrap().unwrap();
-        let result = upload_new_snapshot(&NewTransport, &store, &snapshot)
-            .await
-            .unwrap();
+        let result =
+            upload_new_snapshot_to_parent(&NewTransport("parent"), &store, &snapshot, "parent")
+                .await
+                .unwrap();
         assert!(
             matches!(result, UploadStep::Complete { remote_id, etag: Some(etag) }
             if remote_id == "remote-created" && etag == "v1")
         );
+    }
+
+    #[tokio::test]
+    async fn nested_new_file_uses_remote_parent_without_changing_draft_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DraftStore::open(dir.path()).unwrap();
+        let identity = DraftIdentity {
+            drive_id: "drive".into(),
+            item_id: "local:child".into(),
+            base_etag: "local-new".into(),
+            new_file: Some(NewFileLocation {
+                parent_id: "local-dir:parent".into(),
+                name: "new.txt".into(),
+            }),
+        };
+        store
+            .begin_empty(identity.clone())
+            .unwrap()
+            .write_at(0, b"abc")
+            .unwrap();
+        let snapshot = store.snapshot(&identity).unwrap().unwrap();
+        upload_new_snapshot_to_parent(&NewTransport("parent"), &store, &snapshot, "parent")
+            .await
+            .unwrap();
+        assert_eq!(snapshot.identity, identity);
+        assert!(store.acknowledge(&snapshot).unwrap());
+        assert!(store.recover(&identity).unwrap().is_none());
     }
 
     #[tokio::test]
