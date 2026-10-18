@@ -1,14 +1,14 @@
 //! FUSE adapter around a validated catalog snapshot, versioned cache and local drafts.
 
-use crate::draft::{DraftFile, DraftIdentity, DraftStore};
+use crate::draft::{DraftFile, DraftIdentity, DraftStore, NewFileLocation};
 use crate::{
     DownloadRequest, FileHandle as CachedHandle, MAX_READ_BYTES, Node, NodeKind, OpenError,
     VirtualTree,
 };
 use fuser::{
     BackgroundSession, Config, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags,
-    Generation, INodeNo, MountOption, OpenAccMode, OpenFlags, ReplyAttr, ReplyData, ReplyDirectory,
-    ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request,
+    Generation, INodeNo, MountOption, OpenAccMode, OpenFlags, ReplyAttr, ReplyCreate, ReplyData,
+    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request,
 };
 use onedrive_cache::CacheStore;
 use std::collections::HashMap;
@@ -45,6 +45,7 @@ pub struct VirtualFuse {
     loader: Arc<ContentLoader>,
     open_lock: Mutex<()>,
     files: Mutex<HashMap<u64, OpenFile>>,
+    local_files: Mutex<HashMap<u64, Node>>,
     next_handle: AtomicU64,
     uid: u32,
     gid: u32,
@@ -65,6 +66,7 @@ impl VirtualFuse {
             loader,
             open_lock: Mutex::new(()),
             files: Mutex::new(HashMap::new()),
+            local_files: Mutex::new(HashMap::new()),
             next_handle: AtomicU64::new(1),
             uid: unsafe { libc::geteuid() },
             gid: unsafe { libc::getegid() },
@@ -84,6 +86,7 @@ impl VirtualFuse {
     }
 
     pub fn mount(self, mountpoint: &Path) -> io::Result<BackgroundSession> {
+        self.load_local_files()?;
         let mut options = Config::default();
         options.mount_options = vec![
             MountOption::DefaultPermissions,
@@ -123,7 +126,11 @@ impl VirtualFuse {
                 FileType::RegularFile
             },
             perm: if directory {
-                0o500
+                if self.draft_root.is_some() {
+                    0o700
+                } else {
+                    0o500
+                }
             } else if self.draft_root.is_some() {
                 0o600
             } else {
@@ -147,8 +154,136 @@ impl VirtualFuse {
             .map_err(|_| Errno::EIO)
     }
 
+    fn node(&self, inode: u64) -> Option<Node> {
+        self.local_files
+            .lock()
+            .unwrap()
+            .get(&inode)
+            .cloned()
+            .or_else(|| self.tree.getattr(inode).cloned())
+    }
+
+    fn lookup_node(&self, parent: u64, name: &str) -> Option<Node> {
+        self.local_files
+            .lock()
+            .unwrap()
+            .values()
+            .find(|node| node.parent_inode == parent && node.name == name)
+            .cloned()
+            .or_else(|| self.tree.lookup(parent, name).cloned())
+    }
+
+    fn load_local_files(&self) -> io::Result<()> {
+        let Some(root) = &self.draft_root else {
+            return Ok(());
+        };
+        let store = DraftStore::open(root)?;
+        let mut local = self.local_files.lock().unwrap();
+        for identity in store.list()? {
+            let Some(location) = &identity.new_file else {
+                continue;
+            };
+            if identity.drive_id != self.tree.drive_id() {
+                continue;
+            }
+            let parent = self
+                .tree
+                .getattr(crate::stable_inode(&identity.drive_id, &location.parent_id))
+                .or_else(|| {
+                    self.tree
+                        .getattr(crate::ROOT_INODE)
+                        .filter(|node| node.item_id == location.parent_id)
+                });
+            let Some(parent) = parent.filter(|node| node.kind == NodeKind::Directory) else {
+                continue;
+            };
+            if self.tree.lookup(parent.inode, &location.name).is_some()
+                || local
+                    .values()
+                    .any(|node| node.parent_inode == parent.inode && node.name == location.name)
+            {
+                continue;
+            }
+            let inode = crate::stable_inode(&identity.drive_id, &identity.item_id);
+            if self.tree.getattr(inode).is_some() || local.contains_key(&inode) {
+                continue;
+            }
+            local.insert(
+                inode,
+                Node {
+                    inode,
+                    parent_inode: parent.inode,
+                    item_id: identity.item_id,
+                    name: location.name.clone(),
+                    kind: NodeKind::File,
+                    size: 0,
+                    etag: None,
+                    ctag: None,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    fn create_file(&self, parent: u64, name: &str, flags: OpenFlags) -> Result<(Node, u64), Errno> {
+        let Some(root) = &self.draft_root else {
+            return Err(Errno::EROFS);
+        };
+        if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\0']) {
+            return Err(Errno::EINVAL);
+        }
+        let parent_node = self.tree.getattr(parent).ok_or(Errno::ENOENT)?;
+        if parent_node.kind != NodeKind::Directory {
+            return Err(Errno::ENOTDIR);
+        }
+        let mut local = self.local_files.lock().unwrap();
+        if self.tree.lookup(parent, name).is_some()
+            || local
+                .values()
+                .any(|node| node.parent_inode == parent && node.name == name)
+        {
+            return Err(Errno::EEXIST);
+        }
+        let store = DraftStore::open(root).map_err(map_draft_error)?;
+        let temporary = tempfile::NamedTempFile::new_in(root).map_err(map_draft_error)?;
+        let random = temporary.path().file_name().unwrap().to_string_lossy();
+        let item_id = format!("local:{random}");
+        drop(temporary);
+        let identity = DraftIdentity {
+            drive_id: self.tree.drive_id().to_owned(),
+            item_id: item_id.clone(),
+            base_etag: "local-new".to_owned(),
+            new_file: Some(NewFileLocation {
+                parent_id: parent_node.item_id.clone(),
+                name: name.to_owned(),
+            }),
+        };
+        let inode = crate::stable_inode(self.tree.drive_id(), &item_id);
+        if self.tree.getattr(inode).is_some() || local.contains_key(&inode) {
+            return Err(Errno::EEXIST);
+        }
+        let draft = store.begin_empty(identity).map_err(map_draft_error)?;
+        let node = Node {
+            inode,
+            parent_inode: parent,
+            item_id,
+            name: name.to_owned(),
+            kind: NodeKind::File,
+            size: 0,
+            etag: None,
+            ctag: None,
+        };
+        local.insert(inode, node.clone());
+        let handle = self.insert_open(
+            inode,
+            OpenHandle::Draft(draft),
+            flags.acc_mode() != OpenAccMode::O_RDONLY,
+        );
+        Ok((node, handle))
+    }
+
     fn directory_entries(&self, inode: u64) -> Option<Vec<(u64, FileType, String)>> {
-        let directory = self.tree.getattr(inode)?;
+        let directory = self.node(inode)?;
         let children = self.tree.readdir(inode)?;
         let mut entries = vec![
             (inode, FileType::Directory, ".".to_owned()),
@@ -165,6 +300,15 @@ impl VirtualFuse {
                 node.name.clone(),
             )
         }));
+        entries.extend(
+            self.local_files
+                .lock()
+                .unwrap()
+                .values()
+                .filter(|node| node.parent_inode == inode)
+                .map(|node| (node.inode, FileType::RegularFile, node.name.clone())),
+        );
+        entries[2..].sort_by(|left, right| left.2.cmp(&right.2));
         Some(entries)
     }
 
@@ -174,15 +318,18 @@ impl VirtualFuse {
             return Err(Errno::EROFS);
         }
         let _serialized = self.open_lock.lock().unwrap();
-        let node = self.tree.getattr(inode).ok_or(Errno::ENOENT)?;
+        let node = self.node(inode).ok_or(Errno::ENOENT)?;
         if node.kind != NodeKind::File {
             return Err(Errno::EISDIR);
         }
-        if let Some(draft) = self.draft_for_node(node)? {
+        if let Some(draft) = self.draft_for_node(&node)? {
             if writable && flags.0 & libc::O_TRUNC != 0 {
                 draft.set_len(0).map_err(map_draft_error)?;
             }
             return Ok(self.insert_open(inode, OpenHandle::Draft(draft), writable));
+        }
+        if node.item_id.starts_with("local:") {
+            return Err(Errno::EIO);
         }
         if writable && flags.0 & libc::O_TRUNC != 0 {
             let request = self
@@ -196,6 +343,7 @@ impl VirtualFuse {
                     drive_id: request.drive_id,
                     item_id: request.item_id,
                     base_etag: request.etag,
+                    new_file: None,
                 })
                 .map_err(map_draft_error)?;
             return Ok(self.insert_open(inode, OpenHandle::Draft(draft), true));
@@ -211,6 +359,7 @@ impl VirtualFuse {
                     drive_id: request.drive_id,
                     item_id: request.item_id,
                     base_etag: request.etag,
+                    new_file: None,
                 }),
                 true,
             ));
@@ -258,8 +407,8 @@ impl VirtualFuse {
             .filter(|open| open.inode == inode)
             .ok_or(Errno::EBADF)?;
         if self.draft_root.is_some() {
-            let node = self.tree.getattr(inode).ok_or(Errno::ENOENT)?;
-            if let Some(draft) = self.draft_for_node(node)? {
+            let node = self.node(inode).ok_or(Errno::ENOENT)?;
+            if let Some(draft) = self.draft_for_node(&node)? {
                 return read_draft(&draft, offset, size);
             }
         }
@@ -389,8 +538,8 @@ impl Filesystem for VirtualFuse {
             reply.error(Errno::ENOENT);
             return;
         };
-        match self.tree.lookup(parent.0, name) {
-            Some(node) => match self.attr(node) {
+        match self.lookup_node(parent.0, name) {
+            Some(node) => match self.attr(&node) {
                 Ok(attr) => reply.entry(&TTL, &attr, Generation(0)),
                 Err(error) => reply.error(error),
             },
@@ -405,8 +554,8 @@ impl Filesystem for VirtualFuse {
         _handle: Option<FileHandle>,
         reply: ReplyAttr,
     ) {
-        match self.tree.getattr(inode.0) {
-            Some(node) => match self.attr(node) {
+        match self.node(inode.0) {
+            Some(node) => match self.attr(&node) {
                 Ok(attr) => reply.attr(&TTL, &attr),
                 Err(error) => reply.error(error),
             },
@@ -441,11 +590,7 @@ impl Filesystem for VirtualFuse {
             return;
         };
         match self.truncate_file(inode.0, handle.map(|handle| handle.0), size) {
-            Ok(()) => match self
-                .tree
-                .getattr(inode.0)
-                .and_then(|node| self.attr(node).ok())
-            {
+            Ok(()) => match self.node(inode.0).and_then(|node| self.attr(&node).ok()) {
                 Some(attr) => reply.attr(&TTL, &attr),
                 None => reply.error(Errno::EIO),
             },
@@ -474,6 +619,35 @@ impl Filesystem for VirtualFuse {
             }
         }
         reply.ok();
+    }
+
+    fn create(
+        &self,
+        _request: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        _mode: u32,
+        _umask: u32,
+        flags: i32,
+        reply: ReplyCreate,
+    ) {
+        let Some(name) = name.to_str() else {
+            reply.error(Errno::EINVAL);
+            return;
+        };
+        match self.create_file(parent.0, name, OpenFlags(flags)) {
+            Ok((node, handle)) => match self.attr(&node) {
+                Ok(attr) => reply.created(
+                    &TTL,
+                    &attr,
+                    Generation(0),
+                    FileHandle(handle),
+                    FopenFlags::FOPEN_DIRECT_IO,
+                ),
+                Err(error) => reply.error(error),
+            },
+            Err(error) => reply.error(error),
+        }
     }
 
     fn open(&self, _request: &Request, inode: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
@@ -738,6 +912,78 @@ mod tests {
             .unwrap();
         assert_eq!(draft.len().unwrap(), 13);
         assert_eq!(fs::read(source).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn new_file_survives_remount_as_local_draft() {
+        if std::env::var_os("ONEDRIVE_FUSE_SMOKE").is_none() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mountpoint = dir.path().join("mount");
+        let cache_root = dir.path().join("cache");
+        let draft_root = dir.path().join("drafts");
+        fs::create_dir(&mountpoint).unwrap();
+        let loader: Arc<ContentLoader> = Arc::new(|_| Err(io::ErrorKind::NotConnected.into()));
+        let tree = VirtualTree::from_items("drive", "root", [file_item()]).unwrap();
+        let session = VirtualFuse::new_writable(
+            tree,
+            cache_root.clone(),
+            draft_root.clone(),
+            10,
+            Arc::clone(&loader),
+        )
+        .mount(&mountpoint)
+        .unwrap();
+        let created = mountpoint.join("новый файл.txt");
+        fs::write(&created, b"local content").unwrap();
+        assert_eq!(fs::read(&created).unwrap(), b"local content");
+        assert!(
+            fs::read_dir(&mountpoint)
+                .unwrap()
+                .any(|entry| entry.unwrap().file_name() == "новый файл.txt")
+        );
+        session.umount_and_join().unwrap();
+        let drafts = DraftStore::open(&draft_root).unwrap().list().unwrap();
+        assert_eq!(drafts.len(), 1);
+        assert_eq!(drafts[0].new_file.as_ref().unwrap().name, "новый файл.txt");
+        let tree = VirtualTree::from_items("drive", "root", [file_item()]).unwrap();
+        let session = VirtualFuse::new_writable(tree, cache_root, draft_root, 10, loader)
+            .mount(&mountpoint)
+            .unwrap();
+        assert_eq!(fs::read(&created).unwrap(), b"local content");
+        session.umount_and_join().unwrap();
+    }
+
+    #[test]
+    fn create_file_rejects_name_collision_without_overwriting_draft() {
+        let dir = tempfile::tempdir().unwrap();
+        let tree = VirtualTree::from_items("drive", "root", [file_item()]).unwrap();
+        let fuse = VirtualFuse::new_writable(
+            tree,
+            dir.path().join("cache"),
+            dir.path().join("drafts"),
+            10,
+            Arc::new(|_| Err(io::ErrorKind::NotConnected.into())),
+        );
+        assert_eq!(
+            fuse.create_file(ROOT_INODE, "текст.txt", OpenFlags(libc::O_WRONLY))
+                .unwrap_err(),
+            Errno::EEXIST
+        );
+        let (created, handle) = fuse
+            .create_file(ROOT_INODE, "new.txt", OpenFlags(libc::O_WRONLY))
+            .unwrap();
+        fuse.write_file(created.inode, handle, 0, b"data").unwrap();
+        assert_eq!(
+            fuse.create_file(ROOT_INODE, "new.txt", OpenFlags(libc::O_WRONLY))
+                .unwrap_err(),
+            Errno::EEXIST
+        );
+        assert_eq!(
+            fuse.read_file(created.inode, handle, 0, 4).unwrap(),
+            b"data"
+        );
     }
 
     #[test]

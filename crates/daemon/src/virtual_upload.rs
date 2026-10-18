@@ -174,6 +174,7 @@ mod tests {
             drive_id: "drive".into(),
             item_id: "item".into(),
             base_etag: "old".into(),
+            new_file: None,
         };
         let draft = store.begin_empty(identity.clone()).unwrap();
         draft.set_len(CHUNK_SIZE + 1).unwrap();
@@ -218,6 +219,7 @@ mod tests {
             drive_id: "drive".into(),
             item_id: "item".into(),
             base_etag: "old".into(),
+            new_file: None,
         };
         let draft = store.begin_empty(identity.clone()).unwrap();
         draft.set_len(CHUNK_SIZE + 1).unwrap();
@@ -259,6 +261,7 @@ mod tests {
             drive_id: "drive".into(),
             item_id: "item".into(),
             base_etag: "old".into(),
+            new_file: None,
         };
         let draft = store.begin_empty(identity.clone()).unwrap();
         draft.set_len(CHUNK_SIZE + 1).unwrap();
@@ -333,6 +336,7 @@ mod tests {
             drive_id: "drive".into(),
             item_id: "item".into(),
             base_etag: "old".into(),
+            new_file: None,
         };
         store.begin_empty(identity.clone()).unwrap();
         let snapshot = store.snapshot(&identity).unwrap().unwrap();
