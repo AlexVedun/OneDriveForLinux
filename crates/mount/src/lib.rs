@@ -1,5 +1,6 @@
 //! Read-only metadata view for a future FUSE adapter. No network calls or mounts happen here.
 
+pub mod directory;
 pub mod draft;
 pub mod fuse;
 pub mod preflight;

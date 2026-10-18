@@ -1,5 +1,6 @@
 //! FUSE adapter around a validated catalog snapshot, versioned cache and local drafts.
 
+use crate::directory::DirectoryStore;
 use crate::draft::{DraftFile, DraftIdentity, DraftStore, NewFileLocation};
 use crate::{
     DownloadRequest, FileHandle as CachedHandle, MAX_READ_BYTES, Node, NodeKind, OpenError,
@@ -164,6 +165,12 @@ impl VirtualFuse {
     }
 
     fn lookup_node(&self, parent: u64, name: &str) -> Option<Node> {
+        if name == "." {
+            return self.node(parent);
+        }
+        if name == ".." {
+            return self.node(self.node(parent)?.parent_inode);
+        }
         self.local_files
             .lock()
             .unwrap()
@@ -179,6 +186,81 @@ impl VirtualFuse {
         };
         let store = DraftStore::open(root)?;
         let mut local = self.local_files.lock().unwrap();
+        let mut directories: Vec<_> = DirectoryStore::open(root)?
+            .list()?
+            .into_iter()
+            .filter(|directory| directory.drive_id == self.tree.drive_id())
+            .collect();
+        while !directories.is_empty() {
+            let before = directories.len();
+            directories.retain(|directory| {
+                let parent = self
+                    .tree
+                    .getattr(crate::stable_inode(
+                        &directory.drive_id,
+                        &directory.parent_id,
+                    ))
+                    .or_else(|| {
+                        self.tree
+                            .getattr(crate::ROOT_INODE)
+                            .filter(|node| node.item_id == directory.parent_id)
+                    })
+                    .cloned()
+                    .or_else(|| {
+                        local
+                            .values()
+                            .find(|node| node.item_id == directory.parent_id)
+                            .cloned()
+                    });
+                let Some(parent) = parent.filter(|node| node.kind == NodeKind::Directory) else {
+                    return true;
+                };
+                let inode = crate::stable_inode(&directory.drive_id, &directory.item_id);
+                if self.tree.getattr(inode).is_none() && !local.contains_key(&inode) {
+                    let name = if self.tree.lookup(parent.inode, &directory.name).is_some()
+                        || local.values().any(|node| {
+                            node.parent_inode == parent.inode && node.name == directory.name
+                        }) {
+                        format!(".conflict-{inode}-{}", directory.name)
+                    } else {
+                        directory.name.clone()
+                    };
+                    local.insert(
+                        inode,
+                        Node {
+                            inode,
+                            parent_inode: parent.inode,
+                            item_id: directory.item_id.clone(),
+                            name,
+                            kind: NodeKind::Directory,
+                            size: 0,
+                            etag: None,
+                            ctag: None,
+                        },
+                    );
+                }
+                false
+            });
+            if directories.len() == before {
+                // Keep descendants available even if a remote parent vanished.
+                for directory in directories.drain(..) {
+                    let inode = crate::stable_inode(&directory.drive_id, &directory.item_id);
+                    local.insert(
+                        inode,
+                        Node {
+                            inode,
+                            parent_inode: crate::ROOT_INODE,
+                            item_id: directory.item_id,
+                            name: format!(".orphan-{inode}-{}", directory.name),
+                            kind: NodeKind::Directory,
+                            size: 0,
+                            etag: None,
+                            ctag: None,
+                        },
+                    );
+                }
+            }
+        }
         for identity in store.list()? {
             let Some(location) = &identity.new_file else {
                 continue;
@@ -193,8 +275,18 @@ impl VirtualFuse {
                     self.tree
                         .getattr(crate::ROOT_INODE)
                         .filter(|node| node.item_id == location.parent_id)
+                })
+                .cloned()
+                .or_else(|| {
+                    local
+                        .values()
+                        .find(|node| node.item_id == location.parent_id)
+                        .cloned()
                 });
-            let (parent, orphaned) = match parent.filter(|node| node.kind == NodeKind::Directory) {
+            let (parent, orphaned) = match parent
+                .as_ref()
+                .filter(|node| node.kind == NodeKind::Directory)
+            {
                 Some(parent) => (parent, false),
                 None => (
                     self.tree.getattr(crate::ROOT_INODE).expect("virtual root"),
@@ -246,7 +338,7 @@ impl VirtualFuse {
         if !NewFileLocation::valid_name(name) {
             return Err(Errno::EINVAL);
         }
-        let parent_node = self.tree.getattr(parent).ok_or(Errno::ENOENT)?;
+        let parent_node = self.node(parent).ok_or(Errno::ENOENT)?;
         if parent_node.kind != NodeKind::Directory {
             return Err(Errno::ENOTDIR);
         }
@@ -329,6 +421,84 @@ impl VirtualFuse {
         Ok(())
     }
 
+    fn create_directory(&self, parent: u64, name: &str) -> Result<Node, Errno> {
+        let Some(root) = &self.draft_root else {
+            return Err(Errno::EROFS);
+        };
+        if !NewFileLocation::valid_name(name) {
+            return Err(Errno::EINVAL);
+        }
+        let mut local = self.local_files.lock().unwrap();
+        let parent_node = local
+            .get(&parent)
+            .or_else(|| self.tree.getattr(parent))
+            .ok_or(Errno::ENOENT)?;
+        if parent_node.kind != NodeKind::Directory {
+            return Err(Errno::ENOTDIR);
+        }
+        if self.tree.lookup(parent, name).is_some()
+            || local
+                .values()
+                .any(|node| node.parent_inode == parent && node.name == name)
+        {
+            return Err(Errno::EEXIST);
+        }
+        DraftStore::open(root).map_err(map_draft_error)?;
+        let directory = DirectoryStore::open(root)
+            .and_then(|store| store.create(self.tree.drive_id(), &parent_node.item_id, name))
+            .map_err(map_draft_error)?;
+        let inode = crate::stable_inode(self.tree.drive_id(), &directory.item_id);
+        let node = Node {
+            inode,
+            parent_inode: parent,
+            item_id: directory.item_id,
+            name: name.to_owned(),
+            kind: NodeKind::Directory,
+            size: 0,
+            etag: None,
+            ctag: None,
+        };
+        local.insert(inode, node.clone());
+        Ok(node)
+    }
+
+    fn remove_local_directory(&self, parent: u64, name: &str) -> Result<(), Errno> {
+        let Some(root) = &self.draft_root else {
+            return Err(Errno::EROFS);
+        };
+        let mut local = self.local_files.lock().unwrap();
+        let node = local
+            .values()
+            .find(|node| node.parent_inode == parent && node.name == name)
+            .cloned()
+            .or_else(|| self.tree.lookup(parent, name).cloned())
+            .ok_or(Errno::ENOENT)?;
+        if node.kind != NodeKind::Directory {
+            return Err(Errno::ENOTDIR);
+        }
+        if !node.item_id.starts_with("local-dir:") {
+            return Err(Errno::EROFS);
+        }
+        if local.values().any(|child| child.parent_inode == node.inode)
+            || self
+                .tree
+                .readdir(node.inode)
+                .is_some_and(|children| !children.is_empty())
+        {
+            return Err(Errno::ENOTEMPTY);
+        }
+        let store = DirectoryStore::open(root).map_err(map_draft_error)?;
+        let directory = store
+            .list()
+            .map_err(map_draft_error)?
+            .into_iter()
+            .find(|directory| directory.item_id == node.item_id)
+            .ok_or(Errno::EIO)?;
+        store.remove(&directory).map_err(map_draft_error)?;
+        local.remove(&node.inode);
+        Ok(())
+    }
+
     fn rename_local_file(
         &self,
         parent: u64,
@@ -357,7 +527,7 @@ impl VirtualFuse {
             .cloned()
             .or_else(|| self.tree.lookup(parent, name).cloned())
             .ok_or(Errno::ENOENT)?;
-        if !node.item_id.starts_with("local:") {
+        if !node.item_id.starts_with("local:") && !node.item_id.starts_with("local-dir:") {
             return Err(Errno::EROFS);
         }
         if parent == new_parent && name == new_name {
@@ -370,18 +540,42 @@ impl VirtualFuse {
         {
             return Err(Errno::EEXIST);
         }
-        DraftStore::open(root)
-            .and_then(|store| {
-                store.relocate_new(
-                    self.tree.drive_id(),
-                    &node.item_id,
-                    NewFileLocation {
-                        parent_id: parent_node.item_id,
-                        name: new_name.to_owned(),
-                    },
-                )
-            })
-            .map_err(map_draft_error)?;
+        if node.kind == NodeKind::Directory {
+            let mut ancestor = new_parent;
+            while ancestor != crate::ROOT_INODE {
+                if ancestor == node.inode {
+                    return Err(Errno::EINVAL);
+                }
+                ancestor = local
+                    .get(&ancestor)
+                    .or_else(|| self.tree.getattr(ancestor))
+                    .ok_or(Errno::ENOENT)?
+                    .parent_inode;
+            }
+            let store = DirectoryStore::open(root).map_err(map_draft_error)?;
+            let directory = store
+                .list()
+                .map_err(map_draft_error)?
+                .into_iter()
+                .find(|directory| directory.item_id == node.item_id)
+                .ok_or(Errno::EIO)?;
+            store
+                .relocate(&directory, &parent_node.item_id, new_name)
+                .map_err(map_draft_error)?;
+        } else {
+            DraftStore::open(root)
+                .and_then(|store| {
+                    store.relocate_new(
+                        self.tree.drive_id(),
+                        &node.item_id,
+                        NewFileLocation {
+                            parent_id: parent_node.item_id,
+                            name: new_name.to_owned(),
+                        },
+                    )
+                })
+                .map_err(map_draft_error)?;
+        }
         let moved = local.get_mut(&node.inode).ok_or(Errno::EIO)?;
         moved.parent_inode = new_parent;
         moved.name = new_name.to_owned();
@@ -390,7 +584,10 @@ impl VirtualFuse {
 
     fn directory_entries(&self, inode: u64) -> Option<Vec<(u64, FileType, String)>> {
         let directory = self.node(inode)?;
-        let children = self.tree.readdir(inode)?;
+        if directory.kind != NodeKind::Directory {
+            return None;
+        }
+        let children = self.tree.readdir(inode).unwrap_or_default();
         let mut entries = vec![
             (inode, FileType::Directory, ".".to_owned()),
             (directory.parent_inode, FileType::Directory, "..".to_owned()),
@@ -412,7 +609,17 @@ impl VirtualFuse {
                 .unwrap()
                 .values()
                 .filter(|node| node.parent_inode == inode)
-                .map(|node| (node.inode, FileType::RegularFile, node.name.clone())),
+                .map(|node| {
+                    (
+                        node.inode,
+                        if node.kind == NodeKind::Directory {
+                            FileType::Directory
+                        } else {
+                            FileType::RegularFile
+                        },
+                        node.name.clone(),
+                    )
+                }),
         );
         entries[2..].sort_by(|left, right| left.2.cmp(&right.2));
         Some(entries)
@@ -775,6 +982,39 @@ impl Filesystem for VirtualFuse {
             .ok_or(Errno::EINVAL)
             .and_then(|name| self.remove_local_file(parent.0, name))
         {
+            Ok(()) => reply.ok(),
+            Err(error) => reply.error(error),
+        }
+    }
+
+    fn mkdir(
+        &self,
+        _request: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        _mode: u32,
+        _umask: u32,
+        reply: ReplyEntry,
+    ) {
+        let result = name
+            .to_str()
+            .ok_or(Errno::EINVAL)
+            .and_then(|name| self.create_directory(parent.0, name));
+        match result {
+            Ok(node) => match self.attr(&node) {
+                Ok(attr) => reply.entry(&TTL, &attr, Generation(0)),
+                Err(error) => reply.error(error),
+            },
+            Err(error) => reply.error(error),
+        }
+    }
+
+    fn rmdir(&self, _request: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let result = name
+            .to_str()
+            .ok_or(Errno::EINVAL)
+            .and_then(|name| self.remove_local_directory(parent.0, name));
+        match result {
             Ok(()) => reply.ok(),
             Err(error) => reply.error(error),
         }
@@ -1236,6 +1476,61 @@ mod tests {
                 .list()
                 .unwrap()
                 .is_empty()
+        );
+        session.umount_and_join().unwrap();
+    }
+
+    #[test]
+    fn mounted_nested_directories_and_files_survive_remount() {
+        if std::env::var_os("ONEDRIVE_FUSE_SMOKE").is_none() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mountpoint = dir.path().join("mount");
+        let draft_root = dir.path().join("drafts");
+        fs::create_dir(&mountpoint).unwrap();
+        let loader: Arc<ContentLoader> = Arc::new(|_| Err(io::ErrorKind::NotConnected.into()));
+        let mount = || {
+            VirtualFuse::new_writable(
+                VirtualTree::from_items("drive", "root", [file_item()]).unwrap(),
+                dir.path().join("cache"),
+                draft_root.clone(),
+                10,
+                Arc::clone(&loader),
+            )
+            .mount(&mountpoint)
+            .unwrap()
+        };
+        let session = mount();
+        fs::create_dir(mountpoint.join("parent")).unwrap();
+        fs::create_dir(mountpoint.join("parent/child")).unwrap();
+        fs::write(mountpoint.join("parent/child/document.txt"), b"nested").unwrap();
+        assert_eq!(
+            fs::remove_dir(mountpoint.join("parent/child"))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::DirectoryNotEmpty
+        );
+        session.umount_and_join().unwrap();
+        let session = mount();
+        assert_eq!(
+            fs::read(mountpoint.join("parent/child/document.txt")).unwrap(),
+            b"nested"
+        );
+        fs::rename(mountpoint.join("parent"), mountpoint.join("renamed")).unwrap();
+        assert_eq!(
+            fs::read(mountpoint.join("renamed/child/document.txt")).unwrap(),
+            b"nested"
+        );
+        fs::remove_file(mountpoint.join("renamed/child/document.txt")).unwrap();
+        fs::remove_dir(mountpoint.join("renamed/child")).unwrap();
+        fs::remove_dir(mountpoint.join("renamed")).unwrap();
+        session.umount_and_join().unwrap();
+        let session = mount();
+        assert!(
+            fs::read_dir(&mountpoint)
+                .unwrap()
+                .all(|entry| entry.unwrap().file_name() != "renamed")
         );
         session.umount_and_join().unwrap();
     }
