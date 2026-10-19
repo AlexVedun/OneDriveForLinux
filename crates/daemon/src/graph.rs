@@ -405,6 +405,40 @@ impl<'a> GraphUpload<'a> {
             .map_err(|_| UploadError::InvalidResponse)
     }
 
+    fn empty_new_file_request(
+        &self,
+        operation: &QueuedOperation,
+    ) -> Result<reqwest::Request, UploadError> {
+        let parent_id = operation
+            .remote_id
+            .as_deref()
+            .filter(|id| !id.is_empty())
+            .ok_or(UploadError::InvalidResponse)?;
+        if operation.kind != "UploadNewByParent"
+            || operation.expected_etag.is_some()
+            || !valid_new_file_name(&operation.path)
+        {
+            return Err(UploadError::InvalidResponse);
+        }
+        let mut url = reqwest::Url::parse("https://graph.microsoft.com/v1.0/")
+            .map_err(|_| UploadError::InvalidResponse)?;
+        url.path_segments_mut()
+            .map_err(|_| UploadError::InvalidResponse)?
+            .pop_if_empty()
+            .extend(["drives", self.drive_id, "items", parent_id, "children"]);
+        self.graph
+            .http
+            .post(url)
+            .bearer_auth(self.access_token)
+            .json(&serde_json::json!({
+                "name": operation.path,
+                "file": {},
+                "@microsoft.graph.conflictBehavior": "fail",
+            }))
+            .build()
+            .map_err(|_| UploadError::InvalidResponse)
+    }
+
     fn range_request(
         &self,
         upload_url: &str,
@@ -593,6 +627,43 @@ impl UploadTransport for GraphUpload<'_> {
     }
 
     async fn upload_empty(&self, operation: &QueuedOperation) -> Result<UploadStep, UploadError> {
+        if operation.kind == "UploadNewByParent" {
+            let parent_id = operation
+                .remote_id
+                .as_deref()
+                .ok_or(UploadError::InvalidResponse)?;
+            let response = self
+                .graph
+                .http
+                .execute(self.empty_new_file_request(operation)?)
+                .await
+                .map_err(|_| UploadError::Transient)?;
+            if response.status() != StatusCode::CREATED {
+                return Err(upload_error(response).await);
+            }
+            let item: CreatedVirtualFile = response
+                .json()
+                .await
+                .map_err(|_| UploadError::InvalidResponse)?;
+            let etag = item.etag.as_deref().ok_or(UploadError::InvalidResponse)?;
+            if item.id.is_empty()
+                || etag.is_empty()
+                || !created_virtual_file_matches(
+                    &item,
+                    &item.id,
+                    parent_id,
+                    &operation.path,
+                    etag,
+                    0,
+                )
+            {
+                return Err(UploadError::InvalidResponse);
+            }
+            return Ok(UploadStep::Complete {
+                remote_id: item.id,
+                etag: item.etag,
+            });
+        }
         let item_id = operation
             .remote_id
             .as_deref()
@@ -1497,6 +1568,60 @@ mod tests {
         }))
         .unwrap();
         assert!(!empty_upload_matches(&missing_etag, "item"));
+    }
+
+    #[test]
+    fn empty_new_file_create_fails_on_conflict_and_requires_file_identity() {
+        let graph = GraphClient::new().unwrap();
+        let upload = GraphUpload::new(&graph, "drive", "test-token").unwrap();
+        let mut operation = QueuedOperation {
+            id: 0,
+            kind: "UploadNewByParent".into(),
+            path: "new file.txt".into(),
+            from_path: None,
+            remote_id: Some("parent".into()),
+            expected_etag: None,
+            local_fingerprint: None,
+            attempts: 0,
+        };
+        let request = upload.empty_new_file_request(&operation).unwrap();
+        assert_eq!(request.method(), reqwest::Method::POST);
+        assert_eq!(
+            request.url().path(),
+            "/v1.0/drives/drive/items/parent/children"
+        );
+        assert!(request.headers().contains_key(AUTHORIZATION));
+        let body: serde_json::Value =
+            serde_json::from_slice(request.body().unwrap().as_bytes().unwrap()).unwrap();
+        assert_eq!(body["name"], "new file.txt");
+        assert_eq!(body["file"], serde_json::json!({}));
+        assert_eq!(body["@microsoft.graph.conflictBehavior"], "fail");
+        let item: CreatedVirtualFile = serde_json::from_value(serde_json::json!({
+            "id": "created", "name": "new file.txt", "eTag": "v1", "size": 0,
+            "file": {}, "parentReference": {"id": "parent"}
+        }))
+        .unwrap();
+        assert!(created_virtual_file_matches(
+            &item,
+            "created",
+            "parent",
+            "new file.txt",
+            "v1",
+            0
+        ));
+        assert!(!created_virtual_file_matches(
+            &item,
+            "created",
+            "other",
+            "new file.txt",
+            "v1",
+            0
+        ));
+        operation.path = "../unsafe".into();
+        assert!(upload.empty_new_file_request(&operation).is_err());
+        operation.path = "new.txt".into();
+        operation.expected_etag = Some("v1".into());
+        assert!(upload.empty_new_file_request(&operation).is_err());
     }
 
     #[test]
