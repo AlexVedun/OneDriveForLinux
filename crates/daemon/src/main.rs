@@ -527,6 +527,84 @@ impl Daemon {
 
 #[zbus::interface(name = "io.github.onedrive_linux.Daemon")]
 impl Daemon {
+    fn virtual_directories(&self) -> zbus::fdo::Result<String> {
+        let root = state_directory()
+            .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?
+            .join("virtual-drafts");
+        let directories = DirectoryStore::open(&root)
+            .and_then(|store| store.list())
+            .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
+        let catalog = self.catalog.lock().unwrap();
+        let active_drive = catalog
+            .active_drive_id()
+            .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
+        let statuses: Vec<_> = directories
+            .iter()
+            .map(|directory| {
+                let status = if active_drive.as_deref() != Some(&directory.drive_id) {
+                    "other-drive"
+                } else if directory.remote_id.is_some() {
+                    "uploaded"
+                } else if !catalog.is_complete(&directory.drive_id).unwrap_or(false) {
+                    "catalog-incomplete"
+                } else {
+                    let parent_id = if directory.parent_id.starts_with("local-dir:") {
+                        directories
+                            .iter()
+                            .find(|parent| {
+                                parent.drive_id == directory.drive_id
+                                    && parent.item_id == directory.parent_id
+                            })
+                            .and_then(|parent| parent.remote_id.as_deref())
+                    } else {
+                        Some(directory.parent_id.as_str())
+                    };
+                    if let Some(parent_id) = parent_id {
+                        let parent_exists = catalog
+                            .root_id(&directory.drive_id)
+                            .ok()
+                            .flatten()
+                            .as_deref()
+                            == Some(parent_id)
+                            || catalog
+                                .item(&directory.drive_id, parent_id)
+                                .ok()
+                                .flatten()
+                                .is_some_and(|item| !item.deleted && item.kind == "folder");
+                        let name_taken =
+                            catalog
+                                .items(&directory.drive_id)
+                                .ok()
+                                .is_some_and(|items| {
+                                    items.iter().any(|item| {
+                                        !item.deleted
+                                            && item.parent_id.as_deref() == Some(parent_id)
+                                            && item.name.as_deref() == Some(&directory.name)
+                                    })
+                                });
+                        if !parent_exists {
+                            "parent-missing"
+                        } else if name_taken {
+                            "name-conflict"
+                        } else {
+                            "pending"
+                        }
+                    } else {
+                        "waiting-parent"
+                    }
+                };
+                serde_json::json!({
+                    "drive_id": directory.drive_id,
+                    "item_id": directory.item_id,
+                    "name": directory.name,
+                    "status": status,
+                })
+            })
+            .collect();
+        serde_json::to_string(&statuses)
+            .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))
+    }
+
     fn virtual_mutations(&self) -> zbus::fdo::Result<String> {
         let root = state_directory()
             .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?
