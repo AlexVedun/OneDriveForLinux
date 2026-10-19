@@ -8,9 +8,9 @@ use crate::{
     VirtualTree,
 };
 use fuser::{
-    BackgroundSession, Config, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags,
-    Generation, INodeNo, MountOption, OpenAccMode, OpenFlags, ReplyAttr, ReplyCreate, ReplyData,
-    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request,
+    BackgroundSession, Config, CopyFileRangeFlags, Errno, FileAttr, FileHandle, FileType,
+    Filesystem, FopenFlags, Generation, INodeNo, MountOption, OpenAccMode, OpenFlags, ReplyAttr,
+    ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request,
 };
 use onedrive_cache::CacheStore;
 use std::collections::HashMap;
@@ -1211,6 +1211,71 @@ impl VirtualFuse {
         }
         result
     }
+
+    // Keep the FUSE source and destination arguments explicit to avoid swapping offsets.
+    #[allow(clippy::too_many_arguments)]
+    fn copy_range(
+        &self,
+        source_inode: u64,
+        source_handle: u64,
+        source_offset: u64,
+        target_inode: u64,
+        target_handle: u64,
+        target_offset: u64,
+        length: u64,
+    ) -> Result<u32, Errno> {
+        if source_inode == target_inode
+            || source_offset > i64::MAX as u64
+            || target_offset > i64::MAX as u64
+        {
+            return Err(Errno::EINVAL);
+        }
+        {
+            let files = self.files.lock().unwrap();
+            if files
+                .get(&source_handle)
+                .is_none_or(|open| open.inode != source_inode)
+                || files
+                    .get(&target_handle)
+                    .is_none_or(|open| open.inode != target_inode || !open.writable)
+            {
+                return Err(Errno::EBADF);
+            }
+        }
+        let length = length
+            .min(u32::MAX as u64)
+            .min((i64::MAX as u64).saturating_sub(source_offset))
+            .min((i64::MAX as u64).saturating_sub(target_offset));
+        let mut copied = 0_u64;
+        while copied < length {
+            let amount = (length - copied).min(1024 * 1024) as u32;
+            let bytes =
+                match self.read_file(source_inode, source_handle, source_offset + copied, amount) {
+                    Ok(bytes) => bytes,
+                    Err(error) if copied == 0 => return Err(error),
+                    Err(_) => break,
+                };
+            if bytes.is_empty() {
+                break;
+            }
+            let written = match self.write_file(
+                target_inode,
+                target_handle,
+                target_offset + copied,
+                &bytes,
+            ) {
+                Ok(written) if written > 0 => written,
+                Ok(_) if copied == 0 => return Err(Errno::EIO),
+                Err(error) if copied == 0 => return Err(error),
+                _ => break,
+            };
+            copied += u64::from(written);
+            if written as usize != bytes.len() {
+                break;
+            }
+        }
+        Ok(copied as u32)
+    }
 }
 
 fn read_draft(draft: &DraftFile, offset: u64, size: u32) -> Result<Vec<u8>, Errno> {
@@ -1499,6 +1564,37 @@ impl Filesystem for VirtualFuse {
         }
     }
 
+    fn copy_file_range(
+        &self,
+        _request: &Request,
+        source_inode: INodeNo,
+        source_handle: FileHandle,
+        source_offset: u64,
+        target_inode: INodeNo,
+        target_handle: FileHandle,
+        target_offset: u64,
+        length: u64,
+        flags: CopyFileRangeFlags,
+        reply: ReplyWrite,
+    ) {
+        if !flags.is_empty() {
+            reply.error(Errno::EINVAL);
+            return;
+        }
+        match self.copy_range(
+            source_inode.0,
+            source_handle.0,
+            source_offset,
+            target_inode.0,
+            target_handle.0,
+            target_offset,
+            length,
+        ) {
+            Ok(count) => reply.written(count),
+            Err(error) => reply.error(error),
+        }
+    }
+
     fn flush(
         &self,
         _request: &Request,
@@ -1564,6 +1660,7 @@ mod tests {
     use crate::ROOT_INODE;
     use onedrive_catalog::CatalogItem;
     use std::fs;
+    use std::os::fd::AsRawFd;
     use std::sync::atomic::AtomicUsize;
     use std::sync::{Condvar, mpsc};
 
@@ -1580,6 +1677,188 @@ mod tests {
             modified: None,
             deleted: false,
         }
+    }
+
+    #[test]
+    fn copy_range_writes_local_draft_and_checks_handles() {
+        let dir = tempfile::tempdir().unwrap();
+        let tree = VirtualTree::from_items("drive", "root", [file_item()]).unwrap();
+        let fuse = VirtualFuse::new_writable(
+            tree,
+            dir.path().join("cache"),
+            dir.path().join("drafts"),
+            10,
+            Arc::new(|_| Err(io::ErrorKind::NotConnected.into())),
+        );
+        let (source, source_handle) = fuse
+            .create_file(ROOT_INODE, "source.txt", OpenFlags(libc::O_RDWR))
+            .unwrap();
+        fuse.write_file(source.inode, source_handle, 0, b"abcdef")
+            .unwrap();
+        let (target, target_handle) = fuse
+            .create_file(ROOT_INODE, "target.txt", OpenFlags(libc::O_RDWR))
+            .unwrap();
+        assert_eq!(
+            fuse.copy_range(
+                source.inode,
+                source_handle,
+                2,
+                target.inode,
+                target_handle,
+                3,
+                10
+            )
+            .unwrap(),
+            4
+        );
+        assert_eq!(
+            fuse.read_file(target.inode, target_handle, 0, 10).unwrap(),
+            b"\0\0\0cdef"
+        );
+        assert_eq!(
+            fuse.copy_range(
+                source.inode,
+                source_handle,
+                0,
+                target.inode,
+                target_handle,
+                0,
+                0
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            fuse.copy_range(
+                source.inode,
+                source_handle,
+                0,
+                source.inode,
+                source_handle,
+                0,
+                1
+            ),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(
+            fuse.copy_range(source.inode, source_handle, 0, target.inode, 999, 0, 1),
+            Err(Errno::EBADF)
+        );
+        let readonly = fuse
+            .open_file(target.inode, OpenFlags(libc::O_RDONLY))
+            .unwrap();
+        assert_eq!(
+            fuse.copy_range(source.inode, source_handle, 0, target.inode, readonly, 0, 1),
+            Err(Errno::EBADF)
+        );
+        assert_eq!(
+            fuse.copy_range(
+                source.inode,
+                source_handle,
+                0,
+                target.inode,
+                target_handle,
+                i64::MAX as u64 + 1,
+                1
+            ),
+            Err(Errno::EINVAL)
+        );
+    }
+
+    #[test]
+    fn copy_range_from_cached_remote_file_creates_local_draft() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_root = dir.path().join("cache");
+        let source = dir.path().join("source");
+        fs::write(&source, b"hello").unwrap();
+        let tree = VirtualTree::from_items("drive", "root", [file_item()]).unwrap();
+        let request = tree.request_for_item("file").unwrap();
+        CacheStore::open(&cache_root, 10)
+            .unwrap()
+            .put(&request.cache_key(), &source, 5)
+            .unwrap();
+        let fuse = VirtualFuse::new_writable(
+            tree,
+            cache_root,
+            dir.path().join("drafts"),
+            10,
+            Arc::new(|_| Err(io::ErrorKind::NotConnected.into())),
+        );
+        let source_inode = fuse.lookup_node(ROOT_INODE, "текст.txt").unwrap().inode;
+        let source_handle = fuse
+            .open_file(source_inode, OpenFlags(libc::O_RDONLY))
+            .unwrap();
+        let (target, target_handle) = fuse
+            .create_file(ROOT_INODE, "copy.txt", OpenFlags(libc::O_RDWR))
+            .unwrap();
+        assert_eq!(
+            fuse.copy_range(
+                source_inode,
+                source_handle,
+                0,
+                target.inode,
+                target_handle,
+                0,
+                5
+            )
+            .unwrap(),
+            5
+        );
+        assert_eq!(
+            fuse.read_file(target.inode, target_handle, 0, 5).unwrap(),
+            b"hello"
+        );
+        assert_eq!(fs::read(source).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn mounted_copy_file_range_survives_remount() {
+        if std::env::var_os("ONEDRIVE_FUSE_SMOKE").is_none() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mountpoint = dir.path().join("mount");
+        let draft_root = dir.path().join("drafts");
+        fs::create_dir(&mountpoint).unwrap();
+        let mount = || {
+            VirtualFuse::new_writable(
+                VirtualTree::from_items("drive", "root", [file_item()]).unwrap(),
+                dir.path().join("cache"),
+                draft_root.clone(),
+                10,
+                Arc::new(|_| Err(io::ErrorKind::NotConnected.into())),
+            )
+            .mount(&mountpoint)
+            .unwrap()
+        };
+        let session = mount();
+        fs::write(mountpoint.join("source.txt"), b"abcdef").unwrap();
+        let source = fs::File::open(mountpoint.join("source.txt")).unwrap();
+        let target = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(mountpoint.join("target.txt"))
+            .unwrap();
+        let mut source_offset = 1_i64;
+        let mut target_offset = 0_i64;
+        let copied = unsafe {
+            libc::copy_file_range(
+                source.as_raw_fd(),
+                &mut source_offset,
+                target.as_raw_fd(),
+                &mut target_offset,
+                10,
+                0,
+            )
+        };
+        assert_eq!(copied, 5, "{}", io::Error::last_os_error());
+        assert_eq!((source_offset, target_offset), (6, 5));
+        drop((source, target));
+        assert_eq!(fs::read(mountpoint.join("target.txt")).unwrap(), b"bcdef");
+        session.umount_and_join().unwrap();
+        let session = mount();
+        assert_eq!(fs::read(mountpoint.join("target.txt")).unwrap(), b"bcdef");
+        session.umount_and_join().unwrap();
     }
 
     #[test]
