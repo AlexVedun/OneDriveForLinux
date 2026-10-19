@@ -830,6 +830,59 @@ impl VirtualFuse {
             moved.name = new_name.to_owned();
             return Ok(());
         }
+        if let Some(target) = local
+            .values()
+            .find(|entry| entry.parent_inode == new_parent && entry.name == new_name)
+            .cloned()
+            && flags.bits() & libc::RENAME_NOREPLACE == 0
+            && node.item_id.starts_with("local-dir:")
+            && target.item_id.starts_with("local-dir:")
+            && node.kind == NodeKind::Directory
+            && target.kind == NodeKind::Directory
+        {
+            if local
+                .values()
+                .any(|child| child.parent_inode == target.inode)
+            {
+                return Err(Errno::ENOTEMPTY);
+            }
+            let mut ancestor = new_parent;
+            while ancestor != crate::ROOT_INODE {
+                if ancestor == node.inode {
+                    return Err(Errno::EINVAL);
+                }
+                ancestor = local
+                    .get(&ancestor)
+                    .or_else(|| self.tree.getattr(ancestor))
+                    .ok_or(Errno::ENOENT)?
+                    .parent_inode;
+            }
+            let store = DirectoryStore::open(root).map_err(map_draft_error)?;
+            let directories = store.list().map_err(map_draft_error)?;
+            let source = directories
+                .iter()
+                .find(|directory| directory.item_id == node.item_id)
+                .ok_or(Errno::EIO)?;
+            let destination = directories
+                .iter()
+                .find(|directory| directory.item_id == target.item_id)
+                .ok_or(Errno::EIO)?;
+            if source.remote_id.is_some() || destination.remote_id.is_some() {
+                return Err(Errno::EBUSY);
+            }
+            store
+                .relocate(source, &parent_node.item_id, new_name)
+                .map_err(map_draft_error)?;
+            if let Err(error) = store.remove(destination) {
+                let _ = store.relocate(source, &source.parent_id, &source.name);
+                return Err(map_draft_error(error));
+            }
+            local.remove(&target.inode);
+            let moved = local.get_mut(&node.inode).ok_or(Errno::EIO)?;
+            moved.parent_inode = new_parent;
+            moved.name = new_name.to_owned();
+            return Ok(());
+        }
         if self.tree.lookup(new_parent, new_name).is_some()
             || self.remote_target_taken(&parent_node.item_id, new_name)
             || local
@@ -1746,6 +1799,75 @@ mod tests {
     }
 
     #[test]
+    fn local_directory_replaces_only_empty_local_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let draft_root = dir.path().join("drafts");
+        let make_fuse = || {
+            VirtualFuse::new_writable(
+                VirtualTree::from_items("drive", "root", []).unwrap(),
+                dir.path().join("cache"),
+                draft_root.clone(),
+                10,
+                Arc::new(|_| Err(io::ErrorKind::NotConnected.into())),
+            )
+        };
+        let fuse = make_fuse();
+        let source = fuse.create_directory(ROOT_INODE, "source").unwrap();
+        let target = fuse.create_directory(ROOT_INODE, "target").unwrap();
+        fuse.create_directory(target.inode, "child").unwrap();
+        assert_eq!(
+            fuse.rename_local_file(
+                ROOT_INODE,
+                "source",
+                ROOT_INODE,
+                "target",
+                fuser::RenameFlags::empty(),
+            ),
+            Err(Errno::ENOTEMPTY)
+        );
+        fuse.remove_local_directory(target.inode, "child").unwrap();
+        assert_eq!(fuse.lookup_node(target.inode, "child"), None);
+        assert_eq!(
+            fuse.rename_local_file(
+                ROOT_INODE,
+                "source",
+                ROOT_INODE,
+                "target",
+                fuser::RenameFlags::from_bits_truncate(libc::RENAME_NOREPLACE),
+            ),
+            Err(Errno::EEXIST)
+        );
+        fuse.rename_local_file(
+            ROOT_INODE,
+            "source",
+            ROOT_INODE,
+            "target",
+            fuser::RenameFlags::empty(),
+        )
+        .unwrap();
+        assert!(fuse.lookup_node(ROOT_INODE, "source").is_none());
+        assert_eq!(
+            fuse.lookup_node(ROOT_INODE, "target").unwrap().inode,
+            source.inode
+        );
+        drop(fuse);
+        let fuse = make_fuse();
+        fuse.load_local_files().unwrap();
+        assert_eq!(
+            fuse.lookup_node(ROOT_INODE, "target").unwrap().item_id,
+            source.item_id
+        );
+        assert_eq!(
+            DirectoryStore::open(&draft_root)
+                .unwrap()
+                .list()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
     fn remote_rename_and_delete_remain_visible_in_overlay_after_remount() {
         let dir = tempfile::tempdir().unwrap();
         let draft_root = dir.path().join("drafts");
@@ -2198,6 +2320,45 @@ mod tests {
         let session = mount();
         assert!(!mountpoint.join("source.txt").exists());
         assert_eq!(fs::read(mountpoint.join("target.txt")).unwrap(), b"new");
+        session.umount_and_join().unwrap();
+    }
+
+    #[test]
+    fn mounted_empty_directory_replacement_survives_remount() {
+        if std::env::var_os("ONEDRIVE_FUSE_SMOKE").is_none() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mountpoint = dir.path().join("mount");
+        let draft_root = dir.path().join("drafts");
+        fs::create_dir(&mountpoint).unwrap();
+        let mount = || {
+            VirtualFuse::new_writable(
+                VirtualTree::from_items("drive", "root", []).unwrap(),
+                dir.path().join("cache"),
+                draft_root.clone(),
+                10,
+                Arc::new(|_| Err(io::ErrorKind::NotConnected.into())),
+            )
+            .mount(&mountpoint)
+            .unwrap()
+        };
+        let session = mount();
+        fs::create_dir(mountpoint.join("source")).unwrap();
+        fs::create_dir(mountpoint.join("target")).unwrap();
+        fs::write(mountpoint.join("source/file.txt"), b"kept").unwrap();
+        fs::rename(mountpoint.join("source"), mountpoint.join("target")).unwrap();
+        assert_eq!(
+            fs::read(mountpoint.join("target/file.txt")).unwrap(),
+            b"kept"
+        );
+        session.umount_and_join().unwrap();
+        let session = mount();
+        assert!(!mountpoint.join("source").exists());
+        assert_eq!(
+            fs::read(mountpoint.join("target/file.txt")).unwrap(),
+            b"kept"
+        );
         session.umount_and_join().unwrap();
     }
 
