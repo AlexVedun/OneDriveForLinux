@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
@@ -737,6 +738,32 @@ impl DraftFile {
         self.file.sync_all()
     }
 
+    /// Reserve local space before acknowledging FUSE; cloud upload remains separate.
+    pub fn allocate(&self, offset: u64, length: u64, keep_size: bool) -> io::Result<()> {
+        if length == 0
+            || offset
+                .checked_add(length)
+                .is_none_or(|end| end > i64::MAX as u64)
+        {
+            return Err(io::Error::from(io::ErrorKind::InvalidInput));
+        }
+        let _lock = lock_exclusive(&self.file)?;
+        if self.file.metadata()?.nlink() == 0 {
+            return Err(io::Error::from(io::ErrorKind::NotFound));
+        }
+        let mode = if keep_size {
+            libc::FALLOC_FL_KEEP_SIZE
+        } else {
+            0
+        };
+        let result =
+            unsafe { libc::fallocate(self.file.as_raw_fd(), mode, offset as i64, length as i64) };
+        if result != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        self.file.sync_all()
+    }
+
     pub fn sync(&self) -> io::Result<()> {
         self.file.sync_all()
     }
@@ -779,6 +806,26 @@ impl DraftFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn allocate_preserves_bytes_and_respects_keep_size() {
+        let root = tempfile::tempdir().unwrap();
+        let store = DraftStore::open(root.path()).unwrap();
+        let draft = store.begin_empty(identity()).unwrap();
+        draft.write_at(0, b"abc").unwrap();
+        draft.allocate(16, 16, true).unwrap();
+        assert_eq!(draft.len().unwrap(), 3);
+        draft.allocate(8, 8, false).unwrap();
+        assert_eq!(draft.len().unwrap(), 16);
+        let mut bytes = [0_u8; 16];
+        draft.read_at(0, &mut bytes).unwrap();
+        assert_eq!(&bytes[..3], b"abc");
+        assert_eq!(&bytes[3..], &[0; 13]);
+        assert_eq!(
+            draft.allocate(0, 0, false).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
 
     fn identity() -> DraftIdentity {
         DraftIdentity {
