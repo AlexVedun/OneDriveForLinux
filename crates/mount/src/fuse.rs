@@ -1133,13 +1133,20 @@ impl VirtualFuse {
         {
             return read_draft(&draft, offset, size);
         }
+        if matches!(open.handle, OpenHandle::Pending(_)) {
+            // The first read can wait for Graph. Keep other open handles usable
+            // while the cache is populated, but serialize cache access with open().
+            drop(files);
+            let _serialized = self.open_lock.lock().unwrap();
+            return self
+                .open_cached(inode)?
+                .read(offset, size)
+                .map_err(|_| Errno::EIO);
+        }
         match &open.handle {
             OpenHandle::Cached(handle) => handle.read(offset, size).map_err(|_| Errno::EIO),
             OpenHandle::Draft(handle) => read_draft(handle, offset, size),
-            OpenHandle::Pending(_) => self
-                .open_cached(inode)?
-                .read(offset, size)
-                .map_err(|_| Errno::EIO),
+            OpenHandle::Pending(_) => unreachable!(),
         }
     }
 
@@ -1773,6 +1780,7 @@ mod tests {
     use crate::ROOT_INODE;
     use onedrive_catalog::CatalogItem;
     use std::fs;
+    use std::io::Read;
     use std::os::fd::AsRawFd;
     use std::sync::atomic::AtomicUsize;
     use std::sync::{Condvar, mpsc};
@@ -3263,6 +3271,124 @@ mod tests {
         );
         listing.join().unwrap();
         assert_eq!(listing_result.unwrap(), 1);
+        session.umount_and_join().unwrap();
+    }
+
+    #[test]
+    fn pending_remote_read_does_not_block_other_open_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let (started_tx, started_rx) = mpsc::channel();
+        let gate_for_loader = Arc::clone(&gate);
+        let loader: Arc<ContentLoader> = Arc::new(move |_| {
+            started_tx.send(()).unwrap();
+            let (lock, wake) = &*gate_for_loader;
+            let mut released = lock.lock().unwrap();
+            while !*released {
+                released = wake.wait(released).unwrap();
+            }
+            Err(io::ErrorKind::NotConnected.into())
+        });
+        let tree = VirtualTree::from_items("drive", "root", [file_item()]).unwrap();
+        let fuse = Arc::new(VirtualFuse::new_writable(
+            tree,
+            dir.path().join("cache"),
+            dir.path().join("drafts"),
+            10,
+            loader,
+        ));
+        let (local, local_handle) = fuse
+            .create_file(ROOT_INODE, "local.txt", OpenFlags(libc::O_RDWR))
+            .unwrap();
+        fuse.write_file(local.inode, local_handle, 0, b"local")
+            .unwrap();
+        let remote = fuse.lookup_node(ROOT_INODE, "текст.txt").unwrap();
+        let remote_handle = fuse
+            .open_file(remote.inode, OpenFlags(libc::O_RDWR))
+            .unwrap();
+        let remote_reader = {
+            let fuse = Arc::clone(&fuse);
+            std::thread::spawn(move || fuse.read_file(remote.inode, remote_handle, 0, 5))
+        };
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (local_tx, local_rx) = mpsc::channel();
+        let local_reader = {
+            let fuse = Arc::clone(&fuse);
+            std::thread::spawn(move || {
+                local_tx
+                    .send(fuse.read_file(local.inode, local_handle, 0, 5))
+                    .unwrap();
+            })
+        };
+        let local_result = local_rx.recv_timeout(Duration::from_secs(2));
+        let (lock, wake) = &*gate;
+        *lock.lock().unwrap() = true;
+        wake.notify_all();
+        assert_eq!(local_result.unwrap().unwrap(), b"local");
+        local_reader.join().unwrap();
+        assert_eq!(remote_reader.join().unwrap(), Err(Errno::ENETDOWN));
+    }
+
+    #[test]
+    fn mounted_pending_read_keeps_local_file_responsive() {
+        if std::env::var_os("ONEDRIVE_FUSE_SMOKE").is_none() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mountpoint = dir.path().join("mount");
+        fs::create_dir(&mountpoint).unwrap();
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let (started_tx, started_rx) = mpsc::channel();
+        let gate_for_loader = Arc::clone(&gate);
+        let loader: Arc<ContentLoader> = Arc::new(move |_| {
+            started_tx.send(()).unwrap();
+            let (lock, wake) = &*gate_for_loader;
+            let mut released = lock.lock().unwrap();
+            while !*released {
+                released = wake.wait(released).unwrap();
+            }
+            Err(io::ErrorKind::NotConnected.into())
+        });
+        let tree = VirtualTree::from_items("drive", "root", [file_item()]).unwrap();
+        let session = VirtualFuse::new_writable(
+            tree,
+            dir.path().join("cache"),
+            dir.path().join("drafts"),
+            10,
+            loader,
+        )
+        .mount(&mountpoint)
+        .unwrap();
+        fs::write(mountpoint.join("local.txt"), b"local").unwrap();
+        let mut local = fs::File::open(mountpoint.join("local.txt")).unwrap();
+        let remote_path = mountpoint.join("текст.txt");
+        let remote_reader = std::thread::spawn(move || {
+            let mut remote = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(remote_path)
+                .unwrap();
+            let mut bytes = [0_u8; 5];
+            remote.read(&mut bytes)
+        });
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (local_tx, local_rx) = mpsc::channel();
+        let local_reader = std::thread::spawn(move || {
+            let mut bytes = [0_u8; 5];
+            local_tx
+                .send(local.read(&mut bytes).map(|count| (count, bytes)))
+                .unwrap();
+        });
+        let local_result = local_rx.recv_timeout(Duration::from_secs(2));
+        let (lock, wake) = &*gate;
+        *lock.lock().unwrap() = true;
+        wake.notify_all();
+        assert_eq!(local_result.unwrap().unwrap(), (5, *b"local"));
+        local_reader.join().unwrap();
+        assert_eq!(
+            remote_reader.join().unwrap().unwrap_err().raw_os_error(),
+            Some(libc::ENETDOWN)
+        );
         session.umount_and_join().unwrap();
     }
 }
