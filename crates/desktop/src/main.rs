@@ -62,6 +62,8 @@ struct UiVirtualDraft {
 
 #[derive(Debug, Deserialize)]
 struct UiVirtualMutation {
+    drive_id: String,
+    item_id: String,
     name: String,
     status: String,
     kind: serde_json::Value,
@@ -369,6 +371,15 @@ fn confirm_virtual_mass_delete(count: u64) -> Result<(), String> {
         .map_err(|error| error.to_string())?;
     proxy
         .call("ConfirmVirtualMassDelete", &(count))
+        .map_err(|error| error.to_string())
+}
+
+fn cancel_conflicted_virtual_mutation(drive_id: &str, item_id: &str) -> Result<(), String> {
+    let connection = zbus::blocking::Connection::session().map_err(|error| error.to_string())?;
+    let proxy = zbus::blocking::Proxy::new(&connection, BUS_NAME, OBJECT_PATH, INTERFACE_NAME)
+        .map_err(|error| error.to_string())?;
+    proxy
+        .call("CancelConflictedVirtualMutation", &(drive_id, item_id))
         .map_err(|error| error.to_string())
 }
 
@@ -1292,6 +1303,109 @@ fn present_review_dialog(
     dialog.present();
 }
 
+fn present_virtual_mutation_conflicts_dialog(
+    parent: &adw::ApplicationWindow,
+    controls: &VirtualMountControls,
+    mutations: Vec<UiVirtualMutation>,
+) {
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    content.set_margin_start(18);
+    content.set_margin_end(18);
+    content.set_margin_top(18);
+    content.set_margin_bottom(18);
+    let hint = gtk::Label::new(Some(
+        "Отключите виртуальный диск перед отменой. После отмены обновите каталог и подключите диск снова: будет показано текущее состояние OneDrive.",
+    ));
+    hint.set_wrap(true);
+    hint.set_xalign(0.0);
+    content.append(&hint);
+    let result = gtk::Label::new(None);
+    result.set_xalign(0.0);
+    result.set_wrap(true);
+    content.append(&result);
+    let rows = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    let mut count = 0;
+    for mutation in mutations
+        .into_iter()
+        .filter(|item| item.status == "conflict")
+    {
+        count += 1;
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        let action = if mutation.kind == "delete" {
+            "удаление".to_owned()
+        } else {
+            let target = mutation.kind["rename"]["target_name"]
+                .as_str()
+                .unwrap_or("?");
+            format!("переименование в {target}")
+        };
+        let title = gtk::Label::new(Some(&format!("{} — {}", mutation.name, action)));
+        title.set_xalign(0.0);
+        title.set_hexpand(true);
+        title.set_wrap(true);
+        row.append(&title);
+        let cancel = gtk::Button::with_label("Отменить операцию");
+        row.append(&cancel);
+        rows.append(&row);
+        let drive_id = mutation.drive_id;
+        let item_id = mutation.item_id;
+        let row_for_result = row.clone();
+        let rows_for_result = rows.clone();
+        let result_for_result = result.clone();
+        let controls_for_result = controls.clone();
+        cancel.connect_clicked(move |button| {
+            button.set_sensitive(false);
+            let drive_id = drive_id.clone();
+            let item_id = item_id.clone();
+            let (sender, receiver) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = sender.send(cancel_conflicted_virtual_mutation(&drive_id, &item_id));
+            });
+            let button = button.clone();
+            let row = row_for_result.clone();
+            let rows = rows_for_result.clone();
+            let result = result_for_result.clone();
+            let controls = controls_for_result.clone();
+            gtk::glib::timeout_add_local(Duration::from_millis(100), move || {
+                match receiver.try_recv() {
+                    Ok(Ok(())) => {
+                        rows.remove(&row);
+                        result.set_text("Конфликтная операция отменена. Обновите каталог перед повторным подключением.");
+                        controls.refresh();
+                    }
+                    Ok(Err(error)) => {
+                        result.set_text(&format!("Не удалось отменить операцию: {error}"));
+                        button.set_sensitive(true);
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => return gtk::glib::ControlFlow::Continue,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        result.set_text("Демон недоступен");
+                        button.set_sensitive(true);
+                    }
+                }
+                gtk::glib::ControlFlow::Break
+            });
+        });
+    }
+    if count == 0 {
+        rows.append(&gtk::Label::new(Some("Конфликтных операций нет")));
+    }
+    let scroll = gtk::ScrolledWindow::builder()
+        .child(&rows)
+        .vexpand(true)
+        .hexpand(true)
+        .build();
+    content.append(&scroll);
+    let dialog = gtk::Window::builder()
+        .transient_for(parent)
+        .title("Конфликты виртуального диска")
+        .default_width(700)
+        .default_height(400)
+        .child(&content)
+        .build();
+    dialog.present();
+}
+
 fn present_virtual_drafts_dialog(
     parent: &adw::ApplicationWindow,
     controls: &VirtualMountControls,
@@ -1681,6 +1795,7 @@ fn main() {
         let mount = gtk::Button::with_label("Подключить виртуальный диск");
         let unmount = gtk::Button::with_label("Отключить виртуальный диск");
         let show_drafts = gtk::Button::with_label("Все локальные изменения…");
+        let show_mutation_conflicts = gtk::Button::with_label("Конфликты виртуального диска…");
         let confirm_deletes = gtk::Button::with_label("Подтвердить массовое удаление…");
         mount.set_sensitive(false);
         unmount.set_sensitive(false);
@@ -1740,6 +1855,7 @@ fn main() {
         virtual_actions.append(&unmount);
         virtual_actions.append(&show_drafts);
         virtual_controls.append(&virtual_actions);
+        virtual_controls.append(&show_mutation_conflicts);
         virtual_controls.append(&confirm_deletes);
         virtual_controls.append(&offline_label);
         virtual_controls.append(&offline_button);
@@ -1912,6 +2028,32 @@ fn main() {
                             "Не удалось загрузить локальные изменения: {error}"
                         ));
                     }
+                }
+                button.set_sensitive(true);
+                gtk::glib::ControlFlow::Break
+            });
+        });
+        let window_for_conflicts = window.clone();
+        let status_for_conflicts = status.clone();
+        let controls_for_conflicts = mount_controls.clone();
+        show_mutation_conflicts.connect_clicked(move |button| {
+            button.set_sensitive(false);
+            let (sender, receiver) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = sender.send(read_virtual_mutations());
+            });
+            let button = button.clone();
+            let window = window_for_conflicts.clone();
+            let status = status_for_conflicts.clone();
+            let controls = controls_for_conflicts.clone();
+            gtk::glib::timeout_add_local(Duration::from_millis(100), move || {
+                match receiver.try_recv() {
+                    Ok(Ok(mutations)) => {
+                        present_virtual_mutation_conflicts_dialog(&window, &controls, mutations);
+                    }
+                    Ok(Err(error)) => status.set_text(&format!("Не удалось загрузить конфликты: {error}")),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => return gtk::glib::ControlFlow::Continue,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => status.set_text("Демон недоступен"),
                 }
                 button.set_sensitive(true);
                 gtk::glib::ControlFlow::Break
@@ -2265,12 +2407,16 @@ mod tests {
     fn virtual_mutation_summary_flags_conflicts_and_mass_delete() {
         let mut mutations = (0..11)
             .map(|index| UiVirtualMutation {
+                drive_id: "drive".into(),
+                item_id: format!("item-{index}"),
                 name: format!("file-{index}"),
                 status: "pending".into(),
                 kind: serde_json::json!("delete"),
             })
             .collect::<Vec<_>>();
         mutations.push(UiVirtualMutation {
+            drive_id: "drive".into(),
+            item_id: "changed".into(),
             name: "changed.txt".into(),
             status: "conflict".into(),
             kind: serde_json::json!({"rename": {"target_parent_id":"root", "target_name":"new.txt"}}),

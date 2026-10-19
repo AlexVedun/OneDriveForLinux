@@ -542,6 +542,31 @@ impl Daemon {
             .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))
     }
 
+    fn cancel_conflicted_virtual_mutation(
+        &self,
+        drive_id: String,
+        item_id: String,
+    ) -> zbus::fdo::Result<()> {
+        if drive_id.is_empty() || item_id.is_empty() {
+            return Err(zbus::fdo::Error::InvalidArgs(
+                "item ID is missing".to_owned(),
+            ));
+        }
+        if self.virtual_mount.lock().unwrap().is_some()
+            || self.mount_in_progress.load(Ordering::SeqCst)
+        {
+            return Err(zbus::fdo::Error::Failed(
+                "unmount the virtual drive before cancelling a conflict".to_owned(),
+            ));
+        }
+        let root = state_directory()
+            .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?
+            .join("virtual-drafts");
+        MutationStore::open(&root)
+            .and_then(|store| store.remove_conflict(&drive_id, &item_id))
+            .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))
+    }
+
     fn confirm_virtual_mass_delete(&self, expected_count: u64) -> zbus::fdo::Result<()> {
         let root = state_directory()
             .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?

@@ -154,6 +154,21 @@ impl MutationStore {
         File::open(&self.root)?.sync_all()
     }
 
+    /// Cancel only a conflict. Pending work may already be in flight in Graph.
+    pub fn remove_conflict(&self, drive_id: &str, item_id: &str) -> io::Result<()> {
+        let _lock = self.lock()?;
+        let current = self
+            .list()?
+            .into_iter()
+            .find(|entry| entry.drive_id == drive_id && entry.item_id == item_id)
+            .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
+        if current.status != MutationStatus::Conflict {
+            return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+        }
+        fs::remove_file(self.path(drive_id, item_id))?;
+        File::open(&self.root)?.sync_all()
+    }
+
     fn approval_path(&self) -> PathBuf {
         self.root.join("approved-deletes.approval")
     }
@@ -262,6 +277,38 @@ mod tests {
         assert_eq!(reopened.list().unwrap()[0].status, MutationStatus::Applied);
         reopened.remove(&mutation).unwrap();
         assert!(reopened.list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn only_conflicted_operation_can_be_cancelled() {
+        let root = tempfile::tempdir().unwrap();
+        let store = MutationStore::open(root.path()).unwrap();
+        let mutation = Mutation {
+            drive_id: "drive".into(),
+            item_id: "file".into(),
+            parent_id: "root".into(),
+            name: "name.txt".into(),
+            etag: "v1".into(),
+            directory: false,
+            kind: MutationKind::Delete,
+            status: MutationStatus::Pending,
+        };
+        store.add(&mutation).unwrap();
+        assert_eq!(
+            store.remove_conflict("drive", "file").unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        store
+            .update_status(&mutation, MutationStatus::Conflict)
+            .unwrap();
+        store.remove_conflict("drive", "file").unwrap();
+        assert!(
+            MutationStore::open(root.path())
+                .unwrap()
+                .list()
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
