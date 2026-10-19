@@ -69,6 +69,12 @@ struct UiVirtualMutation {
     kind: serde_json::Value,
 }
 
+#[derive(Debug, Deserialize)]
+struct UiVirtualDirectory {
+    name: String,
+    status: String,
+}
+
 #[derive(Deserialize)]
 struct UiOperationSummary {
     id: i64,
@@ -363,6 +369,46 @@ fn read_virtual_drafts() -> Result<Vec<UiVirtualDraft>, String> {
 fn read_virtual_mutations() -> Result<Vec<UiVirtualMutation>, String> {
     let json: String = daemon_call("VirtualMutations").map_err(|error| error.to_string())?;
     serde_json::from_str(&json).map_err(|error| error.to_string())
+}
+
+fn read_virtual_directories() -> Result<Vec<UiVirtualDirectory>, String> {
+    let json: String = daemon_call("VirtualDirectories").map_err(|error| error.to_string())?;
+    serde_json::from_str(&json).map_err(|error| error.to_string())
+}
+
+fn virtual_directories_text(directories: &[UiVirtualDirectory]) -> String {
+    let pending = directories
+        .iter()
+        .filter(|item| item.status == "pending")
+        .count();
+    let waiting = directories
+        .iter()
+        .filter(|item| item.status == "waiting-parent")
+        .count();
+    let uploaded = directories
+        .iter()
+        .filter(|item| item.status == "uploaded")
+        .count();
+    let issues: Vec<_> = directories
+        .iter()
+        .filter(|item| matches!(item.status.as_str(), "parent-missing" | "name-conflict"))
+        .collect();
+    if directories.is_empty() {
+        return String::new();
+    }
+    let mut text = format!(
+        "Новые папки: {pending} ожидают отправки, {waiting} ждут родителя, {uploaded} созданы в OneDrive, {} требуют сверки.",
+        issues.len()
+    );
+    if let Some(issue) = issues.first() {
+        let reason = if issue.status == "name-conflict" {
+            "имя занято"
+        } else {
+            "родитель не найден"
+        };
+        text.push_str(&format!(" Папка «{}»: {reason}.", issue.name));
+    }
+    text
 }
 
 fn confirm_virtual_mass_delete(count: u64) -> Result<(), String> {
@@ -871,12 +917,20 @@ impl VirtualMountControls {
         &self,
         result: Result<Vec<UiVirtualDraft>, String>,
         mutations: Result<Vec<UiVirtualMutation>, String>,
+        directories: Result<Vec<UiVirtualDirectory>, String>,
     ) {
         match result {
             Ok(drafts) => {
                 let mut text = virtual_drafts_text(&drafts);
                 if let Ok(mutations) = mutations {
                     let summary = virtual_mutations_text(&mutations);
+                    if !summary.is_empty() {
+                        text.push('\n');
+                        text.push_str(&summary);
+                    }
+                }
+                if let Ok(directories) = directories {
+                    let summary = virtual_directories_text(&directories);
                     if !summary.is_empty() {
                         text.push('\n');
                         text.push_str(&summary);
@@ -933,6 +987,7 @@ impl VirtualMountControls {
                 read_virtual_fuse_diagnostics(),
                 read_virtual_drafts(),
                 read_virtual_mutations(),
+                read_virtual_directories(),
             ));
         });
         let controls = self.clone();
@@ -958,7 +1013,7 @@ impl VirtualMountControls {
                     }),
             );
             controls.show_diagnostics(result.1);
-            controls.show_drafts(result.2, result.3);
+            controls.show_drafts(result.2, result.3, result.4);
             controls.busy.set(false);
             gtk::glib::ControlFlow::Break
         });
@@ -985,7 +1040,8 @@ impl VirtualMountControls {
             let diagnostics = read_virtual_fuse_diagnostics();
             let drafts = read_virtual_drafts();
             let mutations = read_virtual_mutations();
-            let _ = sender.send((result, path, diagnostics, drafts, mutations));
+            let directories = read_virtual_directories();
+            let _ = sender.send((result, path, diagnostics, drafts, mutations, directories));
         });
         let controls = self.clone();
         let status = status.clone();
@@ -1012,7 +1068,7 @@ impl VirtualMountControls {
                     }),
             );
             controls.show_diagnostics(result.2);
-            controls.show_drafts(result.3, result.4);
+            controls.show_drafts(result.3, result.4, result.5);
             match result.0 {
                 Ok(message) => status.set_text(message),
                 Err(error) => status.set_text(&format!("Виртуальный диск: {error}")),
@@ -2424,6 +2480,28 @@ mod tests {
         let text = virtual_mutations_text(&mutations);
         assert!(text.contains("Массовое удаление приостановлено"));
         assert!(text.contains("Конфликт: changed.txt"));
+    }
+
+    #[test]
+    fn virtual_directory_summary_names_first_conflict() {
+        let directories = vec![
+            UiVirtualDirectory {
+                name: "parent".into(),
+                status: "uploaded".into(),
+            },
+            UiVirtualDirectory {
+                name: "child".into(),
+                status: "waiting-parent".into(),
+            },
+            UiVirtualDirectory {
+                name: "duplicate".into(),
+                status: "name-conflict".into(),
+            },
+        ];
+        let text = virtual_directories_text(&directories);
+        assert!(text.contains("1 ждут родителя"));
+        assert!(text.contains("1 созданы в OneDrive"));
+        assert!(text.contains("Папка «duplicate»: имя занято"));
     }
 
     #[test]
