@@ -43,9 +43,6 @@ pub async fn upload_new_snapshot_to_parent<T: UploadTransport>(
         .new_file
         .as_ref()
         .ok_or(UploadError::InvalidResponse)?;
-    if snapshot.size == 0 {
-        return Err(UploadError::InvalidResponse);
-    }
     let operation = QueuedOperation {
         id: 0,
         kind: "UploadNewByParent".to_owned(),
@@ -71,7 +68,8 @@ async fn upload_operation_snapshot<T: UploadTransport>(
         let result = transport.upload_empty(&operation).await?;
         return match result {
             UploadStep::Complete { remote_id, etag }
-                if Some(remote_id.as_str()) == expected_id
+                if expected_id.is_none_or(|expected| remote_id == expected)
+                    && !remote_id.is_empty()
                     && etag.as_ref().is_some_and(|etag| !etag.is_empty()) =>
             {
                 Ok(UploadStep::Complete { remote_id, etag })
@@ -242,6 +240,65 @@ mod tests {
                 etag: Some("v1".into()),
             })
         }
+    }
+
+    struct EmptyNewTransport;
+
+    impl UploadTransport for EmptyNewTransport {
+        async fn create_session(&self, _: &QueuedOperation, _: u64) -> Result<String, UploadError> {
+            panic!("empty file should not create an upload session")
+        }
+        async fn session_offset(&self, _: &str) -> Result<u64, UploadError> {
+            panic!("empty file should not resume an upload session")
+        }
+        async fn send_range(
+            &self,
+            _: &str,
+            _: u64,
+            _: u64,
+            _: Vec<u8>,
+        ) -> Result<UploadStep, UploadError> {
+            panic!("empty file should not send a byte range")
+        }
+        async fn upload_empty(
+            &self,
+            operation: &QueuedOperation,
+        ) -> Result<UploadStep, UploadError> {
+            assert_eq!(operation.kind, "UploadNewByParent");
+            assert_eq!(operation.remote_id.as_deref(), Some("remote-parent"));
+            assert_eq!(operation.path, "new.txt");
+            Ok(UploadStep::Complete {
+                remote_id: "remote-created".into(),
+                etag: Some("v1".into()),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_new_virtual_file_uses_remote_parent_without_a_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DraftStore::open(dir.path()).unwrap();
+        let identity = DraftIdentity {
+            drive_id: "drive".into(),
+            item_id: "local:child".into(),
+            base_etag: "local-new".into(),
+            new_file: Some(NewFileLocation {
+                parent_id: "local-dir:parent".into(),
+                name: "new.txt".into(),
+            }),
+        };
+        store.begin_empty(identity.clone()).unwrap();
+        let snapshot = store.snapshot(&identity).unwrap().unwrap();
+        assert_eq!(snapshot.size, 0);
+        let result =
+            upload_new_snapshot_to_parent(&EmptyNewTransport, &store, &snapshot, "remote-parent")
+                .await
+                .unwrap();
+        assert!(
+            matches!(result, UploadStep::Complete { remote_id, etag: Some(etag) }
+            if remote_id == "remote-created" && etag == "v1")
+        );
+        assert_eq!(snapshot.identity, identity);
     }
 
     #[tokio::test]

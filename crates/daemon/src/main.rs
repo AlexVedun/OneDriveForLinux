@@ -470,6 +470,8 @@ impl Daemon {
                             .len()
                             .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?
                             == 0
+                            && std::env::var("ONEDRIVE_EXPERIMENTAL_EMPTY_UPLOAD").as_deref()
+                                != Ok("1")
                         {
                             "new-empty"
                         } else {
@@ -831,12 +833,6 @@ impl Daemon {
                 .map_err(|_| zbus::fdo::Error::Failed("draft snapshot task failed".to_owned()))?
                 .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?
                 .ok_or_else(|| zbus::fdo::Error::Failed("draft is missing".to_owned()))?;
-        if snapshot.size == 0 && snapshot.identity.new_file.is_some() {
-            return Err(zbus::fdo::Error::Failed(
-                "upload of an empty new virtual file is not supported yet; local draft retained"
-                    .to_owned(),
-            ));
-        }
         if snapshot.size == 0
             && std::env::var("ONEDRIVE_EXPERIMENTAL_EMPTY_UPLOAD").as_deref() != Ok("1")
         {
