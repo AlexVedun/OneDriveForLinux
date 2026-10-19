@@ -1212,6 +1212,54 @@ impl VirtualFuse {
         result
     }
 
+    fn allocate_file(
+        &self,
+        inode: u64,
+        handle: u64,
+        offset: u64,
+        length: u64,
+        mode: i32,
+    ) -> Result<(), Errno> {
+        if mode != 0 && mode != libc::FALLOC_FL_KEEP_SIZE {
+            return Err(Errno::EOPNOTSUPP);
+        }
+        if length == 0
+            || offset
+                .checked_add(length)
+                .is_none_or(|end| end > i64::MAX as u64)
+        {
+            return Err(Errno::EINVAL);
+        }
+        let mut files = self.files.lock().unwrap();
+        let open = files
+            .get_mut(&handle)
+            .filter(|open| open.inode == inode && open.writable)
+            .ok_or(Errno::EBADF)?;
+        if let OpenHandle::Pending(identity) = &open.handle {
+            let store =
+                DraftStore::open(self.draft_root.as_ref().unwrap()).map_err(map_draft_error)?;
+            let draft = if let Some(existing) = store.recover(identity).map_err(map_draft_error)? {
+                existing
+            } else {
+                let cached = self.open_cached(inode)?;
+                store
+                    .begin_from_file(identity.clone(), cached.source_file())
+                    .map_err(map_draft_error)?
+            };
+            open.handle = OpenHandle::Draft(draft);
+        }
+        let OpenHandle::Draft(draft) = &open.handle else {
+            return Err(Errno::EROFS);
+        };
+        draft
+            .allocate(offset, length, mode == libc::FALLOC_FL_KEEP_SIZE)
+            .map_err(|error| match error.raw_os_error() {
+                Some(libc::EOPNOTSUPP) => Errno::EOPNOTSUPP,
+                Some(libc::EINVAL) => Errno::EINVAL,
+                _ => map_draft_error(error),
+            })
+    }
+
     // Keep the FUSE source and destination arguments explicit to avoid swapping offsets.
     #[allow(clippy::too_many_arguments)]
     fn copy_range(
@@ -1595,6 +1643,22 @@ impl Filesystem for VirtualFuse {
         }
     }
 
+    fn fallocate(
+        &self,
+        _request: &Request,
+        inode: INodeNo,
+        handle: FileHandle,
+        offset: u64,
+        length: u64,
+        mode: i32,
+        reply: ReplyEmpty,
+    ) {
+        match self.allocate_file(inode.0, handle.0, offset, length, mode) {
+            Ok(()) => reply.ok(),
+            Err(error) => reply.error(error),
+        }
+    }
+
     fn flush(
         &self,
         _request: &Request,
@@ -1766,6 +1830,104 @@ mod tests {
     }
 
     #[test]
+    fn allocate_file_rejects_invalid_requests_without_modifying_draft() {
+        let dir = tempfile::tempdir().unwrap();
+        let tree = VirtualTree::from_items("drive", "root", [file_item()]).unwrap();
+        let fuse = VirtualFuse::new_writable(
+            tree,
+            dir.path().join("cache"),
+            dir.path().join("drafts"),
+            10,
+            Arc::new(|_| Err(io::ErrorKind::NotConnected.into())),
+        );
+        let (node, handle) = fuse
+            .create_file(ROOT_INODE, "new.txt", OpenFlags(libc::O_RDWR))
+            .unwrap();
+        assert_eq!(
+            fuse.allocate_file(node.inode, handle, 0, 1, libc::FALLOC_FL_PUNCH_HOLE),
+            Err(Errno::EOPNOTSUPP)
+        );
+        assert_eq!(
+            fuse.allocate_file(node.inode, handle, 0, 0, 0),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(
+            fuse.allocate_file(node.inode, handle, i64::MAX as u64, 2, 0),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(
+            fuse.allocate_file(node.inode, 999, 0, 1, 0),
+            Err(Errno::EBADF)
+        );
+        let readonly = fuse
+            .open_file(node.inode, OpenFlags(libc::O_RDONLY))
+            .unwrap();
+        assert_eq!(
+            fuse.allocate_file(node.inode, readonly, 0, 1, 0),
+            Err(Errno::EBADF)
+        );
+        assert_eq!(fuse.read_file(node.inode, handle, 0, 1).unwrap(), b"");
+        let remote_inode = fuse.lookup_node(ROOT_INODE, "текст.txt").unwrap().inode;
+        let remote_handle = fuse
+            .open_file(remote_inode, OpenFlags(libc::O_RDWR))
+            .unwrap();
+        assert_eq!(
+            fuse.allocate_file(
+                remote_inode,
+                remote_handle,
+                0,
+                1,
+                libc::FALLOC_FL_PUNCH_HOLE
+            ),
+            Err(Errno::EOPNOTSUPP)
+        );
+        assert!(
+            DraftStore::open(&dir.path().join("drafts"))
+                .unwrap()
+                .recover_item("drive", "file")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn allocate_remote_file_preserves_cached_content_in_draft() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_root = dir.path().join("cache");
+        let draft_root = dir.path().join("drafts");
+        let source = dir.path().join("source");
+        fs::write(&source, b"hello").unwrap();
+        let tree = VirtualTree::from_items("drive", "root", [file_item()]).unwrap();
+        let request = tree.request_for_item("file").unwrap();
+        CacheStore::open(&cache_root, 10)
+            .unwrap()
+            .put(&request.cache_key(), &source, 5)
+            .unwrap();
+        let fuse = VirtualFuse::new_writable(
+            tree,
+            cache_root,
+            draft_root.clone(),
+            10,
+            Arc::new(|_| Err(io::ErrorKind::NotConnected.into())),
+        );
+        let inode = fuse.lookup_node(ROOT_INODE, "текст.txt").unwrap().inode;
+        let handle = fuse.open_file(inode, OpenFlags(libc::O_RDWR)).unwrap();
+        fuse.allocate_file(inode, handle, 8, 8, 0).unwrap();
+        assert_eq!(
+            fuse.read_file(inode, handle, 0, 16).unwrap(),
+            b"hello\0\0\0\0\0\0\0\0\0\0\0"
+        );
+        let draft = DraftStore::open(&draft_root)
+            .unwrap()
+            .recover_item("drive", "file")
+            .unwrap()
+            .unwrap();
+        assert_eq!(draft.identity().base_etag, "v1");
+        assert_eq!(draft.len().unwrap(), 16);
+        assert_eq!(fs::read(source).unwrap(), b"hello");
+    }
+
+    #[test]
     fn copy_range_from_cached_remote_file_creates_local_draft() {
         let dir = tempfile::tempdir().unwrap();
         let cache_root = dir.path().join("cache");
@@ -1858,6 +2020,57 @@ mod tests {
         session.umount_and_join().unwrap();
         let session = mount();
         assert_eq!(fs::read(mountpoint.join("target.txt")).unwrap(), b"bcdef");
+        session.umount_and_join().unwrap();
+    }
+
+    #[test]
+    fn mounted_fallocate_preserves_data_and_size_after_remount() {
+        if std::env::var_os("ONEDRIVE_FUSE_SMOKE").is_none() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mountpoint = dir.path().join("mount");
+        fs::create_dir(&mountpoint).unwrap();
+        let mount = || {
+            VirtualFuse::new_writable(
+                VirtualTree::from_items("drive", "root", [file_item()]).unwrap(),
+                dir.path().join("cache"),
+                dir.path().join("drafts"),
+                10,
+                Arc::new(|_| Err(io::ErrorKind::NotConnected.into())),
+            )
+            .mount(&mountpoint)
+            .unwrap()
+        };
+        let session = mount();
+        let path = mountpoint.join("preallocated.txt");
+        fs::write(&path, b"abc").unwrap();
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::fallocate(file.as_raw_fd(), libc::FALLOC_FL_KEEP_SIZE, 8, 8) },
+            0,
+            "{}",
+            io::Error::last_os_error()
+        );
+        assert_eq!(fs::metadata(&path).unwrap().len(), 3);
+        assert_eq!(
+            unsafe { libc::fallocate(file.as_raw_fd(), 0, 8, 8) },
+            0,
+            "{}",
+            io::Error::last_os_error()
+        );
+        assert_eq!(fs::metadata(&path).unwrap().len(), 16);
+        drop(file);
+        let bytes = fs::read(&path).unwrap();
+        assert_eq!(&bytes[..3], b"abc");
+        assert_eq!(&bytes[3..], &[0; 13]);
+        session.umount_and_join().unwrap();
+        let session = mount();
+        assert_eq!(fs::read(&path).unwrap(), bytes);
         session.umount_and_join().unwrap();
     }
 
