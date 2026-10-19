@@ -1138,6 +1138,20 @@ impl VirtualFuse {
             // while the cache is populated, but serialize cache access with open().
             drop(files);
             let _serialized = self.open_lock.lock().unwrap();
+            let files = self.files.lock().unwrap();
+            let open = files
+                .get(&handle)
+                .filter(|open| open.inode == inode)
+                .ok_or(Errno::EBADF)?;
+            if let OpenHandle::Draft(draft) = &open.handle {
+                return read_draft(draft, offset, size);
+            }
+            if let Some(node) = self.node(inode)
+                && let Some(draft) = self.draft_for_node(&node)?
+            {
+                return read_draft(&draft, offset, size);
+            }
+            drop(files);
             return self
                 .open_cached(inode)?
                 .read(offset, size)
@@ -1150,27 +1164,67 @@ impl VirtualFuse {
         }
     }
 
-    fn write_file(&self, inode: u64, handle: u64, offset: u64, data: &[u8]) -> Result<u32, Errno> {
+    fn materialize_pending(&self, inode: u64, handle: u64, empty: bool) -> Result<(), Errno> {
+        {
+            let files = self.files.lock().unwrap();
+            let open = files
+                .get(&handle)
+                .filter(|open| open.inode == inode && open.writable)
+                .ok_or(Errno::EBADF)?;
+            if matches!(open.handle, OpenHandle::Draft(_)) {
+                return Ok(());
+            }
+            if !matches!(open.handle, OpenHandle::Pending(_)) {
+                return Err(Errno::EROFS);
+            }
+        }
+        // Cache downloads may wait for Graph. Serialize draft creation without
+        // holding the map of open handles so unrelated files remain responsive.
+        let _serialized = self.open_lock.lock().unwrap();
+        let identity = {
+            let files = self.files.lock().unwrap();
+            let open = files
+                .get(&handle)
+                .filter(|open| open.inode == inode && open.writable)
+                .ok_or(Errno::EBADF)?;
+            match &open.handle {
+                OpenHandle::Draft(_) => return Ok(()),
+                OpenHandle::Pending(identity) => identity.clone(),
+                OpenHandle::Cached(_) => return Err(Errno::EROFS),
+            }
+        };
+        let store = DraftStore::open(self.draft_root.as_ref().ok_or(Errno::EROFS)?)
+            .map_err(map_draft_error)?;
+        let draft = if let Some(existing) = store.recover(&identity).map_err(map_draft_error)? {
+            existing
+        } else if empty {
+            store.begin_empty(identity).map_err(map_draft_error)?
+        } else {
+            let cached = self.open_cached(inode)?;
+            store
+                .begin_from_file(identity, cached.source_file())
+                .map_err(map_draft_error)?
+        };
         let mut files = self.files.lock().unwrap();
         let open = files
             .get_mut(&handle)
+            .filter(|open| open.inode == inode && open.writable)
+            .ok_or(Errno::EBADF)?;
+        if matches!(open.handle, OpenHandle::Pending(_)) {
+            open.handle = OpenHandle::Draft(draft);
+        }
+        Ok(())
+    }
+
+    fn write_file(&self, inode: u64, handle: u64, offset: u64, data: &[u8]) -> Result<u32, Errno> {
+        self.materialize_pending(inode, handle, false)?;
+        let files = self.files.lock().unwrap();
+        let open = files
+            .get(&handle)
             .filter(|open| open.inode == inode)
             .ok_or(Errno::EBADF)?;
         if !open.writable {
             return Err(Errno::EBADF);
-        }
-        if let OpenHandle::Pending(identity) = &open.handle {
-            let store =
-                DraftStore::open(self.draft_root.as_ref().unwrap()).map_err(map_draft_error)?;
-            let draft = if let Some(existing) = store.recover(identity).map_err(|_| Errno::EIO)? {
-                existing
-            } else {
-                let cached = self.open_cached(inode)?;
-                store
-                    .begin_from_file(identity.clone(), cached.source_file())
-                    .map_err(map_draft_error)?
-            };
-            open.handle = OpenHandle::Draft(draft);
         }
         let OpenHandle::Draft(draft) = &open.handle else {
             return Err(Errno::EROFS);
@@ -1192,23 +1246,12 @@ impl VirtualFuse {
             )?
         };
         let result = (|| {
-            let mut files = self.files.lock().unwrap();
+            self.materialize_pending(inode, owned_handle, size == 0)?;
+            let files = self.files.lock().unwrap();
             let open = files
-                .get_mut(&owned_handle)
+                .get(&owned_handle)
                 .filter(|open| open.inode == inode && open.writable)
                 .ok_or(Errno::EBADF)?;
-            if let OpenHandle::Pending(identity) = &open.handle {
-                let store =
-                    DraftStore::open(self.draft_root.as_ref().unwrap()).map_err(map_draft_error)?;
-                let draft = if size == 0 {
-                    store.begin_empty(identity.clone())
-                } else {
-                    let cached = self.open_cached(inode)?;
-                    store.begin_from_file(identity.clone(), cached.source_file())
-                }
-                .map_err(map_draft_error)?;
-                open.handle = OpenHandle::Draft(draft);
-            }
             let OpenHandle::Draft(draft) = &open.handle else {
                 return Err(Errno::EROFS);
             };
@@ -1238,24 +1281,12 @@ impl VirtualFuse {
         {
             return Err(Errno::EINVAL);
         }
-        let mut files = self.files.lock().unwrap();
+        self.materialize_pending(inode, handle, false)?;
+        let files = self.files.lock().unwrap();
         let open = files
-            .get_mut(&handle)
+            .get(&handle)
             .filter(|open| open.inode == inode && open.writable)
             .ok_or(Errno::EBADF)?;
-        if let OpenHandle::Pending(identity) = &open.handle {
-            let store =
-                DraftStore::open(self.draft_root.as_ref().unwrap()).map_err(map_draft_error)?;
-            let draft = if let Some(existing) = store.recover(identity).map_err(map_draft_error)? {
-                existing
-            } else {
-                let cached = self.open_cached(inode)?;
-                store
-                    .begin_from_file(identity.clone(), cached.source_file())
-                    .map_err(map_draft_error)?
-            };
-            open.handle = OpenHandle::Draft(draft);
-        }
         let OpenHandle::Draft(draft) = &open.handle else {
             return Err(Errno::EROFS);
         };
@@ -1782,6 +1813,7 @@ mod tests {
     use std::fs;
     use std::io::Read;
     use std::os::fd::AsRawFd;
+    use std::os::unix::fs::FileExt;
     use std::sync::atomic::AtomicUsize;
     use std::sync::{Condvar, mpsc};
 
@@ -3327,6 +3359,120 @@ mod tests {
         assert_eq!(local_result.unwrap().unwrap(), b"local");
         local_reader.join().unwrap();
         assert_eq!(remote_reader.join().unwrap(), Err(Errno::ENETDOWN));
+    }
+
+    #[test]
+    fn pending_remote_write_does_not_block_other_open_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let (started_tx, started_rx) = mpsc::channel();
+        let gate_for_loader = Arc::clone(&gate);
+        let loader: Arc<ContentLoader> = Arc::new(move |_| {
+            started_tx.send(()).unwrap();
+            let (lock, wake) = &*gate_for_loader;
+            let mut released = lock.lock().unwrap();
+            while !*released {
+                released = wake.wait(released).unwrap();
+            }
+            Err(io::ErrorKind::NotConnected.into())
+        });
+        let tree = VirtualTree::from_items("drive", "root", [file_item()]).unwrap();
+        let fuse = Arc::new(VirtualFuse::new_writable(
+            tree,
+            dir.path().join("cache"),
+            dir.path().join("drafts"),
+            10,
+            loader,
+        ));
+        let (local, local_handle) = fuse
+            .create_file(ROOT_INODE, "local.txt", OpenFlags(libc::O_RDWR))
+            .unwrap();
+        fuse.write_file(local.inode, local_handle, 0, b"local")
+            .unwrap();
+        let remote = fuse.lookup_node(ROOT_INODE, "текст.txt").unwrap();
+        let remote_handle = fuse
+            .open_file(remote.inode, OpenFlags(libc::O_RDWR))
+            .unwrap();
+        let remote_writer = {
+            let fuse = Arc::clone(&fuse);
+            std::thread::spawn(move || fuse.write_file(remote.inode, remote_handle, 1, b"X"))
+        };
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (local_tx, local_rx) = mpsc::channel();
+        let local_reader = {
+            let fuse = Arc::clone(&fuse);
+            std::thread::spawn(move || {
+                local_tx
+                    .send(fuse.read_file(local.inode, local_handle, 0, 5))
+                    .unwrap();
+            })
+        };
+        let local_result = local_rx.recv_timeout(Duration::from_secs(2));
+        let (lock, wake) = &*gate;
+        *lock.lock().unwrap() = true;
+        wake.notify_all();
+        assert_eq!(local_result.unwrap().unwrap(), b"local");
+        local_reader.join().unwrap();
+        assert_eq!(remote_writer.join().unwrap(), Err(Errno::ENETDOWN));
+    }
+
+    #[test]
+    fn mounted_pending_write_keeps_local_file_responsive() {
+        if std::env::var_os("ONEDRIVE_FUSE_SMOKE").is_none() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mountpoint = dir.path().join("mount");
+        fs::create_dir(&mountpoint).unwrap();
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let (started_tx, started_rx) = mpsc::channel();
+        let gate_for_loader = Arc::clone(&gate);
+        let loader: Arc<ContentLoader> = Arc::new(move |_| {
+            started_tx.send(()).unwrap();
+            let (lock, wake) = &*gate_for_loader;
+            let mut released = lock.lock().unwrap();
+            while !*released {
+                released = wake.wait(released).unwrap();
+            }
+            Err(io::ErrorKind::NotConnected.into())
+        });
+        let tree = VirtualTree::from_items("drive", "root", [file_item()]).unwrap();
+        let session = VirtualFuse::new_writable(
+            tree,
+            dir.path().join("cache"),
+            dir.path().join("drafts"),
+            10,
+            loader,
+        )
+        .mount(&mountpoint)
+        .unwrap();
+        fs::write(mountpoint.join("local.txt"), b"local").unwrap();
+        let mut local = fs::File::open(mountpoint.join("local.txt")).unwrap();
+        let remote = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(mountpoint.join("текст.txt"))
+            .unwrap();
+        let remote_writer = std::thread::spawn(move || remote.write_at(b"X", 1));
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (local_tx, local_rx) = mpsc::channel();
+        let local_reader = std::thread::spawn(move || {
+            let mut bytes = [0_u8; 5];
+            local_tx
+                .send(local.read(&mut bytes).map(|count| (count, bytes)))
+                .unwrap();
+        });
+        let local_result = local_rx.recv_timeout(Duration::from_secs(2));
+        let (lock, wake) = &*gate;
+        *lock.lock().unwrap() = true;
+        wake.notify_all();
+        assert_eq!(local_result.unwrap().unwrap(), (5, *b"local"));
+        local_reader.join().unwrap();
+        assert_eq!(
+            remote_writer.join().unwrap().unwrap_err().raw_os_error(),
+            Some(libc::ENETDOWN)
+        );
+        session.umount_and_join().unwrap();
     }
 
     #[test]
