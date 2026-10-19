@@ -772,6 +772,19 @@ impl DraftFile {
         self.file.read_at(buffer, offset)
     }
 
+    pub fn seek_data_hole(&self, offset: i64, whence: i32) -> io::Result<i64> {
+        if offset < 0 || !matches!(whence, libc::SEEK_DATA | libc::SEEK_HOLE) {
+            return Err(io::Error::from(io::ErrorKind::InvalidInput));
+        }
+        // Draft reads and writes use positioned I/O, so moving this fd's cursor is safe.
+        let result = unsafe { libc::lseek(self.file.as_raw_fd(), offset, whence) };
+        if result < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(result)
+        }
+    }
+
     /// A successful write is durably stored locally; upload is a separate step.
     pub fn write_at(&self, offset: u64, bytes: &[u8]) -> io::Result<usize> {
         let _lock = lock_exclusive(&self.file)?;

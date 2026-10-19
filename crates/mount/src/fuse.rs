@@ -10,7 +10,8 @@ use crate::{
 use fuser::{
     BackgroundSession, Config, CopyFileRangeFlags, Errno, FileAttr, FileHandle, FileType,
     Filesystem, FopenFlags, Generation, INodeNo, MountOption, OpenAccMode, OpenFlags, ReplyAttr,
-    ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request,
+    ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyLseek, ReplyOpen,
+    ReplyWrite, Request,
 };
 use onedrive_cache::CacheStore;
 use std::collections::HashMap;
@@ -1260,6 +1261,39 @@ impl VirtualFuse {
             })
     }
 
+    fn seek_file(&self, inode: u64, handle: u64, offset: i64, whence: i32) -> Result<i64, Errno> {
+        if offset < 0 || !matches!(whence, libc::SEEK_DATA | libc::SEEK_HOLE) {
+            return Err(Errno::EINVAL);
+        }
+        let files = self.files.lock().unwrap();
+        if files.get(&handle).is_none_or(|open| open.inode != inode) {
+            return Err(Errno::EBADF);
+        }
+        let node = self.node(inode).ok_or(Errno::ENOENT)?;
+        if node.kind != NodeKind::File {
+            return Err(Errno::EISDIR);
+        }
+        if let Some(draft) = self.draft_for_node(&node)? {
+            return draft.seek_data_hole(offset, whence).map_err(|error| {
+                match error.raw_os_error() {
+                    Some(libc::ENXIO) => Errno::ENXIO,
+                    Some(libc::EINVAL) => Errno::EINVAL,
+                    _ => Errno::EIO,
+                }
+            });
+        }
+        // Graph exposes file size, but not physical allocation. A regular file may
+        // legally report all bytes as data and one implicit hole at EOF.
+        if offset as u64 >= node.size {
+            return Err(Errno::ENXIO);
+        }
+        if whence == libc::SEEK_DATA {
+            Ok(offset)
+        } else {
+            i64::try_from(node.size).map_err(|_| Errno::EOVERFLOW)
+        }
+    }
+
     // Keep the FUSE source and destination arguments explicit to avoid swapping offsets.
     #[allow(clippy::too_many_arguments)]
     fn copy_range(
@@ -1659,6 +1693,21 @@ impl Filesystem for VirtualFuse {
         }
     }
 
+    fn lseek(
+        &self,
+        _request: &Request,
+        inode: INodeNo,
+        handle: FileHandle,
+        offset: i64,
+        whence: i32,
+        reply: ReplyLseek,
+    ) {
+        match self.seek_file(inode.0, handle.0, offset, whence) {
+            Ok(offset) => reply.offset(offset),
+            Err(error) => reply.error(error),
+        }
+    }
+
     fn flush(
         &self,
         _request: &Request,
@@ -1741,6 +1790,111 @@ mod tests {
             modified: None,
             deleted: false,
         }
+    }
+
+    #[test]
+    fn seek_data_and_hole_use_draft_or_catalog_without_network() {
+        let dir = tempfile::tempdir().unwrap();
+        let tree = VirtualTree::from_items("drive", "root", [file_item()]).unwrap();
+        let fuse = VirtualFuse::new_writable(
+            tree,
+            dir.path().join("cache"),
+            dir.path().join("drafts"),
+            10,
+            Arc::new(|_| panic!("seek should not download remote content")),
+        );
+        let remote = fuse.lookup_node(ROOT_INODE, "текст.txt").unwrap();
+        let remote_handle = fuse
+            .open_file(remote.inode, OpenFlags(libc::O_RDWR))
+            .unwrap();
+        assert_eq!(
+            fuse.seek_file(remote.inode, remote_handle, 2, libc::SEEK_DATA),
+            Ok(2)
+        );
+        assert_eq!(
+            fuse.seek_file(remote.inode, remote_handle, 2, libc::SEEK_HOLE),
+            Ok(5)
+        );
+        assert_eq!(
+            fuse.seek_file(remote.inode, remote_handle, 5, libc::SEEK_DATA),
+            Err(Errno::ENXIO)
+        );
+        let (local, local_handle) = fuse
+            .create_file(ROOT_INODE, "sparse.bin", OpenFlags(libc::O_RDWR))
+            .unwrap();
+        fuse.truncate_file(local.inode, Some(local_handle), 8192)
+            .unwrap();
+        fuse.write_file(local.inode, local_handle, 4096, b"x")
+            .unwrap();
+        assert_eq!(
+            fuse.seek_file(local.inode, local_handle, 4096, libc::SEEK_DATA),
+            Ok(4096)
+        );
+        assert!(
+            fuse.seek_file(local.inode, local_handle, 0, libc::SEEK_HOLE)
+                .unwrap()
+                <= 8192
+        );
+        assert_eq!(
+            fuse.seek_file(local.inode, local_handle, 8192, libc::SEEK_HOLE),
+            Err(Errno::ENXIO)
+        );
+        assert_eq!(
+            fuse.seek_file(local.inode, local_handle, -1, libc::SEEK_DATA),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(
+            fuse.seek_file(local.inode, 999, 0, libc::SEEK_DATA),
+            Err(Errno::EBADF)
+        );
+    }
+
+    #[test]
+    fn mounted_seek_data_and_hole_survive_remount() {
+        if std::env::var_os("ONEDRIVE_FUSE_SMOKE").is_none() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mountpoint = dir.path().join("mount");
+        fs::create_dir(&mountpoint).unwrap();
+        let mount = || {
+            VirtualFuse::new_writable(
+                VirtualTree::from_items("drive", "root", [file_item()]).unwrap(),
+                dir.path().join("cache"),
+                dir.path().join("drafts"),
+                10,
+                Arc::new(|_| Err(io::ErrorKind::NotConnected.into())),
+            )
+            .mount(&mountpoint)
+            .unwrap()
+        };
+        let session = mount();
+        let path = mountpoint.join("sparse.bin");
+        fs::write(&path, b"abc").unwrap();
+        let file = fs::File::open(&path).unwrap();
+        assert_eq!(
+            unsafe { libc::lseek(file.as_raw_fd(), 0, libc::SEEK_DATA) },
+            0
+        );
+        assert_eq!(
+            unsafe { libc::lseek(file.as_raw_fd(), 0, libc::SEEK_HOLE) },
+            3
+        );
+        assert_eq!(
+            unsafe { libc::lseek(file.as_raw_fd(), 3, libc::SEEK_DATA) },
+            -1
+        );
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ENXIO));
+        drop(file);
+        session.umount_and_join().unwrap();
+        let session = mount();
+        let file = fs::File::open(&path).unwrap();
+        assert_eq!(
+            unsafe { libc::lseek(file.as_raw_fd(), 0, libc::SEEK_HOLE) },
+            3
+        );
+        drop(file);
+        session.umount_and_join().unwrap();
     }
 
     #[test]
