@@ -48,6 +48,7 @@ pub struct VirtualFuse {
     cache_limit: u64,
     loader: Arc<ContentLoader>,
     open_lock: Mutex<()>,
+    cache_lock: Mutex<()>,
     files: Mutex<HashMap<u64, OpenFile>>,
     local_files: Mutex<HashMap<u64, Node>>,
     remote_changes: Mutex<HashMap<u64, Mutation>>,
@@ -70,6 +71,7 @@ impl VirtualFuse {
             cache_limit,
             loader,
             open_lock: Mutex::new(()),
+            cache_lock: Mutex::new(()),
             files: Mutex::new(HashMap::new()),
             local_files: Mutex::new(HashMap::new()),
             remote_changes: Mutex::new(HashMap::new()),
@@ -1086,11 +1088,18 @@ impl VirtualFuse {
                 true,
             ));
         }
+        drop(_serialized);
         let opened = self.open_cached(inode)?;
+        let _serialized = self.open_lock.lock().unwrap();
+        let node = self.node(inode).ok_or(Errno::ENOENT)?;
+        if let Some(draft) = self.draft_for_node(&node)? {
+            return Ok(self.insert_open(inode, OpenHandle::Draft(Arc::new(draft)), false));
+        }
         Ok(self.insert_open(inode, OpenHandle::Cached(Arc::new(opened)), false))
     }
 
     fn open_cached(&self, inode: u64) -> Result<CachedHandle, Errno> {
+        let _serialized = self.cache_lock.lock().unwrap();
         let mut cache =
             CacheStore::open(&self.cache_root, self.cache_limit).map_err(|_| Errno::EIO)?;
         let opened = match self.tree.open_cached(inode, &mut cache) {
@@ -3316,6 +3325,136 @@ mod tests {
         );
         listing.join().unwrap();
         assert_eq!(listing_result.unwrap(), 1);
+        session.umount_and_join().unwrap();
+    }
+
+    #[test]
+    fn slow_remote_open_allows_local_open_and_sees_new_draft() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_root = dir.path().join("cache");
+        let source = dir.path().join("source");
+        fs::write(&source, b"cloud").unwrap();
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let (started_tx, started_rx) = mpsc::channel();
+        let gate_for_loader = Arc::clone(&gate);
+        let cache_for_loader = cache_root.clone();
+        let loader: Arc<ContentLoader> = Arc::new(move |request| {
+            started_tx.send(()).unwrap();
+            let (lock, wake) = &*gate_for_loader;
+            let mut released = lock.lock().unwrap();
+            while !*released {
+                released = wake.wait(released).unwrap();
+            }
+            let mut cache = CacheStore::open(&cache_for_loader, 10).map_err(io::Error::other)?;
+            cache
+                .put(&request.cache_key(), &source, request.size)
+                .map_err(io::Error::other)
+        });
+        let tree = VirtualTree::from_items("drive", "root", [file_item()]).unwrap();
+        let fuse = Arc::new(VirtualFuse::new_writable(
+            tree,
+            cache_root,
+            dir.path().join("drafts"),
+            10,
+            loader,
+        ));
+        let (local, local_handle) = fuse
+            .create_file(ROOT_INODE, "local.txt", OpenFlags(libc::O_RDWR))
+            .unwrap();
+        fuse.write_file(local.inode, local_handle, 0, b"local")
+            .unwrap();
+        let remote = fuse.lookup_node(ROOT_INODE, "текст.txt").unwrap();
+        let remote_reader = {
+            let fuse = Arc::clone(&fuse);
+            std::thread::spawn(move || fuse.open_file(remote.inode, OpenFlags(libc::O_RDONLY)))
+        };
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (local_tx, local_rx) = mpsc::channel();
+        let local_reader = {
+            let fuse = Arc::clone(&fuse);
+            std::thread::spawn(move || {
+                let handle = fuse.open_file(local.inode, OpenFlags(libc::O_RDONLY))?;
+                local_tx
+                    .send(fuse.read_file(local.inode, handle, 0, 5))
+                    .unwrap();
+                Ok::<(), Errno>(())
+            })
+        };
+        let local_result = local_rx.recv_timeout(Duration::from_secs(2));
+        let (replacement_tx, replacement_rx) = mpsc::channel();
+        let replacement_writer = {
+            let fuse = Arc::clone(&fuse);
+            std::thread::spawn(move || {
+                let result = fuse
+                    .open_file(remote.inode, OpenFlags(libc::O_WRONLY | libc::O_TRUNC))
+                    .and_then(|handle| fuse.write_file(remote.inode, handle, 0, b"draft"));
+                replacement_tx.send(result).unwrap();
+            })
+        };
+        let replacement_result = replacement_rx.recv_timeout(Duration::from_secs(2));
+        let (lock, wake) = &*gate;
+        *lock.lock().unwrap() = true;
+        wake.notify_all();
+        assert_eq!(local_result.unwrap().unwrap(), b"local");
+        assert_eq!(replacement_result.unwrap(), Ok(5));
+        local_reader.join().unwrap().unwrap();
+        replacement_writer.join().unwrap();
+        let remote_handle = remote_reader.join().unwrap().unwrap();
+        assert_eq!(
+            fuse.read_file(remote.inode, remote_handle, 0, 5).unwrap(),
+            b"draft"
+        );
+    }
+
+    #[test]
+    fn mounted_slow_remote_open_keeps_local_open_responsive() {
+        if std::env::var_os("ONEDRIVE_FUSE_SMOKE").is_none() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mountpoint = dir.path().join("mount");
+        fs::create_dir(&mountpoint).unwrap();
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let (started_tx, started_rx) = mpsc::channel();
+        let gate_for_loader = Arc::clone(&gate);
+        let loader: Arc<ContentLoader> = Arc::new(move |_| {
+            started_tx.send(()).unwrap();
+            let (lock, wake) = &*gate_for_loader;
+            let mut released = lock.lock().unwrap();
+            while !*released {
+                released = wake.wait(released).unwrap();
+            }
+            Err(io::ErrorKind::NotConnected.into())
+        });
+        let tree = VirtualTree::from_items("drive", "root", [file_item()]).unwrap();
+        let session = VirtualFuse::new_writable(
+            tree,
+            dir.path().join("cache"),
+            dir.path().join("drafts"),
+            10,
+            loader,
+        )
+        .mount(&mountpoint)
+        .unwrap();
+        fs::write(mountpoint.join("local.txt"), b"local").unwrap();
+        let remote_path = mountpoint.join("текст.txt");
+        let remote_reader = std::thread::spawn(move || fs::read(remote_path));
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (local_tx, local_rx) = mpsc::channel();
+        let local_path = mountpoint.join("local.txt");
+        let local_reader = std::thread::spawn(move || {
+            local_tx.send(fs::read(local_path)).unwrap();
+        });
+        let local_result = local_rx.recv_timeout(Duration::from_secs(2));
+        let (lock, wake) = &*gate;
+        *lock.lock().unwrap() = true;
+        wake.notify_all();
+        assert_eq!(local_result.unwrap().unwrap(), b"local");
+        local_reader.join().unwrap();
+        assert_eq!(
+            remote_reader.join().unwrap().unwrap_err().raw_os_error(),
+            Some(libc::ENETDOWN)
+        );
         session.umount_and_join().unwrap();
     }
 
