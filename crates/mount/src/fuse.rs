@@ -34,9 +34,10 @@ struct OpenFile {
     writable: bool,
 }
 
+#[derive(Clone)]
 enum OpenHandle {
-    Cached(CachedHandle),
-    Draft(DraftFile),
+    Cached(Arc<CachedHandle>),
+    Draft(Arc<DraftFile>),
     Pending(DraftIdentity),
 }
 
@@ -530,7 +531,7 @@ impl VirtualFuse {
         local.insert(inode, node.clone());
         let handle = self.insert_open(
             inode,
-            OpenHandle::Draft(draft),
+            OpenHandle::Draft(Arc::new(draft)),
             flags.acc_mode() != OpenAccMode::O_RDONLY,
         );
         Ok((node, handle))
@@ -1047,7 +1048,7 @@ impl VirtualFuse {
             if writable && flags.0 & libc::O_TRUNC != 0 {
                 draft.set_len(0).map_err(map_draft_error)?;
             }
-            return Ok(self.insert_open(inode, OpenHandle::Draft(draft), writable));
+            return Ok(self.insert_open(inode, OpenHandle::Draft(Arc::new(draft)), writable));
         }
         if node.item_id.starts_with("local:") {
             return Err(Errno::EIO);
@@ -1067,7 +1068,7 @@ impl VirtualFuse {
                     new_file: None,
                 })
                 .map_err(map_draft_error)?;
-            return Ok(self.insert_open(inode, OpenHandle::Draft(draft), true));
+            return Ok(self.insert_open(inode, OpenHandle::Draft(Arc::new(draft)), true));
         }
         if writable {
             let request = self
@@ -1086,7 +1087,7 @@ impl VirtualFuse {
             ));
         }
         let opened = self.open_cached(inode)?;
-        Ok(self.insert_open(inode, OpenHandle::Cached(opened), false))
+        Ok(self.insert_open(inode, OpenHandle::Cached(Arc::new(opened)), false))
     }
 
     fn open_cached(&self, inode: u64) -> Result<CachedHandle, Errno> {
@@ -1122,28 +1123,35 @@ impl VirtualFuse {
     }
 
     fn read_file(&self, inode: u64, handle: u64, offset: u64, size: u32) -> Result<Vec<u8>, Errno> {
-        let files = self.files.lock().unwrap();
-        let open = files
+        let opened = self
+            .files
+            .lock()
+            .unwrap()
             .get(&handle)
             .filter(|open| open.inode == inode)
-            .ok_or(Errno::EBADF)?;
+            .ok_or(Errno::EBADF)?
+            .handle
+            .clone();
         if self.draft_root.is_some()
             && let Some(node) = self.node(inode)
             && let Some(draft) = self.draft_for_node(&node)?
         {
             return read_draft(&draft, offset, size);
         }
-        if matches!(open.handle, OpenHandle::Pending(_)) {
+        if matches!(opened, OpenHandle::Pending(_)) {
             // The first read can wait for Graph. Keep other open handles usable
             // while the cache is populated, but serialize cache access with open().
-            drop(files);
             let _serialized = self.open_lock.lock().unwrap();
-            let files = self.files.lock().unwrap();
-            let open = files
+            let opened = self
+                .files
+                .lock()
+                .unwrap()
                 .get(&handle)
                 .filter(|open| open.inode == inode)
-                .ok_or(Errno::EBADF)?;
-            if let OpenHandle::Draft(draft) = &open.handle {
+                .ok_or(Errno::EBADF)?
+                .handle
+                .clone();
+            if let OpenHandle::Draft(draft) = &opened {
                 return read_draft(draft, offset, size);
             }
             if let Some(node) = self.node(inode)
@@ -1151,13 +1159,12 @@ impl VirtualFuse {
             {
                 return read_draft(&draft, offset, size);
             }
-            drop(files);
             return self
                 .open_cached(inode)?
                 .read(offset, size)
                 .map_err(|_| Errno::EIO);
         }
-        match &open.handle {
+        match &opened {
             OpenHandle::Cached(handle) => handle.read(offset, size).map_err(|_| Errno::EIO),
             OpenHandle::Draft(handle) => read_draft(handle, offset, size),
             OpenHandle::Pending(_) => unreachable!(),
@@ -1211,7 +1218,7 @@ impl VirtualFuse {
             .filter(|open| open.inode == inode && open.writable)
             .ok_or(Errno::EBADF)?;
         if matches!(open.handle, OpenHandle::Pending(_)) {
-            open.handle = OpenHandle::Draft(draft);
+            open.handle = OpenHandle::Draft(Arc::new(draft));
         }
         Ok(())
     }
@@ -1229,8 +1236,26 @@ impl VirtualFuse {
         let OpenHandle::Draft(draft) = &open.handle else {
             return Err(Errno::EROFS);
         };
+        let draft = Arc::clone(draft);
+        drop(files);
         let written = draft.write_at(offset, data).map_err(map_draft_error)?;
         u32::try_from(written).map_err(|_| Errno::EIO)
+    }
+
+    fn sync_file(&self, inode: u64, handle: u64) -> Result<(), Errno> {
+        let opened = self
+            .files
+            .lock()
+            .unwrap()
+            .get(&handle)
+            .filter(|open| open.inode == inode)
+            .ok_or(Errno::EBADF)?
+            .handle
+            .clone();
+        if let OpenHandle::Draft(draft) = opened {
+            draft.sync().map_err(map_draft_error)?;
+        }
+        Ok(())
     }
 
     fn truncate_file(&self, inode: u64, handle: Option<u64>, size: u64) -> Result<(), Errno> {
@@ -1255,6 +1280,8 @@ impl VirtualFuse {
             let OpenHandle::Draft(draft) = &open.handle else {
                 return Err(Errno::EROFS);
             };
+            let draft = Arc::clone(draft);
+            drop(files);
             draft.set_len(size).map_err(map_draft_error)
         })();
         if handle.is_none() {
@@ -1290,6 +1317,8 @@ impl VirtualFuse {
         let OpenHandle::Draft(draft) = &open.handle else {
             return Err(Errno::EROFS);
         };
+        let draft = Arc::clone(draft);
+        drop(files);
         draft
             .allocate(offset, length, mode == libc::FALLOC_FL_KEEP_SIZE)
             .map_err(|error| match error.raw_os_error() {
@@ -1754,17 +1783,9 @@ impl Filesystem for VirtualFuse {
         _lock_owner: fuser::LockOwner,
         reply: ReplyEmpty,
     ) {
-        let files = self.files.lock().unwrap();
-        match files.get(&handle.0).filter(|open| open.inode == inode.0) {
-            Some(OpenFile {
-                handle: OpenHandle::Draft(draft),
-                ..
-            }) => match draft.sync() {
-                Ok(()) => reply.ok(),
-                Err(_) => reply.error(Errno::EIO),
-            },
-            Some(_) => reply.ok(),
-            None => reply.error(Errno::EBADF),
+        match self.sync_file(inode.0, handle.0) {
+            Ok(()) => reply.ok(),
+            Err(error) => reply.error(error),
         }
     }
 
@@ -1776,17 +1797,9 @@ impl Filesystem for VirtualFuse {
         _datasync: bool,
         reply: ReplyEmpty,
     ) {
-        let files = self.files.lock().unwrap();
-        match files.get(&handle.0).filter(|open| open.inode == inode.0) {
-            Some(OpenFile {
-                handle: OpenHandle::Draft(draft),
-                ..
-            }) => match draft.sync() {
-                Ok(()) => reply.ok(),
-                Err(_) => reply.error(Errno::EIO),
-            },
-            Some(_) => reply.ok(),
-            None => reply.error(Errno::EBADF),
+        match self.sync_file(inode.0, handle.0) {
+            Ok(()) => reply.ok(),
+            Err(error) => reply.error(error),
         }
     }
 
@@ -3414,6 +3427,82 @@ mod tests {
         assert_eq!(local_result.unwrap().unwrap(), b"local");
         local_reader.join().unwrap();
         assert_eq!(remote_writer.join().unwrap(), Err(Errno::ENETDOWN));
+    }
+
+    #[test]
+    fn blocked_local_write_does_not_block_other_open_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let drafts = dir.path().join("drafts");
+        let tree = VirtualTree::from_items("drive", "root", []).unwrap();
+        let fuse = Arc::new(VirtualFuse::new_writable(
+            tree,
+            dir.path().join("cache"),
+            drafts.clone(),
+            10,
+            Arc::new(|_| unreachable!()),
+        ));
+        let (blocked, blocked_handle) = fuse
+            .create_file(ROOT_INODE, "blocked.txt", OpenFlags(libc::O_RDWR))
+            .unwrap();
+        let (other, other_handle) = fuse
+            .create_file(ROOT_INODE, "other.txt", OpenFlags(libc::O_RDWR))
+            .unwrap();
+        fuse.write_file(blocked.inode, blocked_handle, 0, b"blocked")
+            .unwrap();
+        fuse.write_file(other.inode, other_handle, 0, b"ready")
+            .unwrap();
+        let blocked_path = fs::read_dir(&drafts)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "data")
+                    && fs::read(path).unwrap() == b"blocked"
+            })
+            .unwrap();
+        let lock_file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(blocked_path)
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX) },
+            0
+        );
+        let (started_tx, started_rx) = mpsc::channel();
+        let (write_tx, write_rx) = mpsc::channel();
+        let writer = {
+            let fuse = Arc::clone(&fuse);
+            std::thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                write_tx
+                    .send(fuse.write_file(blocked.inode, blocked_handle, 0, b"updated"))
+                    .unwrap();
+            })
+        };
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(write_rx.recv_timeout(Duration::from_millis(100)).is_err());
+        let (read_tx, read_rx) = mpsc::channel();
+        let reader = {
+            let fuse = Arc::clone(&fuse);
+            std::thread::spawn(move || {
+                read_tx
+                    .send(fuse.read_file(other.inode, other_handle, 0, 5))
+                    .unwrap();
+            })
+        };
+        let read_result = read_rx.recv_timeout(Duration::from_secs(2));
+        assert_eq!(
+            unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_UN) },
+            0
+        );
+        assert_eq!(read_result.unwrap().unwrap(), b"ready");
+        assert_eq!(
+            write_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Ok(7)
+        );
+        writer.join().unwrap();
+        reader.join().unwrap();
     }
 
     #[test]
