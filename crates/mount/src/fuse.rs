@@ -35,6 +35,7 @@ pub struct PublishedVersionController {
     operations: Arc<Mutex<PublicationOperations>>,
     open_lock: Arc<Mutex<()>>,
     files: Arc<Mutex<HashMap<u64, OpenFile>>>,
+    local_files: Arc<Mutex<HashMap<u64, Node>>>,
 }
 
 #[derive(Default)]
@@ -77,11 +78,38 @@ impl PublishedVersionController {
         drive_id: &str,
         item_id: &str,
     ) -> io::Result<PublicationLease> {
-        if drive_id != self.drive_id || item_id.is_empty() || item_id.starts_with("local:") {
+        self.try_begin(drive_id, item_id, false)
+    }
+
+    /// Reserve a newly created file while its temporary ID is published.
+    pub fn try_begin_new(&self, drive_id: &str, item_id: &str) -> io::Result<PublicationLease> {
+        self.try_begin(drive_id, item_id, true)
+    }
+
+    fn try_begin(
+        &self,
+        drive_id: &str,
+        item_id: &str,
+        new_file: bool,
+    ) -> io::Result<PublicationLease> {
+        if drive_id != self.drive_id
+            || item_id.is_empty()
+            || item_id.starts_with("local:") != new_file
+        {
             return Err(io::ErrorKind::InvalidInput.into());
         }
         let inode = crate::stable_inode(drive_id, item_id);
         let _serialized = self.open_lock.lock().unwrap();
+        if new_file
+            && self
+                .local_files
+                .lock()
+                .unwrap()
+                .get(&inode)
+                .is_none_or(|node| node.item_id != item_id || node.kind != NodeKind::File)
+        {
+            return Err(io::ErrorKind::NotFound.into());
+        }
         let files = self.files.lock().unwrap();
         let mut operations = self.operations.lock().unwrap();
         if files.values().any(|open| open.inode == inode)
@@ -100,6 +128,44 @@ impl PublishedVersionController {
     pub fn publish_existing(&self, item_id: &str, etag: String, size: u64) {
         let inode = crate::stable_inode(&self.drive_id, item_id);
         self.versions.lock().unwrap().insert(inode, (etag, size));
+    }
+
+    /// Keep the mounted inode and path while replacing its temporary Graph ID.
+    pub fn publish_new(
+        &self,
+        lease: &PublicationLease,
+        local_id: &str,
+        remote_id: &str,
+        etag: String,
+        size: u64,
+    ) -> io::Result<()> {
+        let inode = crate::stable_inode(&self.drive_id, local_id);
+        if !local_id.starts_with("local:")
+            || remote_id.is_empty()
+            || remote_id.starts_with("local:")
+            || etag.is_empty()
+            || lease.inode != inode
+            || !Arc::ptr_eq(&lease.operations, &self.operations)
+        {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        let _serialized = self.open_lock.lock().unwrap();
+        let mut local = self.local_files.lock().unwrap();
+        if local
+            .values()
+            .any(|node| node.inode != inode && node.item_id == remote_id)
+            || local
+                .get(&inode)
+                .is_none_or(|node| node.item_id != local_id || node.kind != NodeKind::File)
+            || !self.operations.lock().unwrap().active.contains(&inode)
+        {
+            return Err(io::ErrorKind::WouldBlock.into());
+        }
+        let node = local.get_mut(&inode).unwrap();
+        node.item_id = remote_id.to_owned();
+        node.etag = Some(etag);
+        node.size = size;
+        Ok(())
     }
 }
 
@@ -125,7 +191,7 @@ pub struct VirtualFuse {
     open_lock: Arc<Mutex<()>>,
     download_lock: Mutex<()>,
     files: Arc<Mutex<HashMap<u64, OpenFile>>>,
-    local_files: Mutex<HashMap<u64, Node>>,
+    local_files: Arc<Mutex<HashMap<u64, Node>>>,
     remote_changes: Mutex<HashMap<u64, Mutation>>,
     published_versions: Arc<Mutex<HashMap<u64, (String, u64)>>>,
     publication_operations: Arc<Mutex<PublicationOperations>>,
@@ -150,7 +216,7 @@ impl VirtualFuse {
             open_lock: Arc::new(Mutex::new(())),
             download_lock: Mutex::new(()),
             files: Arc::new(Mutex::new(HashMap::new())),
-            local_files: Mutex::new(HashMap::new()),
+            local_files: Arc::new(Mutex::new(HashMap::new())),
             remote_changes: Mutex::new(HashMap::new()),
             published_versions: Arc::new(Mutex::new(HashMap::new())),
             publication_operations: Arc::new(Mutex::new(PublicationOperations::default())),
@@ -196,6 +262,7 @@ impl VirtualFuse {
             operations: Arc::clone(&self.publication_operations),
             open_lock: Arc::clone(&self.open_lock),
             files: Arc::clone(&self.files),
+            local_files: Arc::clone(&self.local_files),
         }
     }
 
@@ -274,17 +341,14 @@ impl VirtualFuse {
     }
 
     fn node(&self, inode: u64) -> Option<Node> {
-        let mut node = self
-            .local_files
-            .lock()
-            .unwrap()
-            .get(&inode)
-            .cloned()
-            .or_else(|| {
-                self.tree
-                    .getattr(inode)
-                    .and_then(|node| self.remote_node(node))
-            })?;
+        let local = self.local_files.lock().unwrap().get(&inode).cloned();
+        let mut node = if let Some(local) = local {
+            self.remote_node(&local)?
+        } else {
+            self.tree
+                .getattr(inode)
+                .and_then(|node| self.remote_node(node))?
+        };
         if let Some((etag, size)) = self.published_versions.lock().unwrap().get(&inode) {
             node.etag = Some(etag.clone());
             node.size = *size;
@@ -351,15 +415,20 @@ impl VirtualFuse {
         if name == ".." {
             return self.node(self.node(parent)?.parent_inode);
         }
-        if let Some(node) = self
+        let local_inodes: Vec<_> = self
             .local_files
             .lock()
             .unwrap()
             .values()
-            .find(|node| node.parent_inode == parent && node.name == name)
-            .cloned()
-        {
-            return Some(node);
+            .map(|node| node.inode)
+            .collect();
+        for inode in local_inodes {
+            if let Some(node) = self.node(inode)
+                && node.parent_inode == parent
+                && node.name == name
+            {
+                return Some(node);
+            }
         }
         let changes: Vec<_> = self
             .remote_changes
@@ -712,8 +781,8 @@ impl VirtualFuse {
         let mut local = self.local_files.lock().unwrap();
         let node = local
             .values()
+            .filter_map(|node| self.remote_node(node))
             .find(|node| node.parent_inode == parent && node.name == name)
-            .cloned()
             .or_else(|| self.tree.lookup(parent, name).cloned())
             .ok_or(Errno::ENOENT)?;
         if node.kind != NodeKind::File {
@@ -791,8 +860,8 @@ impl VirtualFuse {
         let mut local = self.local_files.lock().unwrap();
         let node = local
             .values()
+            .filter_map(|node| self.remote_node(node))
             .find(|node| node.parent_inode == parent && node.name == name)
-            .cloned()
             .or_else(|| self.tree.lookup(parent, name).cloned())
             .ok_or(Errno::ENOENT)?;
         if node.kind != NodeKind::Directory {
@@ -858,8 +927,8 @@ impl VirtualFuse {
         }
         let target = local
             .values()
+            .filter_map(|entry| self.remote_node(entry))
             .find(|entry| entry.parent_inode == new_parent && entry.name == new_name)
-            .cloned()
             .or_else(|| {
                 self.tree
                     .lookup(new_parent, new_name)
@@ -905,10 +974,7 @@ impl VirtualFuse {
                 .snapshot(source.identity())
                 .map_err(map_draft_error)?
                 .ok_or(Errno::EIO)?;
-            let request = self
-                .tree
-                .request_for_item(&target.item_id)
-                .map_err(map_open_error)?;
+            let request = self.request_for_node(&target).map_err(map_open_error)?;
             store
                 .begin_from_file(
                     DraftIdentity {
@@ -1151,11 +1217,16 @@ impl VirtualFuse {
                 ));
             }
         }
-        let local_entries: Vec<_> = self
+        let local_inodes: Vec<_> = self
             .local_files
             .lock()
             .unwrap()
             .values()
+            .map(|node| node.inode)
+            .collect();
+        let local_entries: Vec<_> = local_inodes
+            .into_iter()
+            .filter_map(|local_inode| self.node(local_inode))
             .filter(|node| node.parent_inode == inode)
             .map(|node| {
                 (
@@ -2207,6 +2278,193 @@ mod tests {
         fs::write(&path, b"later").unwrap();
         let revised = store.recover_item("drive", "file").unwrap().unwrap();
         assert_eq!(revised.identity().base_etag, "v2");
+        session.umount_and_join().unwrap();
+    }
+
+    #[test]
+    fn published_new_file_keeps_inode_and_uses_remote_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_root = dir.path().join("cache");
+        let draft_root = dir.path().join("drafts");
+        let tree = VirtualTree::from_items("drive", "root", []).unwrap();
+        let fuse = VirtualFuse::new_writable(
+            tree,
+            cache_root.clone(),
+            draft_root.clone(),
+            20,
+            Arc::new(|_| panic!("published file should be cached")),
+        );
+        let (local, handle) = fuse
+            .create_file(ROOT_INODE, "created.txt", OpenFlags(libc::O_RDWR))
+            .unwrap();
+        fuse.write_file(local.inode, handle, 0, b"created").unwrap();
+        let controller = fuse.published_version_controller();
+        assert_eq!(
+            controller
+                .try_begin_new("drive", &local.item_id)
+                .err()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        fuse.files.lock().unwrap().remove(&handle);
+        let lease = controller.try_begin_new("drive", &local.item_id).unwrap();
+        assert_eq!(
+            fuse.open_file(local.inode, OpenFlags(libc::O_RDONLY)),
+            Err(Errno::EBUSY)
+        );
+        let store = DraftStore::open(&draft_root).unwrap();
+        let draft = store
+            .recover_item("drive", &local.item_id)
+            .unwrap()
+            .unwrap();
+        let snapshot = store.snapshot(draft.identity()).unwrap().unwrap();
+        let request = DownloadRequest {
+            drive_id: "drive".into(),
+            item_id: "remote-created".into(),
+            etag: "v1".into(),
+            size: snapshot.size,
+        };
+        CacheStore::open(&cache_root, 20)
+            .unwrap()
+            .put(&request.cache_key(), snapshot.file.path(), snapshot.size)
+            .unwrap();
+        assert!(store.acknowledge(&snapshot).unwrap());
+        controller
+            .publish_new(&lease, &local.item_id, "remote-created", "v1".into(), 7)
+            .unwrap();
+        drop(lease);
+
+        let published = fuse.lookup_node(ROOT_INODE, "created.txt").unwrap();
+        assert_eq!(published.inode, local.inode);
+        assert_eq!(published.item_id, "remote-created");
+        assert_eq!(published.etag.as_deref(), Some("v1"));
+        let read = fuse
+            .open_file(local.inode, OpenFlags(libc::O_RDONLY))
+            .unwrap();
+        assert_eq!(
+            fuse.read_file(local.inode, read, 0, 10).unwrap(),
+            b"created"
+        );
+        fuse.files.lock().unwrap().remove(&read);
+        let write = fuse
+            .open_file(local.inode, OpenFlags(libc::O_RDWR))
+            .unwrap();
+        let files = fuse.files.lock().unwrap();
+        let OpenHandle::Pending(identity) = &files.get(&write).unwrap().handle else {
+            panic!("published file must use a remote write identity");
+        };
+        assert_eq!(identity.item_id, "remote-created");
+        assert_eq!(identity.base_etag, "v1");
+        drop(files);
+        fuse.files.lock().unwrap().remove(&write);
+
+        fuse.rename_local_file(
+            ROOT_INODE,
+            "created.txt",
+            ROOT_INODE,
+            "renamed.txt",
+            fuser::RenameFlags::empty(),
+        )
+        .unwrap();
+        assert!(fuse.lookup_node(ROOT_INODE, "created.txt").is_none());
+        assert_eq!(
+            fuse.lookup_node(ROOT_INODE, "renamed.txt").unwrap().item_id,
+            "remote-created"
+        );
+        assert!(
+            fuse.directory_entries(ROOT_INODE)
+                .unwrap()
+                .iter()
+                .any(|entry| entry.2 == "renamed.txt")
+        );
+        let deleted_inode = crate::stable_inode("drive", "local:second");
+        fuse.local_files.lock().unwrap().insert(
+            deleted_inode,
+            Node {
+                inode: deleted_inode,
+                parent_inode: ROOT_INODE,
+                item_id: "remote-second".into(),
+                name: "deleted.txt".into(),
+                kind: NodeKind::File,
+                size: 1,
+                etag: Some("v1".into()),
+                ctag: None,
+            },
+        );
+        fuse.remove_local_file(ROOT_INODE, "deleted.txt").unwrap();
+        assert!(fuse.lookup_node(ROOT_INODE, "deleted.txt").is_none());
+        assert!(
+            MutationStore::open(&draft_root)
+                .unwrap()
+                .list()
+                .unwrap()
+                .iter()
+                .any(|mutation| mutation.item_id == "remote-second")
+        );
+    }
+
+    #[test]
+    fn mounted_new_file_survives_publication_without_remount() {
+        if std::env::var_os("ONEDRIVE_FUSE_SMOKE").is_none() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mountpoint = dir.path().join("mount");
+        let cache_root = dir.path().join("cache");
+        let draft_root = dir.path().join("drafts");
+        fs::create_dir(&mountpoint).unwrap();
+        let tree = VirtualTree::from_items("drive", "root", []).unwrap();
+        let fuse = VirtualFuse::new_writable(
+            tree,
+            cache_root.clone(),
+            draft_root.clone(),
+            20,
+            Arc::new(|_| panic!("published file should be cached")),
+        );
+        let controller = fuse.published_version_controller();
+        let session = fuse.mount(&mountpoint).unwrap();
+        let path = mountpoint.join("created.txt");
+        fs::write(&path, b"created").unwrap();
+        let store = DraftStore::open(&draft_root).unwrap();
+        let local_id = store.list().unwrap()[0].item_id.clone();
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        let lease = loop {
+            match controller.try_begin_new("drive", &local_id) {
+                Ok(lease) => break lease,
+                Err(error)
+                    if error.kind() == io::ErrorKind::WouldBlock
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("closed new file did not become idle: {error}"),
+            }
+        };
+        let draft = store.recover_item("drive", &local_id).unwrap().unwrap();
+        let snapshot = store.snapshot(draft.identity()).unwrap().unwrap();
+        let request = DownloadRequest {
+            drive_id: "drive".into(),
+            item_id: "remote-created".into(),
+            etag: "v1".into(),
+            size: snapshot.size,
+        };
+        CacheStore::open(&cache_root, 20)
+            .unwrap()
+            .put(&request.cache_key(), snapshot.file.path(), snapshot.size)
+            .unwrap();
+        assert!(store.acknowledge(&snapshot).unwrap());
+        controller
+            .publish_new(&lease, &local_id, "remote-created", "v1".into(), 7)
+            .unwrap();
+        drop(lease);
+        assert_eq!(fs::read(&path).unwrap(), b"created");
+        fs::write(&path, b"later").unwrap();
+        let revised = store
+            .recover_item("drive", "remote-created")
+            .unwrap()
+            .unwrap();
+        assert_eq!(revised.identity().base_etag, "v1");
         session.umount_and_join().unwrap();
     }
 
