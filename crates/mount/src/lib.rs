@@ -211,6 +211,13 @@ impl VirtualTree {
 
     pub fn open_cached(&self, inode: u64, cache: &mut CacheStore) -> Result<FileHandle, OpenError> {
         let request = self.request_for_inode(inode)?;
+        Self::open_cached_request(request, cache)
+    }
+
+    pub fn open_cached_request(
+        request: DownloadRequest,
+        cache: &mut CacheStore,
+    ) -> Result<FileHandle, OpenError> {
         let size = request.size;
         let key = request.cache_key();
         let file = cache
