@@ -2072,7 +2072,10 @@ mod tests {
     #[test]
     fn publication_lease_requires_idle_file_and_blocks_fuse_mutations() {
         let dir = tempfile::tempdir().unwrap();
-        let tree = VirtualTree::from_items("drive", "root", [file_item()]).unwrap();
+        let mut other = file_item();
+        other.item_id = "other".into();
+        other.name = Some("other.txt".into());
+        let tree = VirtualTree::from_items("drive", "root", [file_item(), other]).unwrap();
         let fuse = VirtualFuse::new_writable(
             tree,
             dir.path().join("cache"),
@@ -2104,6 +2107,8 @@ mod tests {
         drop(opening);
 
         let lease = controller.try_begin_existing("drive", "file").unwrap();
+        let other_inode = fuse.lookup_node(ROOT_INODE, "other.txt").unwrap().inode;
+        assert!(fuse.open_file(other_inode, OpenFlags(libc::O_RDWR)).is_ok());
         assert_eq!(
             fuse.open_file(inode, OpenFlags(libc::O_RDWR)),
             Err(Errno::EBUSY)
@@ -2136,6 +2141,73 @@ mod tests {
         );
         drop(lease);
         assert!(fuse.open_file(inode, OpenFlags(libc::O_RDWR)).is_ok());
+    }
+
+    #[test]
+    fn mounted_file_reads_published_upload_without_remount() {
+        if std::env::var_os("ONEDRIVE_FUSE_SMOKE").is_none() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mountpoint = dir.path().join("mount");
+        let cache_root = dir.path().join("cache");
+        let draft_root = dir.path().join("drafts");
+        fs::create_dir(&mountpoint).unwrap();
+        let tree = VirtualTree::from_items("drive", "root", [file_item()]).unwrap();
+        let fuse = VirtualFuse::new_writable(
+            tree,
+            cache_root.clone(),
+            draft_root.clone(),
+            20,
+            Arc::new(|_| panic!("published content should be cached")),
+        );
+        let controller = fuse.published_version_controller();
+        let session = fuse.mount(&mountpoint).unwrap();
+        let path = mountpoint.join("текст.txt");
+        fs::write(&path, b"updated").unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        let lease = loop {
+            match controller.try_begin_existing("drive", "file") {
+                Ok(lease) => break lease,
+                Err(error)
+                    if error.kind() == io::ErrorKind::WouldBlock
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("closed file did not become idle: {error}"),
+            }
+        };
+        assert_eq!(
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .err()
+                .unwrap()
+                .raw_os_error(),
+            Some(libc::EBUSY)
+        );
+        let store = DraftStore::open(&draft_root).unwrap();
+        let draft = store.recover_item("drive", "file").unwrap().unwrap();
+        let snapshot = store.snapshot(draft.identity()).unwrap().unwrap();
+        let request = DownloadRequest {
+            drive_id: "drive".into(),
+            item_id: "file".into(),
+            etag: "v2".into(),
+            size: snapshot.size,
+        };
+        CacheStore::open(&cache_root, 20)
+            .unwrap()
+            .put(&request.cache_key(), snapshot.file.path(), snapshot.size)
+            .unwrap();
+        controller.publish_existing("file", "v2".into(), snapshot.size);
+        assert!(store.acknowledge(&snapshot).unwrap());
+        drop(lease);
+        assert_eq!(fs::read(&path).unwrap(), b"updated");
+        fs::write(&path, b"later").unwrap();
+        let revised = store.recover_item("drive", "file").unwrap().unwrap();
+        assert_eq!(revised.identity().base_etag, "v2");
+        session.umount_and_join().unwrap();
     }
 
     #[test]

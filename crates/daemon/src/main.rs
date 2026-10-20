@@ -20,7 +20,7 @@ use onedrive_mount::{DownloadRequest, VirtualTree};
 use onedrive_mount::{
     directory::DirectoryStore,
     draft::{DraftStore, DraftUploadFailure, DraftUploadIssue},
-    fuse::VirtualFuse,
+    fuse::{PublishedVersionController, VirtualFuse},
     mutation::{Mutation, MutationKind, MutationStatus, MutationStore},
     preflight,
 };
@@ -134,6 +134,7 @@ struct Daemon {
 struct MountedVirtualDrive {
     path: PathBuf,
     session: fuser::BackgroundSession,
+    published_versions: PublishedVersionController,
 }
 
 #[derive(Clone)]
@@ -510,7 +511,6 @@ impl Daemon {
             )
             || self.sync_paused().ok()?
             || self.sync.lock().unwrap().root().ok()?.is_some()
-            || self.virtual_mount.lock().unwrap().is_some()
             || self.mount_in_progress.load(Ordering::SeqCst)
             || self.scan_in_progress.load(Ordering::SeqCst)
             || self.download_in_progress.load(Ordering::SeqCst)
@@ -518,7 +518,13 @@ impl Daemon {
         {
             return None;
         }
-        let statuses = self.virtual_draft_statuses().ok()?;
+        let mounted = self.virtual_mount.lock().unwrap().is_some();
+        let statuses: Vec<_> = self
+            .virtual_draft_statuses()
+            .ok()?
+            .into_iter()
+            .filter(|draft| !mounted || draft.status != "ready-new")
+            .collect();
         let item_id = virtual_drafts::next_ready_item_id(&statuses, after)?;
         statuses
             .iter()
@@ -726,13 +732,6 @@ impl Daemon {
                 "virtual upload cannot run while folder sync is configured".to_owned(),
             ));
         }
-        if self.virtual_mount.lock().unwrap().is_some()
-            || self.mount_in_progress.load(Ordering::SeqCst)
-        {
-            return Err(zbus::fdo::Error::Failed(
-                "unmount the virtual drive before uploading its draft".to_owned(),
-            ));
-        }
         if self.scan_in_progress.load(Ordering::SeqCst)
             || self.download_in_progress.load(Ordering::SeqCst)
             || self
@@ -745,11 +744,9 @@ impl Daemon {
             ));
         }
         let _busy = BusyFlagGuard(Arc::clone(&self.upload_in_progress));
-        if self.virtual_mount.lock().unwrap().is_some()
-            || self.mount_in_progress.load(Ordering::SeqCst)
-        {
+        if self.mount_in_progress.load(Ordering::SeqCst) {
             return Err(zbus::fdo::Error::Failed(
-                "unmount the virtual drive before uploading its draft".to_owned(),
+                "mount operation is running".to_owned(),
             ));
         }
         let (drive_id, draft, resolved_parent) = {
@@ -817,6 +814,30 @@ impl Daemon {
                 ));
             }
             (drive_id, draft.identity().clone(), resolved_parent)
+        };
+        let mounted_controller = self
+            .virtual_mount
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|mounted| mounted.published_versions.clone());
+        let _publication = if let Some(controller) = &mounted_controller {
+            if draft.new_file.is_some() {
+                return Err(zbus::fdo::Error::Failed(
+                    "unmount the virtual drive before uploading a new file".to_owned(),
+                ));
+            }
+            Some(
+                controller
+                    .try_begin_existing(&drive_id, &item_id)
+                    .map_err(|_| {
+                        zbus::fdo::Error::Failed(
+                            "close the virtual file before uploading its draft".to_owned(),
+                        )
+                    })?,
+            )
+        } else {
+            None
         };
         let client_id = client_id().ok_or_else(|| {
             zbus::fdo::Error::Failed("ONEDRIVE_CLIENT_ID is not configured".to_owned())
@@ -935,6 +956,33 @@ impl Daemon {
             return Err(zbus::fdo::Error::Failed(
                 "catalog changed during upload; local draft retained".to_owned(),
             ));
+        }
+        if let Some(controller) = &mounted_controller {
+            let request = DownloadRequest {
+                drive_id: drive_id.clone(),
+                item_id: item_id.clone(),
+                etag: uploaded_etag.clone(),
+                size: snapshot.size,
+            };
+            let cache_root = state_directory()
+                .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?
+                .join("virtual-cache");
+            let snapshot_path = snapshot.file.path().to_path_buf();
+            tokio::task::spawn_blocking(move || {
+                CacheStore::open_waiting(&cache_root, VIRTUAL_CACHE_BYTES).and_then(|mut cache| {
+                    cache.put(&request.cache_key(), &snapshot_path, request.size)
+                })
+            })
+            .await
+            .map_err(|_| {
+                zbus::fdo::Error::Failed("cache task failed; local draft retained".to_owned())
+            })?
+            .map_err(|error| {
+                zbus::fdo::Error::Failed(format!(
+                    "uploaded file could not be cached; local draft retained: {error}"
+                ))
+            })?;
+            controller.publish_existing(&item_id, uploaded_etag.clone(), snapshot.size);
         }
         let root = state_directory()
             .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?
@@ -1088,6 +1136,7 @@ impl Daemon {
         });
         let fuse =
             VirtualFuse::new_writable(tree, cache_root, draft_root, VIRTUAL_CACHE_BYTES, loader);
+        let published_versions = fuse.published_version_controller();
         mount_record::write(&state_root, &mount_path).map_err(|error| {
             zbus::fdo::Error::Failed(format!("cannot record mount path: {error}"))
         })?;
@@ -1107,6 +1156,7 @@ impl Daemon {
         *self.virtual_mount.lock().unwrap() = Some(MountedVirtualDrive {
             path: mount_path.clone(),
             session,
+            published_versions,
         });
         Ok(mount_path.to_string_lossy().into_owned())
     }
@@ -1122,6 +1172,9 @@ impl Daemon {
             ));
         }
         let _guard = BusyFlagGuard(Arc::clone(&self.mount_in_progress));
+        if self.upload_in_progress.load(Ordering::SeqCst) {
+            return Err(zbus::fdo::Error::Failed("upload is running".to_owned()));
+        }
         let mounted =
             self.virtual_mount.lock().unwrap().take().ok_or_else(|| {
                 zbus::fdo::Error::Failed("virtual drive is not mounted".to_owned())
