@@ -14,7 +14,7 @@ use fuser::{
     ReplyWrite, Request,
 };
 use onedrive_cache::CacheStore;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -32,9 +32,70 @@ pub type ContentLoader = dyn Fn(&DownloadRequest) -> io::Result<()> + Send + Syn
 pub struct PublishedVersionController {
     drive_id: String,
     versions: Arc<Mutex<HashMap<u64, (String, u64)>>>,
+    operations: Arc<Mutex<PublicationOperations>>,
+    open_lock: Arc<Mutex<()>>,
+    files: Arc<Mutex<HashMap<u64, OpenFile>>>,
+}
+
+#[derive(Default)]
+struct PublicationOperations {
+    active: HashSet<u64>,
+    opening: HashMap<u64, usize>,
+}
+
+pub struct PublicationLease {
+    inode: u64,
+    operations: Arc<Mutex<PublicationOperations>>,
+}
+
+impl Drop for PublicationLease {
+    fn drop(&mut self) {
+        self.operations.lock().unwrap().active.remove(&self.inode);
+    }
+}
+
+struct OpeningFile {
+    inode: u64,
+    operations: Arc<Mutex<PublicationOperations>>,
+}
+
+impl Drop for OpeningFile {
+    fn drop(&mut self) {
+        let mut operations = self.operations.lock().unwrap();
+        let count = operations.opening.get_mut(&self.inode).unwrap();
+        *count -= 1;
+        if *count == 0 {
+            operations.opening.remove(&self.inode);
+        }
+    }
 }
 
 impl PublishedVersionController {
+    /// Reserve an idle existing file until its uploaded draft is acknowledged.
+    pub fn try_begin_existing(
+        &self,
+        drive_id: &str,
+        item_id: &str,
+    ) -> io::Result<PublicationLease> {
+        if drive_id != self.drive_id || item_id.is_empty() || item_id.starts_with("local:") {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        let inode = crate::stable_inode(drive_id, item_id);
+        let _serialized = self.open_lock.lock().unwrap();
+        let files = self.files.lock().unwrap();
+        let mut operations = self.operations.lock().unwrap();
+        if files.values().any(|open| open.inode == inode)
+            || operations.opening.contains_key(&inode)
+            || !operations.active.insert(inode)
+        {
+            return Err(io::ErrorKind::WouldBlock.into());
+        }
+        Ok(PublicationLease {
+            inode,
+            operations: Arc::clone(&self.operations),
+        })
+    }
+
     /// Make a verified upload visible to an already mounted filesystem.
     pub fn publish_existing(&self, item_id: &str, etag: String, size: u64) {
         let inode = crate::stable_inode(&self.drive_id, item_id);
@@ -61,12 +122,13 @@ pub struct VirtualFuse {
     draft_root: Option<PathBuf>,
     cache_limit: u64,
     loader: Arc<ContentLoader>,
-    open_lock: Mutex<()>,
+    open_lock: Arc<Mutex<()>>,
     download_lock: Mutex<()>,
-    files: Mutex<HashMap<u64, OpenFile>>,
+    files: Arc<Mutex<HashMap<u64, OpenFile>>>,
     local_files: Mutex<HashMap<u64, Node>>,
     remote_changes: Mutex<HashMap<u64, Mutation>>,
     published_versions: Arc<Mutex<HashMap<u64, (String, u64)>>>,
+    publication_operations: Arc<Mutex<PublicationOperations>>,
     next_handle: AtomicU64,
     uid: u32,
     gid: u32,
@@ -85,12 +147,13 @@ impl VirtualFuse {
             draft_root: None,
             cache_limit,
             loader,
-            open_lock: Mutex::new(()),
+            open_lock: Arc::new(Mutex::new(())),
             download_lock: Mutex::new(()),
-            files: Mutex::new(HashMap::new()),
+            files: Arc::new(Mutex::new(HashMap::new())),
             local_files: Mutex::new(HashMap::new()),
             remote_changes: Mutex::new(HashMap::new()),
             published_versions: Arc::new(Mutex::new(HashMap::new())),
+            publication_operations: Arc::new(Mutex::new(PublicationOperations::default())),
             next_handle: AtomicU64::new(1),
             uid: unsafe { libc::geteuid() },
             gid: unsafe { libc::getegid() },
@@ -130,6 +193,31 @@ impl VirtualFuse {
         PublishedVersionController {
             drive_id: self.tree.drive_id().to_owned(),
             versions: Arc::clone(&self.published_versions),
+            operations: Arc::clone(&self.publication_operations),
+            open_lock: Arc::clone(&self.open_lock),
+            files: Arc::clone(&self.files),
+        }
+    }
+
+    fn is_publishing(&self, inode: u64) -> bool {
+        self.publication_operations
+            .lock()
+            .unwrap()
+            .active
+            .contains(&inode)
+    }
+
+    fn mark_opening(&self, inode: u64) -> OpeningFile {
+        *self
+            .publication_operations
+            .lock()
+            .unwrap()
+            .opening
+            .entry(inode)
+            .or_default() += 1;
+        OpeningFile {
+            inode,
+            operations: Arc::clone(&self.publication_operations),
         }
     }
 
@@ -617,6 +705,7 @@ impl VirtualFuse {
     }
 
     fn remove_local_file(&self, parent: u64, name: &str) -> Result<(), Errno> {
+        let _serialized = self.open_lock.lock().unwrap();
         let Some(root) = &self.draft_root else {
             return Err(Errno::EROFS);
         };
@@ -629,6 +718,9 @@ impl VirtualFuse {
             .ok_or(Errno::ENOENT)?;
         if node.kind != NodeKind::File {
             return Err(Errno::EISDIR);
+        }
+        if self.is_publishing(node.inode) {
+            return Err(Errno::EBUSY);
         }
         if !node.item_id.starts_with("local:") {
             drop(local);
@@ -740,6 +832,7 @@ impl VirtualFuse {
         new_name: &str,
         flags: fuser::RenameFlags,
     ) -> Result<(), Errno> {
+        let _serialized = self.open_lock.lock().unwrap();
         let Some(root) = &self.draft_root else {
             return Err(Errno::EROFS);
         };
@@ -772,6 +865,13 @@ impl VirtualFuse {
                     .lookup(new_parent, new_name)
                     .and_then(|entry| self.remote_node(entry))
             });
+        if self.is_publishing(node.inode)
+            || target
+                .as_ref()
+                .is_some_and(|target| self.is_publishing(target.inode))
+        {
+            return Err(Errno::EBUSY);
+        }
         if let Some(target) = target.clone()
             && node.item_id.starts_with("local:")
             && target.kind == NodeKind::File
@@ -1085,6 +1185,9 @@ impl VirtualFuse {
             return Err(Errno::EROFS);
         }
         let _serialized = self.open_lock.lock().unwrap();
+        if self.is_publishing(inode) {
+            return Err(Errno::EBUSY);
+        }
         let node = self.node(inode).ok_or(Errno::ENOENT)?;
         if node.kind != NodeKind::File {
             return Err(Errno::EISDIR);
@@ -1125,9 +1228,13 @@ impl VirtualFuse {
                 true,
             ));
         }
+        let _opening = self.mark_opening(inode);
         drop(_serialized);
         let opened = self.open_cached(inode)?;
         let _serialized = self.open_lock.lock().unwrap();
+        if self.is_publishing(inode) {
+            return Err(Errno::EBUSY);
+        }
         let node = self.node(inode).ok_or(Errno::ENOENT)?;
         if let Some(draft) = self.draft_for_node(&node)? {
             return Ok(self.insert_open(inode, OpenHandle::Draft(Arc::new(draft)), false));
@@ -1960,6 +2067,75 @@ mod tests {
             panic!("expected a pending remote write");
         };
         assert_eq!(identity.base_etag, "v2");
+    }
+
+    #[test]
+    fn publication_lease_requires_idle_file_and_blocks_fuse_mutations() {
+        let dir = tempfile::tempdir().unwrap();
+        let tree = VirtualTree::from_items("drive", "root", [file_item()]).unwrap();
+        let fuse = VirtualFuse::new_writable(
+            tree,
+            dir.path().join("cache"),
+            dir.path().join("drafts"),
+            10,
+            Arc::new(|_| panic!("publication must not download")),
+        );
+        let inode = fuse.lookup_node(ROOT_INODE, "текст.txt").unwrap().inode;
+        let controller = fuse.published_version_controller();
+        let open = fuse.open_file(inode, OpenFlags(libc::O_RDWR)).unwrap();
+        assert_eq!(
+            controller
+                .try_begin_existing("drive", "file")
+                .err()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        fuse.files.lock().unwrap().remove(&open);
+        let opening = fuse.mark_opening(inode);
+        assert_eq!(
+            controller
+                .try_begin_existing("drive", "file")
+                .err()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        drop(opening);
+
+        let lease = controller.try_begin_existing("drive", "file").unwrap();
+        assert_eq!(
+            fuse.open_file(inode, OpenFlags(libc::O_RDWR)),
+            Err(Errno::EBUSY)
+        );
+        assert_eq!(
+            fuse.open_file(inode, OpenFlags(libc::O_RDONLY)),
+            Err(Errno::EBUSY)
+        );
+        assert_eq!(
+            fuse.remove_local_file(ROOT_INODE, "текст.txt"),
+            Err(Errno::EBUSY)
+        );
+        assert_eq!(
+            fuse.rename_local_file(
+                ROOT_INODE,
+                "текст.txt",
+                ROOT_INODE,
+                "moved.txt",
+                fuser::RenameFlags::empty(),
+            ),
+            Err(Errno::EBUSY)
+        );
+        assert_eq!(
+            controller
+                .try_begin_existing("drive", "file")
+                .err()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        drop(lease);
+        assert!(fuse.open_file(inode, OpenFlags(libc::O_RDWR)).is_ok());
     }
 
     #[test]
