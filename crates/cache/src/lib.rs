@@ -118,6 +118,15 @@ fn private_database(path: &Path) -> Result<(), CacheError> {
 
 impl CacheStore {
     pub fn open(root: &Path, max_bytes: u64) -> Result<Self, CacheError> {
+        Self::open_with_lock(root, max_bytes, libc::LOCK_EX | libc::LOCK_NB)
+    }
+
+    /// Wait for a short-lived cache writer instead of treating a busy cache as corrupt.
+    pub fn open_waiting(root: &Path, max_bytes: u64) -> Result<Self, CacheError> {
+        Self::open_with_lock(root, max_bytes, libc::LOCK_EX)
+    }
+
+    fn open_with_lock(root: &Path, max_bytes: u64, lock_mode: i32) -> Result<Self, CacheError> {
         private_directory(root)?;
         let objects = root.join("objects");
         private_directory(&objects)?;
@@ -132,7 +141,7 @@ impl CacheStore {
         if !lock.metadata()?.is_file() {
             return Err(CacheError::InvalidDirectory);
         }
-        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        if unsafe { libc::flock(lock.as_raw_fd(), lock_mode) } != 0 {
             return Err(io::Error::last_os_error().into());
         }
         let database = root.join("index.sqlite3");
@@ -428,6 +437,8 @@ impl CacheStore {
 mod tests {
     use super::*;
     use std::io::Read;
+    use std::sync::mpsc;
+    use std::time::Duration;
 
     fn key(item: &str, version: &str) -> CacheKey {
         CacheKey::new("drive", item, version).unwrap()
@@ -438,6 +449,23 @@ mod tests {
         let mut file = file;
         file.read_to_string(&mut value).unwrap();
         value
+    }
+
+    #[test]
+    fn waiting_open_resumes_after_cache_writer_releases_lock() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("cache");
+        let writer = CacheStore::open(&root, 10).unwrap();
+        assert!(CacheStore::open(&root, 10).is_err());
+        let (tx, rx) = mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            tx.send(CacheStore::open_waiting(&root, 10).is_ok())
+                .unwrap();
+        });
+        assert!(rx.recv_timeout(Duration::from_millis(100)).is_err());
+        drop(writer);
+        assert!(rx.recv_timeout(Duration::from_secs(2)).unwrap());
+        waiter.join().unwrap();
     }
 
     #[test]

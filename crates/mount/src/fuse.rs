@@ -48,7 +48,7 @@ pub struct VirtualFuse {
     cache_limit: u64,
     loader: Arc<ContentLoader>,
     open_lock: Mutex<()>,
-    cache_lock: Mutex<()>,
+    download_lock: Mutex<()>,
     files: Mutex<HashMap<u64, OpenFile>>,
     local_files: Mutex<HashMap<u64, Node>>,
     remote_changes: Mutex<HashMap<u64, Mutation>>,
@@ -71,7 +71,7 @@ impl VirtualFuse {
             cache_limit,
             loader,
             open_lock: Mutex::new(()),
-            cache_lock: Mutex::new(()),
+            download_lock: Mutex::new(()),
             files: Mutex::new(HashMap::new()),
             local_files: Mutex::new(HashMap::new()),
             remote_changes: Mutex::new(HashMap::new()),
@@ -1099,23 +1099,28 @@ impl VirtualFuse {
     }
 
     fn open_cached(&self, inode: u64) -> Result<CachedHandle, Errno> {
-        let _serialized = self.cache_lock.lock().unwrap();
-        let mut cache =
-            CacheStore::open(&self.cache_root, self.cache_limit).map_err(|_| Errno::EIO)?;
-        let opened = match self.tree.open_cached(inode, &mut cache) {
-            Ok(handle) => handle,
+        match self.cached_handle(inode) {
+            Ok(handle) => return Ok(handle),
+            Err(OpenError::NotCached(_)) => {}
+            Err(error) => return Err(map_open_error(error)),
+        }
+        // Only a cache miss waits for another download. Cached files remain
+        // available while Graph is transferring an unrelated file.
+        let _serialized = self.download_lock.lock().unwrap();
+        match self.cached_handle(inode) {
+            Ok(handle) => return Ok(handle),
             Err(OpenError::NotCached(request)) => {
-                drop(cache);
                 (self.loader)(&request).map_err(map_loader_error)?;
-                let mut cache =
-                    CacheStore::open(&self.cache_root, self.cache_limit).map_err(|_| Errno::EIO)?;
-                self.tree
-                    .open_cached(inode, &mut cache)
-                    .map_err(map_open_error)?
             }
             Err(error) => return Err(map_open_error(error)),
-        };
-        Ok(opened)
+        }
+        self.cached_handle(inode).map_err(map_open_error)
+    }
+
+    fn cached_handle(&self, inode: u64) -> Result<CachedHandle, OpenError> {
+        let mut cache = CacheStore::open_waiting(&self.cache_root, self.cache_limit)
+            .map_err(OpenError::Cache)?;
+        self.tree.open_cached(inode, &mut cache)
     }
 
     fn insert_open(&self, inode: u64, handle: OpenHandle, writable: bool) -> u64 {
@@ -3417,6 +3422,116 @@ mod tests {
             fuse.read_file(remote.inode, remote_handle, 0, 5).unwrap(),
             b"draft"
         );
+    }
+
+    #[test]
+    fn slow_download_does_not_block_cached_file_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_root = dir.path().join("cache");
+        let source = dir.path().join("source");
+        fs::write(&source, b"ready").unwrap();
+        let mut cached_item = file_item();
+        cached_item.item_id = "cached".into();
+        cached_item.name = Some("cached.txt".into());
+        let tree = VirtualTree::from_items("drive", "root", [file_item(), cached_item]).unwrap();
+        let cached_request = tree.request_for_item("cached").unwrap();
+        CacheStore::open(&cache_root, 10)
+            .unwrap()
+            .put(&cached_request.cache_key(), &source, 5)
+            .unwrap();
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let (started_tx, started_rx) = mpsc::channel();
+        let gate_for_loader = Arc::clone(&gate);
+        let loader: Arc<ContentLoader> = Arc::new(move |_| {
+            started_tx.send(()).unwrap();
+            let (lock, wake) = &*gate_for_loader;
+            let mut released = lock.lock().unwrap();
+            while !*released {
+                released = wake.wait(released).unwrap();
+            }
+            Err(io::ErrorKind::NotConnected.into())
+        });
+        let fuse = Arc::new(VirtualFuse::new(tree, cache_root, 10, loader));
+        let uncached = fuse.lookup_node(ROOT_INODE, "текст.txt").unwrap();
+        let remote_reader = {
+            let fuse = Arc::clone(&fuse);
+            std::thread::spawn(move || fuse.open_file(uncached.inode, OpenFlags(libc::O_RDONLY)))
+        };
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let cached = fuse.lookup_node(ROOT_INODE, "cached.txt").unwrap();
+        let (cached_tx, cached_rx) = mpsc::channel();
+        let cached_reader = {
+            let fuse = Arc::clone(&fuse);
+            std::thread::spawn(move || {
+                let result = fuse
+                    .open_file(cached.inode, OpenFlags(libc::O_RDONLY))
+                    .and_then(|handle| fuse.read_file(cached.inode, handle, 0, 5));
+                cached_tx.send(result).unwrap();
+            })
+        };
+        let cached_result = cached_rx.recv_timeout(Duration::from_secs(2));
+        let (lock, wake) = &*gate;
+        *lock.lock().unwrap() = true;
+        wake.notify_all();
+        assert_eq!(cached_result.unwrap().unwrap(), b"ready");
+        cached_reader.join().unwrap();
+        assert_eq!(remote_reader.join().unwrap(), Err(Errno::ENETDOWN));
+    }
+
+    #[test]
+    fn mounted_slow_download_keeps_cached_file_responsive() {
+        if std::env::var_os("ONEDRIVE_FUSE_SMOKE").is_none() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mountpoint = dir.path().join("mount");
+        fs::create_dir(&mountpoint).unwrap();
+        let cache_root = dir.path().join("cache");
+        let source = dir.path().join("source");
+        fs::write(&source, b"ready").unwrap();
+        let mut cached_item = file_item();
+        cached_item.item_id = "cached".into();
+        cached_item.name = Some("cached.txt".into());
+        let tree = VirtualTree::from_items("drive", "root", [file_item(), cached_item]).unwrap();
+        let cached_request = tree.request_for_item("cached").unwrap();
+        CacheStore::open(&cache_root, 10)
+            .unwrap()
+            .put(&cached_request.cache_key(), &source, 5)
+            .unwrap();
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let (started_tx, started_rx) = mpsc::channel();
+        let gate_for_loader = Arc::clone(&gate);
+        let loader: Arc<ContentLoader> = Arc::new(move |_| {
+            started_tx.send(()).unwrap();
+            let (lock, wake) = &*gate_for_loader;
+            let mut released = lock.lock().unwrap();
+            while !*released {
+                released = wake.wait(released).unwrap();
+            }
+            Err(io::ErrorKind::NotConnected.into())
+        });
+        let session = VirtualFuse::new(tree, cache_root, 10, loader)
+            .mount(&mountpoint)
+            .unwrap();
+        let uncached_path = mountpoint.join("текст.txt");
+        let remote_reader = std::thread::spawn(move || fs::read(uncached_path));
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let cached_path = mountpoint.join("cached.txt");
+        let (cached_tx, cached_rx) = mpsc::channel();
+        let cached_reader = std::thread::spawn(move || {
+            cached_tx.send(fs::read(cached_path)).unwrap();
+        });
+        let cached_result = cached_rx.recv_timeout(Duration::from_secs(2));
+        let (lock, wake) = &*gate;
+        *lock.lock().unwrap() = true;
+        wake.notify_all();
+        assert_eq!(cached_result.unwrap().unwrap(), b"ready");
+        cached_reader.join().unwrap();
+        assert_eq!(
+            remote_reader.join().unwrap().unwrap_err().raw_os_error(),
+            Some(libc::ENETDOWN)
+        );
+        session.umount_and_join().unwrap();
     }
 
     #[test]
