@@ -1148,8 +1148,9 @@ impl VirtualFuse {
             return read_draft(&draft, offset, size);
         }
         if matches!(opened, OpenHandle::Pending(_)) {
-            // The first read can wait for Graph. Keep other open handles usable
-            // while the cache is populated, but serialize cache access with open().
+            // A cold read may wait for Graph. Recheck the draft after the load:
+            // another handle may have replaced the remote version meanwhile.
+            let cached = self.open_cached(inode);
             let _serialized = self.open_lock.lock().unwrap();
             let opened = self
                 .files
@@ -1168,10 +1169,7 @@ impl VirtualFuse {
             {
                 return read_draft(&draft, offset, size);
             }
-            return self
-                .open_cached(inode)?
-                .read(offset, size)
-                .map_err(|_| Errno::EIO);
+            return cached?.read(offset, size).map_err(|_| Errno::EIO);
         }
         match &opened {
             OpenHandle::Cached(handle) => handle.read(offset, size).map_err(|_| Errno::EIO),
@@ -1194,9 +1192,6 @@ impl VirtualFuse {
                 return Err(Errno::EROFS);
             }
         }
-        // Cache downloads may wait for Graph. Serialize draft creation without
-        // holding the map of open handles so unrelated files remain responsive.
-        let _serialized = self.open_lock.lock().unwrap();
         let identity = {
             let files = self.files.lock().unwrap();
             let open = files
@@ -1211,12 +1206,30 @@ impl VirtualFuse {
         };
         let store = DraftStore::open(self.draft_root.as_ref().ok_or(Errno::EROFS)?)
             .map_err(map_draft_error)?;
+        // Download outside open_lock. A concurrent truncation can create a
+        // draft during the wait, so recover it before using the cached source.
+        let cached = if !empty && store.recover(&identity).map_err(map_draft_error)?.is_none() {
+            Some(self.open_cached(inode))
+        } else {
+            None
+        };
+        let _serialized = self.open_lock.lock().unwrap();
+        {
+            let files = self.files.lock().unwrap();
+            let open = files
+                .get(&handle)
+                .filter(|open| open.inode == inode && open.writable)
+                .ok_or(Errno::EBADF)?;
+            if matches!(open.handle, OpenHandle::Draft(_)) {
+                return Ok(());
+            }
+        }
         let draft = if let Some(existing) = store.recover(&identity).map_err(map_draft_error)? {
             existing
         } else if empty {
             store.begin_empty(identity).map_err(map_draft_error)?
         } else {
-            let cached = self.open_cached(inode)?;
+            let cached = cached.ok_or(Errno::EIO)??;
             store
                 .begin_from_file(identity, cached.source_file())
                 .map_err(map_draft_error)?
@@ -3459,7 +3472,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_remote_read_does_not_block_other_open_file() {
+    fn pending_remote_read_does_not_block_new_local_open() {
         let dir = tempfile::tempdir().unwrap();
         let gate = Arc::new((Mutex::new(false), Condvar::new()));
         let (started_tx, started_rx) = mpsc::channel();
@@ -3499,22 +3512,36 @@ mod tests {
         let local_reader = {
             let fuse = Arc::clone(&fuse);
             std::thread::spawn(move || {
+                let handle = fuse.open_file(local.inode, OpenFlags(libc::O_RDONLY));
                 local_tx
-                    .send(fuse.read_file(local.inode, local_handle, 0, 5))
+                    .send(handle.and_then(|handle| fuse.read_file(local.inode, handle, 0, 5)))
                     .unwrap();
             })
         };
         let local_result = local_rx.recv_timeout(Duration::from_secs(2));
+        let (replacement_tx, replacement_rx) = mpsc::channel();
+        let replacement_writer = {
+            let fuse = Arc::clone(&fuse);
+            std::thread::spawn(move || {
+                let result = fuse
+                    .open_file(remote.inode, OpenFlags(libc::O_WRONLY | libc::O_TRUNC))
+                    .and_then(|handle| fuse.write_file(remote.inode, handle, 0, b"draft"));
+                replacement_tx.send(result).unwrap();
+            })
+        };
+        let replacement_result = replacement_rx.recv_timeout(Duration::from_secs(2));
         let (lock, wake) = &*gate;
         *lock.lock().unwrap() = true;
         wake.notify_all();
         assert_eq!(local_result.unwrap().unwrap(), b"local");
+        assert_eq!(replacement_result.unwrap(), Ok(5));
         local_reader.join().unwrap();
-        assert_eq!(remote_reader.join().unwrap(), Err(Errno::ENETDOWN));
+        replacement_writer.join().unwrap();
+        assert_eq!(remote_reader.join().unwrap(), Ok(b"draft".to_vec()));
     }
 
     #[test]
-    fn pending_remote_write_does_not_block_other_open_file() {
+    fn pending_remote_write_does_not_block_new_local_open() {
         let dir = tempfile::tempdir().unwrap();
         let gate = Arc::new((Mutex::new(false), Condvar::new()));
         let (started_tx, started_rx) = mpsc::channel();
@@ -3554,18 +3581,36 @@ mod tests {
         let local_reader = {
             let fuse = Arc::clone(&fuse);
             std::thread::spawn(move || {
+                let handle = fuse.open_file(local.inode, OpenFlags(libc::O_RDONLY));
                 local_tx
-                    .send(fuse.read_file(local.inode, local_handle, 0, 5))
+                    .send(handle.and_then(|handle| fuse.read_file(local.inode, handle, 0, 5)))
                     .unwrap();
             })
         };
         let local_result = local_rx.recv_timeout(Duration::from_secs(2));
+        let (replacement_tx, replacement_rx) = mpsc::channel();
+        let replacement_writer = {
+            let fuse = Arc::clone(&fuse);
+            std::thread::spawn(move || {
+                let result = fuse
+                    .open_file(remote.inode, OpenFlags(libc::O_WRONLY | libc::O_TRUNC))
+                    .and_then(|handle| fuse.write_file(remote.inode, handle, 0, b"draft"));
+                replacement_tx.send(result).unwrap();
+            })
+        };
+        let replacement_result = replacement_rx.recv_timeout(Duration::from_secs(2));
         let (lock, wake) = &*gate;
         *lock.lock().unwrap() = true;
         wake.notify_all();
         assert_eq!(local_result.unwrap().unwrap(), b"local");
+        assert_eq!(replacement_result.unwrap(), Ok(5));
         local_reader.join().unwrap();
-        assert_eq!(remote_writer.join().unwrap(), Err(Errno::ENETDOWN));
+        replacement_writer.join().unwrap();
+        assert_eq!(remote_writer.join().unwrap(), Ok(1));
+        assert_eq!(
+            fuse.read_file(remote.inode, remote_handle, 0, 5).unwrap(),
+            b"dXaft"
+        );
     }
 
     #[test]
@@ -3645,7 +3690,7 @@ mod tests {
     }
 
     #[test]
-    fn mounted_pending_write_keeps_local_file_responsive() {
+    fn mounted_pending_write_keeps_local_open_responsive() {
         if std::env::var_os("ONEDRIVE_FUSE_SMOKE").is_none() {
             return;
         }
@@ -3675,7 +3720,6 @@ mod tests {
         .mount(&mountpoint)
         .unwrap();
         fs::write(mountpoint.join("local.txt"), b"local").unwrap();
-        let mut local = fs::File::open(mountpoint.join("local.txt")).unwrap();
         let remote = fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -3684,17 +3728,15 @@ mod tests {
         let remote_writer = std::thread::spawn(move || remote.write_at(b"X", 1));
         started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         let (local_tx, local_rx) = mpsc::channel();
+        let local_path = mountpoint.join("local.txt");
         let local_reader = std::thread::spawn(move || {
-            let mut bytes = [0_u8; 5];
-            local_tx
-                .send(local.read(&mut bytes).map(|count| (count, bytes)))
-                .unwrap();
+            local_tx.send(fs::read(local_path)).unwrap();
         });
         let local_result = local_rx.recv_timeout(Duration::from_secs(2));
         let (lock, wake) = &*gate;
         *lock.lock().unwrap() = true;
         wake.notify_all();
-        assert_eq!(local_result.unwrap().unwrap(), (5, *b"local"));
+        assert_eq!(local_result.unwrap().unwrap(), b"local");
         local_reader.join().unwrap();
         assert_eq!(
             remote_writer.join().unwrap().unwrap_err().raw_os_error(),
@@ -3704,7 +3746,7 @@ mod tests {
     }
 
     #[test]
-    fn mounted_pending_read_keeps_local_file_responsive() {
+    fn mounted_pending_read_keeps_local_open_responsive() {
         if std::env::var_os("ONEDRIVE_FUSE_SMOKE").is_none() {
             return;
         }
@@ -3734,7 +3776,6 @@ mod tests {
         .mount(&mountpoint)
         .unwrap();
         fs::write(mountpoint.join("local.txt"), b"local").unwrap();
-        let mut local = fs::File::open(mountpoint.join("local.txt")).unwrap();
         let remote_path = mountpoint.join("текст.txt");
         let remote_reader = std::thread::spawn(move || {
             let mut remote = fs::OpenOptions::new()
@@ -3747,17 +3788,15 @@ mod tests {
         });
         started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         let (local_tx, local_rx) = mpsc::channel();
+        let local_path = mountpoint.join("local.txt");
         let local_reader = std::thread::spawn(move || {
-            let mut bytes = [0_u8; 5];
-            local_tx
-                .send(local.read(&mut bytes).map(|count| (count, bytes)))
-                .unwrap();
+            local_tx.send(fs::read(local_path)).unwrap();
         });
         let local_result = local_rx.recv_timeout(Duration::from_secs(2));
         let (lock, wake) = &*gate;
         *lock.lock().unwrap() = true;
         wake.notify_all();
-        assert_eq!(local_result.unwrap().unwrap(), (5, *b"local"));
+        assert_eq!(local_result.unwrap().unwrap(), b"local");
         local_reader.join().unwrap();
         assert_eq!(
             remote_reader.join().unwrap().unwrap_err().raw_os_error(),
