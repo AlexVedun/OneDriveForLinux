@@ -28,6 +28,20 @@ const TTL: Duration = Duration::from_secs(1);
 
 pub type ContentLoader = dyn Fn(&DownloadRequest) -> io::Result<()> + Send + Sync;
 
+#[derive(Clone)]
+pub struct PublishedVersionController {
+    drive_id: String,
+    versions: Arc<Mutex<HashMap<u64, (String, u64)>>>,
+}
+
+impl PublishedVersionController {
+    /// Make a verified upload visible to an already mounted filesystem.
+    pub fn publish_existing(&self, item_id: &str, etag: String, size: u64) {
+        let inode = crate::stable_inode(&self.drive_id, item_id);
+        self.versions.lock().unwrap().insert(inode, (etag, size));
+    }
+}
+
 struct OpenFile {
     inode: u64,
     handle: OpenHandle,
@@ -52,6 +66,7 @@ pub struct VirtualFuse {
     files: Mutex<HashMap<u64, OpenFile>>,
     local_files: Mutex<HashMap<u64, Node>>,
     remote_changes: Mutex<HashMap<u64, Mutation>>,
+    published_versions: Arc<Mutex<HashMap<u64, (String, u64)>>>,
     next_handle: AtomicU64,
     uid: u32,
     gid: u32,
@@ -75,6 +90,7 @@ impl VirtualFuse {
             files: Mutex::new(HashMap::new()),
             local_files: Mutex::new(HashMap::new()),
             remote_changes: Mutex::new(HashMap::new()),
+            published_versions: Arc::new(Mutex::new(HashMap::new())),
             next_handle: AtomicU64::new(1),
             uid: unsafe { libc::geteuid() },
             gid: unsafe { libc::getegid() },
@@ -108,6 +124,13 @@ impl VirtualFuse {
         // A cold file open can wait for Graph. Keep directory requests responsive meanwhile.
         options.n_threads = Some(4);
         fuser::spawn_mount(self, mountpoint, &options)
+    }
+
+    pub fn published_version_controller(&self) -> PublishedVersionController {
+        PublishedVersionController {
+            drive_id: self.tree.drive_id().to_owned(),
+            versions: Arc::clone(&self.published_versions),
+        }
     }
 
     fn attr(&self, node: &Node) -> Result<FileAttr, Errno> {
@@ -163,7 +186,8 @@ impl VirtualFuse {
     }
 
     fn node(&self, inode: u64) -> Option<Node> {
-        self.local_files
+        let mut node = self
+            .local_files
             .lock()
             .unwrap()
             .get(&inode)
@@ -172,7 +196,26 @@ impl VirtualFuse {
                 self.tree
                     .getattr(inode)
                     .and_then(|node| self.remote_node(node))
-            })
+            })?;
+        if let Some((etag, size)) = self.published_versions.lock().unwrap().get(&inode) {
+            node.etag = Some(etag.clone());
+            node.size = *size;
+        }
+        Some(node)
+    }
+
+    fn request_for_node(&self, node: &Node) -> Result<DownloadRequest, OpenError> {
+        let etag = node
+            .etag
+            .clone()
+            .filter(|etag| !etag.is_empty())
+            .ok_or(OpenError::MissingVersion)?;
+        Ok(DownloadRequest {
+            drive_id: self.tree.drive_id().to_owned(),
+            item_id: node.item_id.clone(),
+            etag,
+            size: node.size,
+        })
     }
 
     fn remote_node(&self, node: &Node) -> Option<Node> {
@@ -250,12 +293,12 @@ impl VirtualFuse {
                 return self
                     .tree
                     .getattr(crate::stable_inode(&mutation.drive_id, &mutation.item_id))
-                    .and_then(|node| self.remote_node(node));
+                    .and_then(|node| self.node(node.inode));
             }
         }
         self.tree
             .lookup(parent, name)
-            .and_then(|node| self.remote_node(node))
+            .and_then(|node| self.node(node.inode))
             .filter(|node| node.parent_inode == parent && node.name == name)
     }
 
@@ -1056,10 +1099,7 @@ impl VirtualFuse {
             return Err(Errno::EIO);
         }
         if writable && flags.0 & libc::O_TRUNC != 0 {
-            let request = self
-                .tree
-                .request_for_item(&node.item_id)
-                .map_err(map_open_error)?;
+            let request = self.request_for_node(&node).map_err(map_open_error)?;
             let store =
                 DraftStore::open(self.draft_root.as_ref().unwrap()).map_err(map_draft_error)?;
             let draft = store
@@ -1073,10 +1113,7 @@ impl VirtualFuse {
             return Ok(self.insert_open(inode, OpenHandle::Draft(Arc::new(draft)), true));
         }
         if writable {
-            let request = self
-                .tree
-                .request_for_item(&node.item_id)
-                .map_err(map_open_error)?;
+            let request = self.request_for_node(&node).map_err(map_open_error)?;
             return Ok(self.insert_open(
                 inode,
                 OpenHandle::Pending(DraftIdentity {
@@ -1120,7 +1157,11 @@ impl VirtualFuse {
     fn cached_handle(&self, inode: u64) -> Result<CachedHandle, OpenError> {
         let mut cache = CacheStore::open_waiting(&self.cache_root, self.cache_limit)
             .map_err(OpenError::Cache)?;
-        self.tree.open_cached(inode, &mut cache)
+        let node = self.node(inode).ok_or(OpenError::MissingFile)?;
+        if node.kind != NodeKind::File {
+            return Err(OpenError::IsDirectory);
+        }
+        VirtualTree::open_cached_request(self.request_for_node(&node)?, &mut cache)
     }
 
     fn insert_open(&self, inode: u64, handle: OpenHandle, writable: bool) -> u64 {
@@ -1870,6 +1911,55 @@ mod tests {
             modified: None,
             deleted: false,
         }
+    }
+
+    #[test]
+    fn published_version_replaces_mounted_metadata_and_cache_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_root = dir.path().join("cache");
+        let old_source = dir.path().join("old");
+        let new_source = dir.path().join("new");
+        fs::write(&old_source, b"hello").unwrap();
+        fs::write(&new_source, b"updated").unwrap();
+        let tree = VirtualTree::from_items("drive", "root", [file_item()]).unwrap();
+        let old_request = tree.request_for_item("file").unwrap();
+        let mut new_request = old_request.clone();
+        new_request.etag = "v2".into();
+        new_request.size = 7;
+        let mut cache = CacheStore::open(&cache_root, 20).unwrap();
+        cache.put(&old_request.cache_key(), &old_source, 5).unwrap();
+        drop(cache);
+        let fuse = VirtualFuse::new_writable(
+            tree,
+            cache_root,
+            dir.path().join("drafts"),
+            20,
+            Arc::new(|_| panic!("both versions are already cached")),
+        );
+        let inode = fuse.lookup_node(ROOT_INODE, "текст.txt").unwrap().inode;
+        let old = fuse.open_file(inode, OpenFlags(libc::O_RDONLY)).unwrap();
+        assert_eq!(fuse.read_file(inode, old, 0, 10).unwrap(), b"hello");
+        fuse.files.lock().unwrap().remove(&old);
+
+        CacheStore::open(&fuse.cache_root, 20)
+            .unwrap()
+            .put(&new_request.cache_key(), &new_source, 7)
+            .unwrap();
+
+        let controller = fuse.published_version_controller();
+        controller.publish_existing("file", "v2".into(), 7);
+        let node = fuse.lookup_node(ROOT_INODE, "текст.txt").unwrap();
+        assert_eq!(node.etag.as_deref(), Some("v2"));
+        assert_eq!(fuse.attr(&node).unwrap().size, 7);
+        let new = fuse.open_file(inode, OpenFlags(libc::O_RDONLY)).unwrap();
+        assert_eq!(fuse.read_file(inode, new, 0, 10).unwrap(), b"updated");
+        fuse.files.lock().unwrap().remove(&new);
+        let writable = fuse.open_file(inode, OpenFlags(libc::O_RDWR)).unwrap();
+        let files = fuse.files.lock().unwrap();
+        let OpenHandle::Pending(identity) = &files.get(&writable).unwrap().handle else {
+            panic!("expected a pending remote write");
+        };
+        assert_eq!(identity.base_etag, "v2");
     }
 
     #[test]
