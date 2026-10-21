@@ -170,6 +170,7 @@ impl PublishedVersionController {
         if !local_id.starts_with("local:")
             || remote_id.is_empty()
             || remote_id.starts_with("local:")
+            || remote_id.starts_with("local-dir:")
             || etag.is_empty()
             || lease.inode != inode
             || !Arc::ptr_eq(&lease.operations, &self.operations)
@@ -221,8 +222,8 @@ impl PublishedVersionController {
         Ok(())
     }
 
-    /// Give a mounted local directory its Graph identity without moving its inode.
-    pub fn publish_directory(
+    /// Check the mounted directory before storing the verified Graph mapping.
+    pub fn validate_directory(
         &self,
         lease: &PublicationLease,
         local_id: &str,
@@ -233,12 +234,38 @@ impl PublishedVersionController {
         if !local_id.starts_with("local-dir:")
             || remote_id.is_empty()
             || remote_id.starts_with("local:")
+            || remote_id.starts_with("local-dir:")
             || etag.is_empty()
             || lease.inode != inode
             || !Arc::ptr_eq(&lease.operations, &self.operations)
         {
             return Err(io::ErrorKind::InvalidInput.into());
         }
+        let _serialized = self.open_lock.lock().unwrap();
+        let local = self.local_files.lock().unwrap();
+        if local
+            .values()
+            .any(|node| node.inode != inode && node.item_id == remote_id)
+            || local
+                .get(&inode)
+                .is_none_or(|node| node.item_id != local_id || node.kind != NodeKind::Directory)
+            || !self.operations.lock().unwrap().active.contains(&inode)
+        {
+            return Err(io::ErrorKind::WouldBlock.into());
+        }
+        Ok(())
+    }
+
+    /// Give a mounted local directory its Graph identity without moving its inode.
+    pub fn publish_directory(
+        &self,
+        lease: &PublicationLease,
+        local_id: &str,
+        remote_id: &str,
+        etag: &str,
+    ) -> io::Result<()> {
+        self.validate_directory(lease, local_id, remote_id, etag)?;
+        let inode = crate::stable_inode(&self.drive_id, local_id);
         let _serialized = self.open_lock.lock().unwrap();
         let mut local = self.local_files.lock().unwrap();
         if local

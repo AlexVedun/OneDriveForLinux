@@ -137,8 +137,21 @@ impl DirectoryStore {
     }
 
     pub fn mark_uploaded(&self, directory: &LocalDirectory, remote_id: &str) -> io::Result<()> {
-        if directory.remote_id.is_some() || remote_id.is_empty() {
+        if directory.remote_id.is_some()
+            || remote_id.is_empty()
+            || remote_id.starts_with("local:")
+            || remote_id.starts_with("local-dir:")
+        {
             return Err(io::Error::from(io::ErrorKind::InvalidInput));
+        }
+        if self
+            .list()?
+            .into_iter()
+            .find(|current| current.item_id == directory.item_id)
+            .as_ref()
+            != Some(directory)
+        {
+            return Err(io::Error::from(io::ErrorKind::WouldBlock));
         }
         let mut uploaded = directory.clone();
         uploaded.remote_id = Some(remote_id.to_owned());
@@ -232,6 +245,31 @@ mod tests {
         assert!(store.remove(&uploaded).is_err());
         store.mark_seen(&uploaded).unwrap();
         assert!(store.list().unwrap()[0].seen_remote);
+    }
+
+    #[test]
+    fn upload_mapping_does_not_overwrite_a_moved_or_removed_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let store = DirectoryStore::open(root.path()).unwrap();
+        let original = store.create("drive", "root", "folder").unwrap();
+        store.relocate(&original, "root", "renamed").unwrap();
+        assert_eq!(
+            store
+                .mark_uploaded(&original, "remote-folder")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        let moved = store.list().unwrap().remove(0);
+        assert_eq!(moved.name, "renamed");
+        store.remove(&moved).unwrap();
+        assert_eq!(
+            store
+                .mark_uploaded(&original, "remote-folder")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
     }
 
     #[test]
