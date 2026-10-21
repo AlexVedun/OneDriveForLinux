@@ -110,6 +110,8 @@ pub struct DraftUploadFailure {
     pub identity: DraftIdentity,
     pub issue: DraftUploadIssue,
     pub attempted_at_unix: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_status: Option<u16>,
 }
 
 impl std::fmt::Debug for DraftUploadCheckpoint {
@@ -1008,6 +1010,7 @@ mod tests {
             identity: identity(),
             issue: DraftUploadIssue::TransferFailed,
             attempted_at_unix: 123,
+            http_status: Some(400),
         };
         store.save_upload_failure(&failure).unwrap();
         let path = store.failure_path(&identity());
@@ -1020,6 +1023,10 @@ mod tests {
             reopened.upload_failure(&identity()).unwrap(),
             Some(failure.clone())
         );
+        let mut old_record = serde_json::to_value(&failure).unwrap();
+        old_record.as_object_mut().unwrap().remove("http_status");
+        let decoded: DraftUploadFailure = serde_json::from_value(old_record).unwrap();
+        assert_eq!(decoded.http_status, None);
         reopened.clear_upload_failure(&identity()).unwrap();
         assert!(reopened.upload_failure(&identity()).unwrap().is_none());
         assert_eq!(reopened.list().unwrap(), vec![identity()]);

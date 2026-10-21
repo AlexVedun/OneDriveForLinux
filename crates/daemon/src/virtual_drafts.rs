@@ -9,6 +9,7 @@ pub struct VirtualDraftStatus {
     pub name: Option<String>,
     pub status: &'static str,
     pub last_upload_issue: Option<DraftUploadIssue>,
+    pub last_upload_http_status: Option<u16>,
 }
 
 pub fn next_ready_item_id<'a>(
@@ -55,6 +56,7 @@ pub fn classify(
         name: item.and_then(|item| item.name.clone()),
         status,
         last_upload_issue: None,
+        last_upload_http_status: None,
     }
 }
 

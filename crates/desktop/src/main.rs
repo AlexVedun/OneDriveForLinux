@@ -58,6 +58,7 @@ struct UiVirtualDraft {
     name: Option<String>,
     status: String,
     last_upload_issue: Option<String>,
+    last_upload_http_status: Option<u16>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -541,9 +542,13 @@ fn virtual_drafts_text(drafts: &[UiVirtualDraft]) -> String {
             virtual_draft_status_label(&draft.status)
         ));
         if let Some(issue) = &draft.last_upload_issue {
+            let http_status = draft
+                .last_upload_http_status
+                .map(|status| format!(" (HTTP {status})"))
+                .unwrap_or_default();
             lines.push(format!(
-                "Предыдущая фоновая отправка: {}",
-                virtual_draft_upload_issue_label(issue)
+                "Предыдущая фоновая отправка: {}{http_status}",
+                virtual_draft_upload_issue_label(issue),
             ));
         }
     }
@@ -1508,9 +1513,13 @@ fn present_virtual_drafts_dialog(
         state.set_xalign(0.0);
         row.append(&state);
         if let Some(issue) = &draft.last_upload_issue {
+            let http_status = draft
+                .last_upload_http_status
+                .map(|status| format!(" (HTTP {status})"))
+                .unwrap_or_default();
             let warning = gtk::Label::new(Some(&format!(
-                "Предыдущая фоновая отправка: {}. Черновик сохранён локально.",
-                virtual_draft_upload_issue_label(issue)
+                "Предыдущая фоновая отправка: {}{http_status}. Черновик сохранён локально.",
+                virtual_draft_upload_issue_label(issue),
             )));
             warning.set_xalign(0.0);
             warning.set_wrap(true);
@@ -2451,7 +2460,7 @@ mod tests {
     fn virtual_drafts_show_conflicts_and_manual_upload_summary() {
         let drafts: Vec<UiVirtualDraft> = serde_json::from_str(
             r#"[
-              {"drive_id":"drive","item_id":"1","name":"note.txt","status":"ready","last_upload_issue":"transfer-failed"},
+              {"drive_id":"drive","item_id":"1","name":"note.txt","status":"ready","last_upload_issue":"transfer-failed","last_upload_http_status":400},
               {"drive_id":"drive","item_id":"2","name":null,"status":"remote-changed"}
             ]"#,
         )
@@ -2459,7 +2468,7 @@ mod tests {
         let text = virtual_drafts_text(&drafts);
         assert!(text.contains("Локально сохранено: 2 · требуют внимания: 1"));
         assert!(text.contains("ошибки отправки: 1"));
-        assert!(text.contains("Предыдущая фоновая отправка: ошибка передачи"));
+        assert!(text.contains("Предыдущая фоновая отправка: ошибка передачи (HTTP 400)"));
         assert!(text.contains("note.txt (drive) — готов к отправке; версия в каталоге совпадает"));
         assert!(text.contains("2 (drive) — версия в каталоге изменилась"));
         assert!(text.contains("Откройте полный список для проверки"));
