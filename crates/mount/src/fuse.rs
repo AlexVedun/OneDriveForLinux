@@ -36,6 +36,7 @@ pub struct PublishedVersionController {
     open_lock: Arc<Mutex<()>>,
     files: Arc<Mutex<HashMap<u64, OpenFile>>>,
     local_files: Arc<Mutex<HashMap<u64, Node>>>,
+    directory_aliases: Arc<Mutex<HashMap<String, u64>>>,
 }
 
 #[derive(Default)]
@@ -84,6 +85,33 @@ impl PublishedVersionController {
     /// Reserve a newly created file while its temporary ID is published.
     pub fn try_begin_new(&self, drive_id: &str, item_id: &str) -> io::Result<PublicationLease> {
         self.try_begin(drive_id, item_id, true)
+    }
+
+    /// Reserve a local directory while Graph creates its remote counterpart.
+    pub fn try_begin_directory(
+        &self,
+        drive_id: &str,
+        item_id: &str,
+    ) -> io::Result<PublicationLease> {
+        if drive_id != self.drive_id || !item_id.starts_with("local-dir:") {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        let inode = crate::stable_inode(drive_id, item_id);
+        let _serialized = self.open_lock.lock().unwrap();
+        if self
+            .local_files
+            .lock()
+            .unwrap()
+            .get(&inode)
+            .is_none_or(|node| node.item_id != item_id || node.kind != NodeKind::Directory)
+            || !self.operations.lock().unwrap().active.insert(inode)
+        {
+            return Err(io::ErrorKind::WouldBlock.into());
+        }
+        Ok(PublicationLease {
+            inode,
+            operations: Arc::clone(&self.operations),
+        })
     }
 
     fn try_begin(
@@ -192,6 +220,46 @@ impl PublishedVersionController {
         node.size = size;
         Ok(())
     }
+
+    /// Give a mounted local directory its Graph identity without moving its inode.
+    pub fn publish_directory(
+        &self,
+        lease: &PublicationLease,
+        local_id: &str,
+        remote_id: &str,
+        etag: &str,
+    ) -> io::Result<()> {
+        let inode = crate::stable_inode(&self.drive_id, local_id);
+        if !local_id.starts_with("local-dir:")
+            || remote_id.is_empty()
+            || remote_id.starts_with("local:")
+            || etag.is_empty()
+            || lease.inode != inode
+            || !Arc::ptr_eq(&lease.operations, &self.operations)
+        {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        let _serialized = self.open_lock.lock().unwrap();
+        let mut local = self.local_files.lock().unwrap();
+        if local
+            .values()
+            .any(|node| node.inode != inode && node.item_id == remote_id)
+            || local
+                .get(&inode)
+                .is_none_or(|node| node.item_id != local_id || node.kind != NodeKind::Directory)
+            || !self.operations.lock().unwrap().active.contains(&inode)
+        {
+            return Err(io::ErrorKind::WouldBlock.into());
+        }
+        let node = local.get_mut(&inode).unwrap();
+        node.item_id = remote_id.to_owned();
+        node.etag = Some(etag.to_owned());
+        self.directory_aliases
+            .lock()
+            .unwrap()
+            .insert(remote_id.to_owned(), inode);
+        Ok(())
+    }
 }
 
 struct OpenFile {
@@ -217,6 +285,7 @@ pub struct VirtualFuse {
     download_lock: Mutex<()>,
     files: Arc<Mutex<HashMap<u64, OpenFile>>>,
     local_files: Arc<Mutex<HashMap<u64, Node>>>,
+    directory_aliases: Arc<Mutex<HashMap<String, u64>>>,
     remote_changes: Mutex<HashMap<u64, Mutation>>,
     published_versions: Arc<Mutex<HashMap<u64, (String, u64)>>>,
     publication_operations: Arc<Mutex<PublicationOperations>>,
@@ -242,6 +311,7 @@ impl VirtualFuse {
             download_lock: Mutex::new(()),
             files: Arc::new(Mutex::new(HashMap::new())),
             local_files: Arc::new(Mutex::new(HashMap::new())),
+            directory_aliases: Arc::new(Mutex::new(HashMap::new())),
             remote_changes: Mutex::new(HashMap::new()),
             published_versions: Arc::new(Mutex::new(HashMap::new())),
             publication_operations: Arc::new(Mutex::new(PublicationOperations::default())),
@@ -288,6 +358,7 @@ impl VirtualFuse {
             open_lock: Arc::clone(&self.open_lock),
             files: Arc::clone(&self.files),
             local_files: Arc::clone(&self.local_files),
+            directory_aliases: Arc::clone(&self.directory_aliases),
         }
     }
 
@@ -395,6 +466,17 @@ impl VirtualFuse {
         })
     }
 
+    fn remote_parent_id(&self, parent: &Node) -> Result<String, Errno> {
+        if !parent.item_id.starts_with("local-dir:") {
+            return Ok(parent.item_id.clone());
+        }
+        let root = self.draft_root.as_ref().ok_or(Errno::EROFS)?;
+        DirectoryStore::open(root)
+            .and_then(|store| store.remote_parent_id(&parent.item_id))
+            .map_err(map_draft_error)?
+            .ok_or(Errno::EINVAL)
+    }
+
     fn remote_node(&self, node: &Node) -> Option<Node> {
         let mutation = self
             .remote_changes
@@ -413,7 +495,14 @@ impl VirtualFuse {
                     if target_parent_id == self.tree.getattr(crate::ROOT_INODE)?.item_id {
                         crate::ROOT_INODE
                     } else {
-                        crate::stable_inode(self.tree.drive_id(), &target_parent_id)
+                        self.directory_aliases
+                            .lock()
+                            .unwrap()
+                            .get(&target_parent_id)
+                            .copied()
+                            .unwrap_or_else(|| {
+                                crate::stable_inode(self.tree.drive_id(), &target_parent_id)
+                            })
                     };
                 moved.name = target_name;
                 Some(moved)
@@ -703,6 +792,12 @@ impl VirtualFuse {
                 },
             );
         }
+        let mut aliases = self.directory_aliases.lock().unwrap();
+        for (local_id, remote_id) in mappings {
+            if let Some(node) = local.values().find(|node| node.item_id == local_id) {
+                aliases.insert(remote_id, node.inode);
+            }
+        }
         Ok(())
     }
 
@@ -771,11 +866,11 @@ impl VirtualFuse {
         if self.draft_for_node(node)?.is_some() {
             return Err(Errno::EBUSY);
         }
-        let parent = self.tree.getattr(node.parent_inode).ok_or(Errno::EIO)?;
+        let parent = self.node(node.parent_inode).ok_or(Errno::EIO)?;
         let mutation = Mutation {
             drive_id: self.tree.drive_id().to_owned(),
             item_id: node.item_id.clone(),
-            parent_id: parent.item_id.clone(),
+            parent_id: self.remote_parent_id(&parent)?,
             name: node.name.clone(),
             etag: node
                 .etag
@@ -879,6 +974,7 @@ impl VirtualFuse {
     }
 
     fn remove_local_directory(&self, parent: u64, name: &str) -> Result<(), Errno> {
+        let _serialized = self.open_lock.lock().unwrap();
         let Some(root) = &self.draft_root else {
             return Err(Errno::EROFS);
         };
@@ -891,6 +987,9 @@ impl VirtualFuse {
             .ok_or(Errno::ENOENT)?;
         if node.kind != NodeKind::Directory {
             return Err(Errno::ENOTDIR);
+        }
+        if self.is_publishing(node.inode) {
+            return Err(Errno::EBUSY);
         }
         if local.values().any(|child| child.parent_inode == node.inode)
             || self.tree.readdir(node.inode).is_some_and(|children| {
@@ -1143,14 +1242,12 @@ impl VirtualFuse {
             }
         }
         if !node.item_id.starts_with("local:") && !node.item_id.starts_with("local-dir:") {
-            if parent_node.item_id.starts_with("local-dir:") {
-                return Err(Errno::EINVAL);
-            }
+            let target_parent_id = self.remote_parent_id(&parent_node)?;
             drop(local);
             return self.queue_remote_change(
                 &node,
                 MutationKind::Rename {
-                    target_parent_id: parent_node.item_id,
+                    target_parent_id,
                     target_name: new_name.to_owned(),
                 },
             );
@@ -2476,6 +2573,177 @@ mod tests {
             .open_file(local.inode, OpenFlags(libc::O_RDONLY))
             .unwrap();
         assert_eq!(fuse.read_file(local.inode, read, 0, 5).unwrap(), b"later");
+    }
+
+    #[test]
+    fn published_directories_keep_children_and_resolve_remote_mutations() {
+        let dir = tempfile::tempdir().unwrap();
+        let draft_root = dir.path().join("drafts");
+        let tree = VirtualTree::from_items("drive", "root", []).unwrap();
+        let fuse = VirtualFuse::new_writable(
+            tree,
+            dir.path().join("cache"),
+            draft_root.clone(),
+            20,
+            Arc::new(|_| panic!("local file should not be downloaded")),
+        );
+        let source = fuse.create_directory(ROOT_INODE, "source").unwrap();
+        let target = fuse.create_directory(ROOT_INODE, "target").unwrap();
+        let (child, handle) = fuse
+            .create_file(source.inode, "child.txt", OpenFlags(libc::O_RDWR))
+            .unwrap();
+        fuse.write_file(child.inode, handle, 0, b"child").unwrap();
+        fuse.files.lock().unwrap().remove(&handle);
+        let controller = fuse.published_version_controller();
+        let source_lease = controller
+            .try_begin_directory("drive", &source.item_id)
+            .unwrap();
+        assert_eq!(
+            fuse.rename_local_file(
+                ROOT_INODE,
+                "source",
+                ROOT_INODE,
+                "other",
+                fuser::RenameFlags::empty(),
+            ),
+            Err(Errno::EBUSY)
+        );
+        assert_eq!(
+            fuse.remove_local_directory(ROOT_INODE, "source"),
+            Err(Errno::EBUSY)
+        );
+        let directories = DirectoryStore::open(&draft_root).unwrap();
+        let entries = directories.list().unwrap();
+        directories
+            .mark_uploaded(
+                entries
+                    .iter()
+                    .find(|entry| entry.item_id == source.item_id)
+                    .unwrap(),
+                "remote-source",
+            )
+            .unwrap();
+        controller
+            .publish_directory(&source_lease, &source.item_id, "remote-source", "v1")
+            .unwrap();
+        drop(source_lease);
+        let target_lease = controller
+            .try_begin_directory("drive", &target.item_id)
+            .unwrap();
+        directories
+            .mark_uploaded(
+                entries
+                    .iter()
+                    .find(|entry| entry.item_id == target.item_id)
+                    .unwrap(),
+                "remote-target",
+            )
+            .unwrap();
+        controller
+            .publish_directory(&target_lease, &target.item_id, "remote-target", "v1")
+            .unwrap();
+        drop(target_lease);
+        assert_eq!(
+            fuse.lookup_node(ROOT_INODE, "source").unwrap().inode,
+            source.inode
+        );
+        assert_eq!(
+            fuse.lookup_node(ROOT_INODE, "source").unwrap().item_id,
+            "remote-source"
+        );
+        assert_eq!(
+            fuse.lookup_node(source.inode, "child.txt").unwrap().inode,
+            child.inode
+        );
+
+        let store = DraftStore::open(&draft_root).unwrap();
+        let draft = store
+            .recover_item("drive", &child.item_id)
+            .unwrap()
+            .unwrap();
+        let snapshot = store.snapshot(draft.identity()).unwrap().unwrap();
+        assert!(store.acknowledge(&snapshot).unwrap());
+        let child_lease = controller.try_begin_new("drive", &child.item_id).unwrap();
+        controller
+            .publish_new(&child_lease, &child.item_id, "remote-child", "v1".into(), 5)
+            .unwrap();
+        drop(child_lease);
+        fuse.rename_local_file(
+            source.inode,
+            "child.txt",
+            target.inode,
+            "moved.txt",
+            fuser::RenameFlags::empty(),
+        )
+        .unwrap();
+        assert!(fuse.lookup_node(source.inode, "child.txt").is_none());
+        assert_eq!(
+            fuse.lookup_node(target.inode, "moved.txt").unwrap().inode,
+            child.inode
+        );
+        let mutation = MutationStore::open(&draft_root)
+            .unwrap()
+            .list()
+            .unwrap()
+            .remove(0);
+        assert_eq!(mutation.item_id, "remote-child");
+        assert_eq!(mutation.parent_id, "remote-source");
+        assert_eq!(
+            mutation.kind,
+            MutationKind::Rename {
+                target_parent_id: "remote-target".into(),
+                target_name: "moved.txt".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn mounted_directory_survives_publication_without_remount() {
+        if std::env::var_os("ONEDRIVE_FUSE_SMOKE").is_none() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mountpoint = dir.path().join("mount");
+        let draft_root = dir.path().join("drafts");
+        fs::create_dir(&mountpoint).unwrap();
+        let tree = VirtualTree::from_items("drive", "root", []).unwrap();
+        let fuse = VirtualFuse::new_writable(
+            tree,
+            dir.path().join("cache"),
+            draft_root.clone(),
+            20,
+            Arc::new(|_| panic!("local file should not be downloaded")),
+        );
+        let controller = fuse.published_version_controller();
+        let session = fuse.mount(&mountpoint).unwrap();
+        let folder = mountpoint.join("new folder");
+        fs::create_dir(&folder).unwrap();
+        let child = folder.join("child.txt");
+        fs::write(&child, b"child").unwrap();
+        let directories = DirectoryStore::open(&draft_root).unwrap();
+        let local = directories.list().unwrap().remove(0);
+        let lease = controller
+            .try_begin_directory("drive", &local.item_id)
+            .unwrap();
+        directories.mark_uploaded(&local, "remote-folder").unwrap();
+        controller
+            .publish_directory(&lease, &local.item_id, "remote-folder", "v1")
+            .unwrap();
+        drop(lease);
+        assert_eq!(fs::read(&child).unwrap(), b"child");
+        assert!(
+            fs::read_dir(&folder)
+                .unwrap()
+                .any(|entry| { entry.unwrap().file_name() == "child.txt" })
+        );
+        fs::write(folder.join("another.txt"), b"another").unwrap();
+        let drafts = DraftStore::open(&draft_root).unwrap().list().unwrap();
+        assert!(drafts.iter().any(|draft| {
+            draft.new_file.as_ref().is_some_and(|location| {
+                location.name == "another.txt" && location.parent_id == "remote-folder"
+            })
+        }));
+        session.umount_and_join().unwrap();
     }
 
     #[test]
