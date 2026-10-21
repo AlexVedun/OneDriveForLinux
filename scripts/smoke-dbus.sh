@@ -5,9 +5,6 @@ daemon="${1:-target/debug/onedrive-daemon}"
 test_state=$(mktemp -d)
 export XDG_STATE_HOME="$test_state"
 export ONEDRIVE_SMOKE_NO_RESTORE=1
-# The automatic flag alone must not enable experimental writes.
-export ONEDRIVE_EXPERIMENTAL_VIRTUAL_UPLOAD=
-export ONEDRIVE_EXPERIMENTAL_VIRTUAL_AUTO_UPLOAD=1
 case "${SMOKE_TEST_LOGIN:-0}" in
     1) export ONEDRIVE_CLIENT_ID=test-client ;;
     xdg)
@@ -129,7 +126,7 @@ upload_enabled=$(gdbus call --session \
     --dest io.github.onedrive_linux.Daemon \
     --object-path /io/github/onedrive_linux/Daemon \
     --method io.github.onedrive_linux.Daemon.VirtualDraftUploadEnabled)
-test "$upload_enabled" = "(false,)"
+test "$upload_enabled" = "(true,)"
 if gdbus call --session \
     --dest io.github.onedrive_linux.Daemon \
     --object-path /io/github/onedrive_linux/Daemon \

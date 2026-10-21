@@ -463,11 +463,6 @@ impl Daemon {
         Ok(remote_id)
     }
 
-    fn virtual_draft_auto_upload_enabled(&self) -> bool {
-        self.virtual_draft_upload_enabled()
-            && std::env::var("ONEDRIVE_EXPERIMENTAL_VIRTUAL_AUTO_UPLOAD").as_deref() == Ok("1")
-    }
-
     /// Advisory catalog view. Upload must recheck the remote eTag before writing.
     fn virtual_draft_statuses(&self) -> zbus::fdo::Result<Vec<virtual_drafts::VirtualDraftStatus>> {
         let root = state_directory()
@@ -571,12 +566,10 @@ impl Daemon {
     }
 
     fn virtual_auto_upload_candidate(&self, after: Option<&str>) -> Option<(String, String)> {
-        if !self.virtual_draft_auto_upload_enabled()
-            || !matches!(
-                *self.state.lock().unwrap(),
-                EngineState::Connected | EngineState::Synced
-            )
-            || self.sync_paused().ok()?
+        if !matches!(
+            *self.state.lock().unwrap(),
+            EngineState::Connected | EngineState::Synced
+        ) || self.sync_paused().ok()?
             || self.sync.lock().unwrap().root().ok()?.is_some()
             || self.mount_in_progress.load(Ordering::SeqCst)
             || self.scan_in_progress.load(Ordering::SeqCst)
@@ -731,7 +724,7 @@ impl Daemon {
 
     /// UI capability flag only; RunVirtualDraftUpload repeats all safety checks.
     fn virtual_draft_upload_enabled(&self) -> bool {
-        std::env::var("ONEDRIVE_EXPERIMENTAL_VIRTUAL_UPLOAD").as_deref() == Ok("1")
+        true
     }
 
     fn virtual_draft_count(&self) -> zbus::fdo::Result<u64> {
@@ -773,13 +766,8 @@ impl Daemon {
         .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))
     }
 
-    /// Explicit experimental transfer of one existing virtual-drive draft.
+    /// Explicit transfer of one virtual-drive draft.
     async fn run_virtual_draft_upload(&self, item_id: String) -> zbus::fdo::Result<String> {
-        if !self.virtual_draft_upload_enabled() {
-            return Err(zbus::fdo::Error::Failed(
-                "virtual draft upload is experimental and disabled".to_owned(),
-            ));
-        }
         if item_id.is_empty() || self.sync_paused()? {
             return Err(zbus::fdo::Error::Failed(
                 "invalid item or sync is paused".to_owned(),
@@ -3618,9 +3606,8 @@ async fn poll_catalog(
 
 /// Drafts are the durable queue; one candidate is retried per interval.
 async fn poll_virtual_drafts(daemon: Daemon) {
-    let mut interval = tokio::time::interval(Duration::from_secs(300));
+    let mut interval = tokio::time::interval(Duration::from_secs(30));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    interval.tick().await;
     let mut last_attempted = None;
     loop {
         interval.tick().await;
@@ -3640,6 +3627,7 @@ async fn poll_virtual_drafts(daemon: Daemon) {
                 eprintln!("cannot record automatic virtual draft upload failure");
             }
             eprintln!("automatic virtual draft upload failed; local draft retained");
+            tokio::time::sleep(Duration::from_secs(300)).await;
         }
     }
 }
@@ -4128,9 +4116,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 client_id.clone(),
             ));
         }
-        if automatic_upload.virtual_draft_auto_upload_enabled() {
-            tokio::spawn(poll_virtual_drafts(automatic_upload));
-        }
+        tokio::spawn(poll_virtual_drafts(automatic_upload));
         if std::env::var("ONEDRIVE_SMOKE_NO_RESTORE").as_deref() != Ok("1") {
             tokio::spawn(restore_login(Arc::clone(&state), client_id.clone()));
         }
