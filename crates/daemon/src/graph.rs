@@ -300,6 +300,9 @@ impl<'a> GraphUpload<'a> {
                     .post(url)
                     .bearer_auth(self.access_token)
                     .header(IF_MATCH, etag)
+                    .json(&serde_json::json!({"item": {
+                        "@microsoft.graph.conflictBehavior": "replace"
+                    }}))
                     .build()
                     .map_err(|_| UploadError::InvalidResponse)
             }
@@ -551,7 +554,7 @@ async fn upload_error(response: reqwest::Response) -> UploadError {
         status if status.is_server_error() || status == StatusCode::RANGE_NOT_SATISFIABLE => {
             UploadError::Transient
         }
-        _ => UploadError::InvalidResponse,
+        status => UploadError::HttpStatus(status.as_u16()),
     }
 }
 
@@ -1565,6 +1568,9 @@ mod tests {
         let create = upload.create_session_request(&operation, 10).unwrap();
         assert_eq!(create.headers().get(IF_MATCH).unwrap(), "v1");
         assert!(create.headers().contains_key(AUTHORIZATION));
+        let body: serde_json::Value =
+            serde_json::from_slice(create.body().unwrap().as_bytes().unwrap()).unwrap();
+        assert_eq!(body["item"]["@microsoft.graph.conflictBehavior"], "replace");
         assert_eq!(
             create.url().path(),
             "/v1.0/drives/drive/items/item/createUploadSession"

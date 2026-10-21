@@ -21,6 +21,7 @@ pub enum UploadError {
     Transient,
     Conflict,
     Expired,
+    HttpStatus(u16),
 }
 
 impl From<io::Error> for UploadError {
