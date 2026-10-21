@@ -291,7 +291,6 @@ impl Daemon {
             ));
         }
         if item_id.is_empty()
-            || self.virtual_mount.lock().unwrap().is_some()
             || self.mount_in_progress.load(Ordering::SeqCst)
             || self.sync_paused()?
             || self.scan_in_progress.load(Ordering::SeqCst)
@@ -305,9 +304,9 @@ impl Daemon {
             ));
         }
         let _busy = BusyFlagGuard(Arc::clone(&self.upload_in_progress));
-        if self.virtual_mount.lock().unwrap().is_some() {
+        if self.mount_in_progress.load(Ordering::SeqCst) {
             return Err(zbus::fdo::Error::Failed(
-                "unmount the virtual drive first".to_owned(),
+                "mount operation is running".to_owned(),
             ));
         }
         let root = state_directory()
@@ -323,6 +322,24 @@ impl Daemon {
             .ok_or_else(|| {
                 zbus::fdo::Error::InvalidArgs("local directory is missing".to_owned())
             })?;
+        let mounted_controller = self
+            .virtual_mount
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|mounted| mounted.published_versions.clone());
+        let publication = mounted_controller
+            .as_ref()
+            .map(|controller| {
+                controller
+                    .try_begin_directory(&directory.drive_id, &directory.item_id)
+                    .map_err(|_| {
+                        zbus::fdo::Error::Failed(
+                            "virtual directory is busy or missing from the mount".to_owned(),
+                        )
+                    })
+            })
+            .transpose()?;
         let parent_id = if directory.parent_id.starts_with("local-dir:") {
             store
                 .list()
@@ -388,11 +405,48 @@ impl Daemon {
             .map_err(|error| {
                 zbus::fdo::Error::Failed(format!("cannot create remote directory: {error:?}"))
             })?;
+        let etag = graph
+            .created_virtual_directory_etag(
+                &directory.drive_id,
+                &remote_id,
+                &parent_id,
+                &directory.name,
+                &token,
+            )
+            .await
+            .map_err(|_| {
+                zbus::fdo::Error::Failed(
+                    "cannot verify created directory; local mapping retained".to_owned(),
+                )
+            })?
+            .ok_or_else(|| {
+                zbus::fdo::Error::Failed(
+                    "created directory needs review; local mapping retained".to_owned(),
+                )
+            })?;
+        if let (Some(controller), Some(lease)) = (&mounted_controller, &publication) {
+            controller
+                .validate_directory(lease, &directory.item_id, &remote_id, &etag)
+                .map_err(|error| {
+                    zbus::fdo::Error::Failed(format!(
+                        "mounted directory cannot be published; local mapping retained: {error}"
+                    ))
+                })?;
+        }
         store
             .mark_uploaded(&directory, &remote_id)
             .map_err(|error| {
                 zbus::fdo::Error::Failed(format!("folder created but mapping not saved: {error}"))
             })?;
+        if let (Some(controller), Some(lease)) = (&mounted_controller, &publication) {
+            controller
+                .publish_directory(lease, &directory.item_id, &remote_id, &etag)
+                .map_err(|error| {
+                    zbus::fdo::Error::Failed(format!(
+                        "folder created but mounted directory was not updated: {error}"
+                    ))
+                })?;
+        }
         Ok(remote_id)
     }
 
@@ -518,31 +572,7 @@ impl Daemon {
         {
             return None;
         }
-        let mounted = self.virtual_mount.lock().unwrap().is_some();
-        let draft_store = if mounted {
-            let root = state_directory().ok()?.join("virtual-drafts");
-            Some(DraftStore::open(&root).ok()?)
-        } else {
-            None
-        };
-        let statuses: Vec<_> = self
-            .virtual_draft_statuses()
-            .ok()?
-            .into_iter()
-            .filter(|draft| {
-                if draft.status != "ready-new" {
-                    return true;
-                }
-                draft_store.as_ref().is_none_or(|store| {
-                    store
-                        .recover_item(&draft.drive_id, &draft.item_id)
-                        .ok()
-                        .flatten()
-                        .and_then(|file| file.identity().new_file.clone())
-                        .is_some_and(|location| !location.parent_id.starts_with("local-dir:"))
-                })
-            })
-            .collect();
+        let statuses = self.virtual_draft_statuses().ok()?;
         let item_id = virtual_drafts::next_ready_item_id(&statuses, after)?;
         statuses
             .iter()
@@ -840,16 +870,6 @@ impl Daemon {
             .as_ref()
             .map(|mounted| mounted.published_versions.clone());
         let _publication = if let Some(controller) = &mounted_controller {
-            if draft
-                .new_file
-                .as_ref()
-                .is_some_and(|location| location.parent_id.starts_with("local-dir:"))
-            {
-                return Err(zbus::fdo::Error::Failed(
-                    "unmount the virtual drive before uploading a file in a local directory"
-                        .to_owned(),
-                ));
-            }
             Some(
                 (if draft.new_file.is_some() {
                     controller.try_begin_new(&drive_id, &item_id)
@@ -3811,8 +3831,7 @@ async fn poll_virtual_directories(daemon: Daemon, state_root: PathBuf, client_id
         if !matches!(
             *daemon.state.lock().unwrap(),
             EngineState::Connected | EngineState::Synced
-        ) || daemon.virtual_mount.lock().unwrap().is_some()
-            || daemon.upload_in_progress.load(Ordering::SeqCst)
+        ) || daemon.upload_in_progress.load(Ordering::SeqCst)
             || daemon.scan_in_progress.load(Ordering::SeqCst)
         {
             continue;

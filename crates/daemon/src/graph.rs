@@ -518,6 +518,14 @@ fn item_metadata_url(drive_id: &str, item_id: &str) -> Result<reqwest::Url, Fetc
     Ok(url)
 }
 
+fn directory_metadata_url(drive_id: &str, item_id: &str) -> Result<reqwest::Url, FetchError> {
+    let mut url = item_metadata_url(drive_id, item_id)?;
+    url.set_query(None);
+    url.query_pairs_mut()
+        .append_pair("$select", "id,name,parentReference,eTag,folder");
+    Ok(url)
+}
+
 fn version_matches(item: &DownloadItemVersion, id: &str, etag: &str, size: u64) -> bool {
     item.id == id
         && item.etag.as_deref() == Some(etag)
@@ -1032,6 +1040,26 @@ impl GraphClient {
         }
     }
 
+    pub async fn created_virtual_directory_etag(
+        &self,
+        drive_id: &str,
+        item_id: &str,
+        parent_id: &str,
+        name: &str,
+        access_token: &str,
+    ) -> Result<Option<String>, FetchError> {
+        let url = directory_metadata_url(drive_id, item_id)?;
+        let item: MovedFile = self
+            .get_with_retry(url.as_str(), access_token)
+            .await?
+            .json()
+            .await
+            .map_err(transport_fetch_error)?;
+        Ok(moved_item_matches(&item, item_id, parent_id, name, true)
+            .then_some(item.etag)
+            .flatten())
+    }
+
     pub async fn drive_id(&self, access_token: &str) -> Result<String, FetchError> {
         let response = self.get_with_retry(DRIVE_URL, access_token).await?;
         let drive: Drive = response.json().await.map_err(|_| FetchError::Failed)?;
@@ -1470,6 +1498,39 @@ mod tests {
             &created,
             "My Notes",
             "other-parent"
+        ));
+    }
+
+    #[test]
+    fn created_directory_metadata_requires_exact_identity_and_etag() {
+        let url = directory_metadata_url("drive", "folder").unwrap();
+        assert_eq!(url.path(), "/v1.0/drives/drive/items/folder");
+        assert_eq!(
+            url.query(),
+            Some("%24select=id%2Cname%2CparentReference%2CeTag%2Cfolder")
+        );
+        let item: MovedFile = serde_json::from_value(serde_json::json!({
+            "id": "folder", "name": "My Notes", "eTag": "v1", "folder": {},
+            "parentReference": { "id": "parent" }
+        }))
+        .unwrap();
+        assert!(moved_item_matches(
+            &item, "folder", "parent", "My Notes", true
+        ));
+        assert!(!moved_item_matches(
+            &item, "folder", "wrong", "My Notes", true
+        ));
+        let missing_etag: MovedFile = serde_json::from_value(serde_json::json!({
+            "id": "folder", "name": "My Notes", "folder": {},
+            "parentReference": { "id": "parent" }
+        }))
+        .unwrap();
+        assert!(!moved_item_matches(
+            &missing_etag,
+            "folder",
+            "parent",
+            "My Notes",
+            true
         ));
     }
 
