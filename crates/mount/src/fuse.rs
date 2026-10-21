@@ -413,20 +413,20 @@ impl VirtualFuse {
 
     fn attr(&self, node: &Node) -> Result<FileAttr, Errno> {
         let directory = node.kind == NodeKind::Directory;
-        let draft_size = if directory {
+        let draft_attributes = if directory {
             None
         } else {
             self.draft_for_node(node)?
-                .map(|draft| draft.len().map_err(|_| Errno::EIO))
+                .map(|draft| draft.attributes().map_err(|_| Errno::EIO))
                 .transpose()?
         };
-        let size = draft_size.unwrap_or(node.size);
+        let size = draft_attributes.map_or(node.size, |attributes| attributes.0);
         Ok(FileAttr {
             ino: INodeNo(node.inode),
             size,
             blocks: size.saturating_add(511) / 512,
-            atime: UNIX_EPOCH,
-            mtime: UNIX_EPOCH,
+            atime: draft_attributes.map_or(UNIX_EPOCH, |attributes| attributes.1),
+            mtime: draft_attributes.map_or(UNIX_EPOCH, |attributes| attributes.2),
             ctime: UNIX_EPOCH,
             crtime: UNIX_EPOCH,
             kind: if directory {
@@ -1099,20 +1099,10 @@ impl VirtualFuse {
             && flags.bits() & libc::RENAME_NOREPLACE == 0
         {
             if self
-                .files
+                .remote_changes
                 .lock()
                 .unwrap()
-                .values()
-                .any(|open| open.inode == node.inode)
-            {
-                return Err(Errno::EBUSY);
-            }
-            if self.draft_for_node(&target)?.is_some()
-                || self
-                    .remote_changes
-                    .lock()
-                    .unwrap()
-                    .contains_key(&target.inode)
+                .contains_key(&target.inode)
             {
                 return Err(Errno::EEXIST);
             }
@@ -1126,20 +1116,30 @@ impl VirtualFuse {
                 .map_err(map_draft_error)?
                 .ok_or(Errno::EIO)?;
             let request = self.request_for_node(&target).map_err(map_open_error)?;
-            store
-                .begin_from_file(
-                    DraftIdentity {
-                        drive_id: request.drive_id,
-                        item_id: request.item_id,
-                        base_etag: request.etag,
-                        new_file: None,
-                    },
-                    snapshot.file.as_file(),
-                )
-                .map_err(map_draft_error)?;
+            let identity = DraftIdentity {
+                drive_id: request.drive_id,
+                item_id: request.item_id,
+                base_etag: request.etag,
+                new_file: None,
+            };
+            let replacement_draft = if self.draft_for_node(&target)?.is_some() {
+                store.replace_from_file(&identity, snapshot.file.as_file())
+            } else {
+                store.begin_from_file(identity, snapshot.file.as_file())
+            }
+            .map_err(map_draft_error)?;
             store
                 .remove_new(self.tree.drive_id(), &node.item_id)
                 .map_err(map_draft_error)?;
+            if target.inode != node.inode {
+                local.remove(&target.inode);
+            }
+            let replacement_draft = Arc::new(replacement_draft);
+            for open in self.files.lock().unwrap().values_mut() {
+                if open.inode == node.inode {
+                    open.handle = OpenHandle::Draft(Arc::clone(&replacement_draft));
+                }
+            }
             let replacement = local.get_mut(&node.inode).ok_or(Errno::EIO)?;
             replacement.parent_inode = new_parent;
             replacement.name = new_name.to_owned();
@@ -1620,6 +1620,7 @@ impl VirtualFuse {
 
     fn write_file(&self, inode: u64, handle: u64, offset: u64, data: &[u8]) -> Result<u32, Errno> {
         self.materialize_pending(inode, handle, false)?;
+        let _serialized = self.open_lock.lock().unwrap();
         let files = self.files.lock().unwrap();
         let open = files
             .get(&handle)
@@ -1903,8 +1904,8 @@ impl Filesystem for VirtualFuse {
         uid: Option<u32>,
         gid: Option<u32>,
         size: Option<u64>,
-        _atime: Option<fuser::TimeOrNow>,
-        _mtime: Option<fuser::TimeOrNow>,
+        atime: Option<fuser::TimeOrNow>,
+        mtime: Option<fuser::TimeOrNow>,
         _ctime: Option<std::time::SystemTime>,
         handle: Option<FileHandle>,
         _crtime: Option<std::time::SystemTime>,
@@ -1928,12 +1929,28 @@ impl Filesystem for VirtualFuse {
         }
         let result = if let Some(size) = size {
             self.truncate_file(inode.0, handle.map(|handle| handle.0), size)
-        } else if mode.is_some() && self.draft_root.is_some() {
+        } else if (mode.is_some() || atime.is_some() || mtime.is_some())
+            && self.draft_root.is_some()
+        {
             // OneDrive has no Unix mode metadata; accept the copy tool's chmod.
             Ok(())
         } else {
             Err(Errno::EROFS)
         };
+        let result = result.and_then(|()| {
+            if atime.is_none() && mtime.is_none() {
+                return Ok(());
+            }
+            let node = self.node(inode.0).ok_or(Errno::ENOENT)?;
+            let draft = self.draft_for_node(&node)?.ok_or(Errno::EROFS)?;
+            let resolve = |time| match time {
+                fuser::TimeOrNow::SpecificTime(time) => time,
+                fuser::TimeOrNow::Now => std::time::SystemTime::now(),
+            };
+            draft
+                .set_times(atime.map(resolve), mtime.map(resolve))
+                .map_err(|_| Errno::EIO)
+        });
         match result {
             Ok(()) => match self.node(inode.0).and_then(|node| self.attr(&node).ok()) {
                 Some(attr) => reply.attr(&TTL, &attr),
@@ -3421,17 +3438,6 @@ mod tests {
                 "swap.tmp",
                 ROOT_INODE,
                 "текст.txt",
-                fuser::RenameFlags::empty(),
-            ),
-            Err(Errno::EBUSY)
-        );
-        fuse.files.lock().unwrap().remove(&handle);
-        assert_eq!(
-            fuse.rename_local_file(
-                ROOT_INODE,
-                "swap.tmp",
-                ROOT_INODE,
-                "текст.txt",
                 fuser::RenameFlags::from_bits_truncate(libc::RENAME_NOREPLACE),
             ),
             Err(Errno::EEXIST)
@@ -3444,6 +3450,12 @@ mod tests {
             fuser::RenameFlags::empty(),
         )
         .unwrap();
+        assert_eq!(fuse.sync_file(temporary.inode, handle), Ok(()));
+        assert_eq!(
+            fuse.read_file(temporary.inode, handle, 0, 11).unwrap(),
+            b"replacement"
+        );
+        fuse.files.lock().unwrap().remove(&handle);
         assert!(fuse.lookup_node(ROOT_INODE, "swap.tmp").is_none());
         let drafts = DraftStore::open(&draft_root).unwrap().list().unwrap();
         assert_eq!(drafts.len(), 1);
@@ -3829,6 +3841,37 @@ mod tests {
     }
 
     #[test]
+    fn mounted_editor_can_set_modified_time_after_saving_a_draft() {
+        if std::env::var_os("ONEDRIVE_FUSE_SMOKE").is_none() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mountpoint = dir.path().join("mount");
+        fs::create_dir(&mountpoint).unwrap();
+        let session = VirtualFuse::new_writable(
+            VirtualTree::from_items("drive", "root", [file_item()]).unwrap(),
+            dir.path().join("cache"),
+            dir.path().join("drafts"),
+            20,
+            Arc::new(|_| Err(io::ErrorKind::NotConnected.into())),
+        )
+        .mount(&mountpoint)
+        .unwrap();
+        let path = mountpoint.join("текст.txt");
+        fs::write(&path, b"edited locally").unwrap();
+        let modified = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"edited locally");
+        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), modified);
+        session.umount_and_join().unwrap();
+    }
+
+    #[test]
     fn new_file_survives_remount_as_local_draft() {
         if std::env::var_os("ONEDRIVE_FUSE_SMOKE").is_none() {
             return;
@@ -4030,6 +4073,58 @@ mod tests {
             DraftStore::open(&draft_root).unwrap().list().unwrap().len(),
             1
         );
+        session.umount_and_join().unwrap();
+    }
+
+    #[test]
+    fn mounted_editor_can_rename_open_temporary_file_over_existing_file() {
+        if std::env::var_os("ONEDRIVE_FUSE_SMOKE").is_none() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mountpoint = dir.path().join("mount");
+        let draft_root = dir.path().join("drafts");
+        fs::create_dir(&mountpoint).unwrap();
+        let mount = || {
+            VirtualFuse::new_writable(
+                VirtualTree::from_items("drive", "root", [file_item()]).unwrap(),
+                dir.path().join("cache"),
+                draft_root.clone(),
+                10,
+                Arc::new(|_| Err(io::ErrorKind::NotConnected.into())),
+            )
+            .mount(&mountpoint)
+            .unwrap()
+        };
+        let session = mount();
+        let target = mountpoint.join("текст.txt");
+        let temporary = mountpoint.join("текст.txt.tmp");
+        let mut output = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .unwrap();
+        use std::io::Write;
+        output.write_all(b"first edit").unwrap();
+        output.sync_all().unwrap();
+        fs::rename(&temporary, &target).unwrap();
+        output.sync_all().unwrap();
+        drop(output);
+        assert_eq!(fs::read(&target).unwrap(), b"first edit");
+        let mut output = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .unwrap();
+        output.write_all(b"second edit").unwrap();
+        output.sync_all().unwrap();
+        fs::rename(&temporary, &target).unwrap();
+        output.sync_all().unwrap();
+        drop(output);
+        assert_eq!(fs::read(&target).unwrap(), b"second edit");
+        session.umount_and_join().unwrap();
+        let session = mount();
+        assert_eq!(fs::read(&target).unwrap(), b"second edit");
         session.umount_and_join().unwrap();
     }
 
