@@ -519,11 +519,29 @@ impl Daemon {
             return None;
         }
         let mounted = self.virtual_mount.lock().unwrap().is_some();
+        let draft_store = if mounted {
+            let root = state_directory().ok()?.join("virtual-drafts");
+            Some(DraftStore::open(&root).ok()?)
+        } else {
+            None
+        };
         let statuses: Vec<_> = self
             .virtual_draft_statuses()
             .ok()?
             .into_iter()
-            .filter(|draft| !mounted || draft.status != "ready-new")
+            .filter(|draft| {
+                if draft.status != "ready-new" {
+                    return true;
+                }
+                draft_store.as_ref().is_none_or(|store| {
+                    store
+                        .recover_item(&draft.drive_id, &draft.item_id)
+                        .ok()
+                        .flatten()
+                        .and_then(|file| file.identity().new_file.clone())
+                        .is_some_and(|location| !location.parent_id.starts_with("local-dir:"))
+                })
+            })
             .collect();
         let item_id = virtual_drafts::next_ready_item_id(&statuses, after)?;
         statuses
@@ -822,19 +840,27 @@ impl Daemon {
             .as_ref()
             .map(|mounted| mounted.published_versions.clone());
         let _publication = if let Some(controller) = &mounted_controller {
-            if draft.new_file.is_some() {
+            if draft
+                .new_file
+                .as_ref()
+                .is_some_and(|location| location.parent_id.starts_with("local-dir:"))
+            {
                 return Err(zbus::fdo::Error::Failed(
-                    "unmount the virtual drive before uploading a new file".to_owned(),
+                    "unmount the virtual drive before uploading a file in a local directory"
+                        .to_owned(),
                 ));
             }
             Some(
-                controller
-                    .try_begin_existing(&drive_id, &item_id)
-                    .map_err(|_| {
-                        zbus::fdo::Error::Failed(
-                            "close the virtual file before uploading its draft".to_owned(),
-                        )
-                    })?,
+                (if draft.new_file.is_some() {
+                    controller.try_begin_new(&drive_id, &item_id)
+                } else {
+                    controller.try_begin_existing(&drive_id, &item_id)
+                })
+                .map_err(|_| {
+                    zbus::fdo::Error::Failed(
+                        "close the virtual file before uploading its draft".to_owned(),
+                    )
+                })?,
             )
         } else {
             None
@@ -960,7 +986,11 @@ impl Daemon {
         if let Some(controller) = &mounted_controller {
             let request = DownloadRequest {
                 drive_id: drive_id.clone(),
-                item_id: item_id.clone(),
+                item_id: if snapshot.identity.new_file.is_some() {
+                    uploaded_id.clone()
+                } else {
+                    item_id.clone()
+                },
                 etag: uploaded_etag.clone(),
                 size: snapshot.size,
             };
@@ -982,12 +1012,29 @@ impl Daemon {
                     "uploaded file could not be cached; local draft retained: {error}"
                 ))
             })?;
-            controller.publish_existing(&item_id, uploaded_etag.clone(), snapshot.size);
+            if snapshot.identity.new_file.is_some() {
+                controller
+                    .validate_new(
+                        _publication.as_ref().expect("mounted publication lease"),
+                        &item_id,
+                        &uploaded_id,
+                        &uploaded_etag,
+                    )
+                    .map_err(|error| {
+                        zbus::fdo::Error::Failed(format!(
+                            "mounted file cannot be published; local draft retained: {error}"
+                        ))
+                    })?;
+            } else {
+                controller.publish_existing(&item_id, uploaded_etag.clone(), snapshot.size);
+            }
         }
         let root = state_directory()
             .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?
             .join("virtual-drafts");
         let completed_identity = snapshot.identity.clone();
+        let uploaded_new_file = snapshot.identity.new_file.is_some();
+        let uploaded_size = snapshot.size;
         let acknowledged =
             tokio::task::spawn_blocking(move || DraftStore::open(&root)?.acknowledge(&snapshot))
                 .await
@@ -995,6 +1042,24 @@ impl Daemon {
                     zbus::fdo::Error::Failed("draft acknowledgement task failed".to_owned())
                 })?
                 .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
+        if acknowledged
+            && uploaded_new_file
+            && let Some(controller) = &mounted_controller
+        {
+            controller
+                .publish_new(
+                    _publication.as_ref().expect("mounted publication lease"),
+                    &item_id,
+                    &uploaded_id,
+                    uploaded_etag,
+                    uploaded_size,
+                )
+                .map_err(|error| {
+                    zbus::fdo::Error::Failed(format!(
+                        "mounted file cannot be published after upload: {error}"
+                    ))
+                })?;
+        }
         checkpoint_store
             .clear_upload_checkpoint(&completed_identity)
             .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;

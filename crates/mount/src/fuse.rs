@@ -130,14 +130,13 @@ impl PublishedVersionController {
         self.versions.lock().unwrap().insert(inode, (etag, size));
     }
 
-    /// Keep the mounted inode and path while replacing its temporary Graph ID.
-    pub fn publish_new(
+    /// Check publication while the local draft still exists, before acknowledging it.
+    pub fn validate_new(
         &self,
         lease: &PublicationLease,
         local_id: &str,
         remote_id: &str,
-        etag: String,
-        size: u64,
+        etag: &str,
     ) -> io::Result<()> {
         let inode = crate::stable_inode(&self.drive_id, local_id);
         if !local_id.starts_with("local:")
@@ -149,6 +148,32 @@ impl PublishedVersionController {
         {
             return Err(io::ErrorKind::InvalidInput.into());
         }
+        let _serialized = self.open_lock.lock().unwrap();
+        let local = self.local_files.lock().unwrap();
+        if local
+            .values()
+            .any(|node| node.inode != inode && node.item_id == remote_id)
+            || local
+                .get(&inode)
+                .is_none_or(|node| node.item_id != local_id || node.kind != NodeKind::File)
+            || !self.operations.lock().unwrap().active.contains(&inode)
+        {
+            return Err(io::ErrorKind::WouldBlock.into());
+        }
+        Ok(())
+    }
+
+    /// Keep the mounted inode and path while replacing its temporary Graph ID.
+    pub fn publish_new(
+        &self,
+        lease: &PublicationLease,
+        local_id: &str,
+        remote_id: &str,
+        etag: String,
+        size: u64,
+    ) -> io::Result<()> {
+        self.validate_new(lease, local_id, remote_id, &etag)?;
+        let inode = crate::stable_inode(&self.drive_id, local_id);
         let _serialized = self.open_lock.lock().unwrap();
         let mut local = self.local_files.lock().unwrap();
         if local
@@ -2329,6 +2354,9 @@ mod tests {
             .unwrap()
             .put(&request.cache_key(), snapshot.file.path(), snapshot.size)
             .unwrap();
+        controller
+            .validate_new(&lease, &local.item_id, "remote-created", "v1")
+            .unwrap();
         assert!(store.acknowledge(&snapshot).unwrap());
         controller
             .publish_new(&lease, &local.item_id, "remote-created", "v1".into(), 7)
@@ -2402,6 +2430,52 @@ mod tests {
                 .iter()
                 .any(|mutation| mutation.item_id == "remote-second")
         );
+    }
+
+    #[test]
+    fn edited_new_draft_stays_local_after_upload_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let draft_root = dir.path().join("drafts");
+        let tree = VirtualTree::from_items("drive", "root", []).unwrap();
+        let fuse = VirtualFuse::new_writable(
+            tree,
+            dir.path().join("cache"),
+            draft_root.clone(),
+            20,
+            Arc::new(|_| panic!("local draft should not be downloaded")),
+        );
+        let (local, handle) = fuse
+            .create_file(ROOT_INODE, "edited.txt", OpenFlags(libc::O_RDWR))
+            .unwrap();
+        fuse.write_file(local.inode, handle, 0, b"first").unwrap();
+        fuse.files.lock().unwrap().remove(&handle);
+        let controller = fuse.published_version_controller();
+        let lease = controller.try_begin_new("drive", &local.item_id).unwrap();
+        let store = DraftStore::open(&draft_root).unwrap();
+        let draft = store
+            .recover_item("drive", &local.item_id)
+            .unwrap()
+            .unwrap();
+        let snapshot = store.snapshot(draft.identity()).unwrap().unwrap();
+        controller
+            .validate_new(&lease, &local.item_id, "remote-created", "v1")
+            .unwrap();
+        draft.write_at(0, b"later").unwrap();
+        assert!(!store.acknowledge(&snapshot).unwrap());
+        drop(lease);
+        let visible = fuse.lookup_node(ROOT_INODE, "edited.txt").unwrap();
+        assert_eq!(visible.inode, local.inode);
+        assert_eq!(visible.item_id, local.item_id);
+        assert!(
+            store
+                .recover_item("drive", &local.item_id)
+                .unwrap()
+                .is_some()
+        );
+        let read = fuse
+            .open_file(local.inode, OpenFlags(libc::O_RDONLY))
+            .unwrap();
+        assert_eq!(fuse.read_file(local.inode, read, 0, 5).unwrap(), b"later");
     }
 
     #[test]
