@@ -7,6 +7,7 @@ use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DraftIdentity {
@@ -405,6 +406,37 @@ impl DraftStore {
         self.begin_with_source(identity, Some(input))
     }
 
+    /// Atomically replace an existing draft's bytes after a successful editor rename.
+    pub fn replace_from_file(
+        &self,
+        identity: &DraftIdentity,
+        input: &File,
+    ) -> io::Result<DraftFile> {
+        identity.validate()?;
+        let _lock = lock_store(&self.root)?;
+        if self.recover(identity)?.is_none() || !input.metadata()?.is_file() {
+            return Err(io::Error::from(io::ErrorKind::NotFound));
+        }
+        let mut temporary = tempfile::NamedTempFile::new_in(&self.root)?;
+        let mut offset = 0;
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let count = input.read_at(&mut buffer, offset)?;
+            if count == 0 {
+                break;
+            }
+            temporary.write_all(&buffer[..count])?;
+            offset += count as u64;
+        }
+        temporary.as_file().sync_all()?;
+        temporary
+            .persist(self.paths(identity).1)
+            .map_err(|error| error.error)?;
+        File::open(&self.root)?.sync_all()?;
+        self.recover(identity)?
+            .ok_or_else(|| io::Error::other("draft disappeared"))
+    }
+
     pub fn begin_empty(&self, identity: DraftIdentity) -> io::Result<DraftFile> {
         self.begin_with_source(identity, None)
     }
@@ -723,6 +755,31 @@ impl DraftFile {
 
     pub fn len(&self) -> io::Result<u64> {
         Ok(self.file.metadata()?.len())
+    }
+
+    pub fn attributes(&self) -> io::Result<(u64, SystemTime, SystemTime)> {
+        let metadata = self.file.metadata()?;
+        Ok((metadata.len(), metadata.accessed()?, metadata.modified()?))
+    }
+
+    pub fn set_times(
+        &self,
+        atime: Option<SystemTime>,
+        mtime: Option<SystemTime>,
+    ) -> io::Result<()> {
+        let _lock = lock_exclusive(&self.file)?;
+        if self.file.metadata()?.nlink() == 0 {
+            return Err(io::Error::from(io::ErrorKind::NotFound));
+        }
+        let mut times = fs::FileTimes::new();
+        if let Some(atime) = atime {
+            times = times.set_accessed(atime);
+        }
+        if let Some(mtime) = mtime {
+            times = times.set_modified(mtime);
+        }
+        self.file.set_times(times)?;
+        self.file.sync_all()
     }
 
     pub fn is_empty(&self) -> io::Result<bool> {
