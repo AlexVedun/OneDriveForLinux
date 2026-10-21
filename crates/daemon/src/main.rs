@@ -381,6 +381,7 @@ impl Daemon {
                         !item.deleted
                             && item.parent_id.as_deref() == Some(&parent_id)
                             && item.name.as_deref() == Some(&directory.name)
+                            && Some(item.item_id.as_str()) != directory.created_remote_id.as_deref()
                     })
                 });
             if !parent_exists || name_taken {
@@ -399,12 +400,24 @@ impl Daemon {
         if graph.drive_id(&token).await.ok().as_deref() != Some(&directory.drive_id) {
             return Err(zbus::fdo::Error::Failed("active drive changed".to_owned()));
         }
-        let remote_id = graph
-            .create_remote_folder(&directory.drive_id, &parent_id, &directory.name, &token)
-            .await
-            .map_err(|error| {
-                zbus::fdo::Error::Failed(format!("cannot create remote directory: {error:?}"))
-            })?;
+        let (directory, remote_id) = if let Some(remote_id) = &directory.created_remote_id {
+            (directory.clone(), remote_id.clone())
+        } else {
+            let remote_id = graph
+                .create_remote_folder(&directory.drive_id, &parent_id, &directory.name, &token)
+                .await
+                .map_err(|error| {
+                    zbus::fdo::Error::Failed(format!("cannot create remote directory: {error:?}"))
+                })?;
+            let created = store
+                .record_created(&directory, &remote_id)
+                .map_err(|error| {
+                    zbus::fdo::Error::Failed(format!(
+                        "folder created but its ID was not saved; review required: {error}"
+                    ))
+                })?;
+            (created, remote_id)
+        };
         let etag = graph
             .created_virtual_directory_etag(
                 &directory.drive_id,
@@ -636,12 +649,16 @@ impl Daemon {
                                         !item.deleted
                                             && item.parent_id.as_deref() == Some(parent_id)
                                             && item.name.as_deref() == Some(&directory.name)
+                                            && Some(item.item_id.as_str())
+                                                != directory.created_remote_id.as_deref()
                                     })
                                 });
                         if !parent_exists {
                             "parent-missing"
                         } else if name_taken {
                             "name-conflict"
+                        } else if directory.created_remote_id.is_some() {
+                            "verifying"
                         } else {
                             "pending"
                         }

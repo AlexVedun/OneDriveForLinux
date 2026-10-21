@@ -14,6 +14,9 @@ pub struct LocalDirectory {
     pub item_id: String,
     pub parent_id: String,
     pub name: String,
+    /// ID returned by folder creation, before a separate metadata check succeeds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_remote_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_id: Option<String>,
     #[serde(default)]
@@ -26,13 +29,25 @@ impl LocalDirectory {
             || !self.item_id.starts_with("local-dir:")
             || self.parent_id.is_empty()
             || !NewFileLocation::valid_name(&self.name)
-            || self.remote_id.as_deref() == Some("")
+            || self
+                .created_remote_id
+                .as_deref()
+                .is_some_and(|id| !valid_remote_id(id))
+            || self
+                .remote_id
+                .as_deref()
+                .is_some_and(|id| !valid_remote_id(id))
+            || self.created_remote_id.is_some() && self.remote_id.is_some()
             || (self.seen_remote && self.remote_id.is_none())
         {
             return Err(io::Error::from(io::ErrorKind::InvalidData));
         }
         Ok(())
     }
+}
+
+fn valid_remote_id(id: &str) -> bool {
+    !id.is_empty() && !id.starts_with("local:") && !id.starts_with("local-dir:")
 }
 
 pub struct DirectoryStore {
@@ -103,6 +118,7 @@ impl DirectoryStore {
             item_id: format!("local-dir:{random}"),
             parent_id: parent_id.to_owned(),
             name: name.to_owned(),
+            created_remote_id: None,
             remote_id: None,
             seen_remote: false,
         };
@@ -121,6 +137,9 @@ impl DirectoryStore {
         if directory.remote_id.is_some() {
             return Err(io::Error::from(io::ErrorKind::PermissionDenied));
         }
+        if directory.created_remote_id.is_some() {
+            return Err(io::Error::from(io::ErrorKind::WouldBlock));
+        }
         let mut changed = directory.clone();
         changed.parent_id = parent_id.to_owned();
         changed.name = name.to_owned();
@@ -132,18 +151,46 @@ impl DirectoryStore {
         if directory.remote_id.is_some() {
             return Err(io::Error::from(io::ErrorKind::PermissionDenied));
         }
+        if directory.created_remote_id.is_some() {
+            return Err(io::Error::from(io::ErrorKind::WouldBlock));
+        }
         fs::remove_file(self.path(&directory.item_id))?;
         File::open(&self.root)?.sync_all()
     }
 
-    pub fn mark_uploaded(&self, directory: &LocalDirectory, remote_id: &str) -> io::Result<()> {
+    pub fn record_created(
+        &self,
+        directory: &LocalDirectory,
+        remote_id: &str,
+    ) -> io::Result<LocalDirectory> {
         if directory.remote_id.is_some()
-            || remote_id.is_empty()
-            || remote_id.starts_with("local:")
-            || remote_id.starts_with("local-dir:")
+            || directory.created_remote_id.is_some()
+            || !valid_remote_id(remote_id)
         {
             return Err(io::Error::from(io::ErrorKind::InvalidInput));
         }
+        self.require_current(directory)?;
+        let mut created = directory.clone();
+        created.created_remote_id = Some(remote_id.to_owned());
+        self.save(&created, false)?;
+        Ok(created)
+    }
+
+    pub fn mark_uploaded(&self, directory: &LocalDirectory, remote_id: &str) -> io::Result<()> {
+        if directory.remote_id.is_some()
+            || directory.created_remote_id.as_deref() != Some(remote_id)
+            || !valid_remote_id(remote_id)
+        {
+            return Err(io::Error::from(io::ErrorKind::InvalidInput));
+        }
+        self.require_current(directory)?;
+        let mut uploaded = directory.clone();
+        uploaded.created_remote_id = None;
+        uploaded.remote_id = Some(remote_id.to_owned());
+        self.save(&uploaded, false)
+    }
+
+    fn require_current(&self, directory: &LocalDirectory) -> io::Result<()> {
         if self
             .list()?
             .into_iter()
@@ -153,9 +200,7 @@ impl DirectoryStore {
         {
             return Err(io::Error::from(io::ErrorKind::WouldBlock));
         }
-        let mut uploaded = directory.clone();
-        uploaded.remote_id = Some(remote_id.to_owned());
-        self.save(&uploaded, false)
+        Ok(())
     }
 
     pub fn mark_seen(&self, directory: &LocalDirectory) -> io::Result<()> {
@@ -235,8 +280,16 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let store = DirectoryStore::open(root.path()).unwrap();
         let local = store.create("drive", "root", "folder").unwrap();
-        store.mark_uploaded(&local, "remote-folder").unwrap();
+        let created = store.record_created(&local, "remote-folder").unwrap();
         let store = DirectoryStore::open(root.path()).unwrap();
+        assert_eq!(
+            store.list().unwrap()[0].created_remote_id.as_deref(),
+            Some("remote-folder")
+        );
+        assert_eq!(store.remote_parent_id(&local.item_id).unwrap(), None);
+        assert!(store.relocate(&created, "root", "changed").is_err());
+        assert!(store.remove(&created).is_err());
+        store.mark_uploaded(&created, "remote-folder").unwrap();
         assert_eq!(
             store.remote_parent_id(&local.item_id).unwrap().as_deref(),
             Some("remote-folder")
@@ -255,7 +308,7 @@ mod tests {
         store.relocate(&original, "root", "renamed").unwrap();
         assert_eq!(
             store
-                .mark_uploaded(&original, "remote-folder")
+                .record_created(&original, "remote-folder")
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::WouldBlock
@@ -265,7 +318,7 @@ mod tests {
         store.remove(&moved).unwrap();
         assert_eq!(
             store
-                .mark_uploaded(&original, "remote-folder")
+                .record_created(&original, "remote-folder")
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::WouldBlock

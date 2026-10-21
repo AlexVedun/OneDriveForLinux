@@ -1841,6 +1841,9 @@ fn map_open_error(error: OpenError) -> Errno {
 }
 
 fn map_draft_error(error: io::Error) -> Errno {
+    if error.kind() == io::ErrorKind::WouldBlock {
+        return Errno::EBUSY;
+    }
     match error.raw_os_error() {
         Some(libc::ENOSPC) => Errno::ENOSPC,
         Some(libc::EDQUOT) => Errno::EDQUOT,
@@ -2641,14 +2644,17 @@ mod tests {
         );
         let directories = DirectoryStore::open(&draft_root).unwrap();
         let entries = directories.list().unwrap();
-        directories
-            .mark_uploaded(
+        let created_source = directories
+            .record_created(
                 entries
                     .iter()
                     .find(|entry| entry.item_id == source.item_id)
                     .unwrap(),
                 "remote-source",
             )
+            .unwrap();
+        directories
+            .mark_uploaded(&created_source, "remote-source")
             .unwrap();
         controller
             .publish_directory(&source_lease, &source.item_id, "remote-source", "v1")
@@ -2657,14 +2663,17 @@ mod tests {
         let target_lease = controller
             .try_begin_directory("drive", &target.item_id)
             .unwrap();
-        directories
-            .mark_uploaded(
+        let created_target = directories
+            .record_created(
                 entries
                     .iter()
                     .find(|entry| entry.item_id == target.item_id)
                     .unwrap(),
                 "remote-target",
             )
+            .unwrap();
+        directories
+            .mark_uploaded(&created_target, "remote-target")
             .unwrap();
         controller
             .publish_directory(&target_lease, &target.item_id, "remote-target", "v1")
@@ -2725,6 +2734,42 @@ mod tests {
     }
 
     #[test]
+    fn directory_waiting_for_graph_verification_cannot_be_moved_or_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let draft_root = dir.path().join("drafts");
+        let tree = VirtualTree::from_items("drive", "root", []).unwrap();
+        let fuse = VirtualFuse::new_writable(
+            tree,
+            dir.path().join("cache"),
+            draft_root.clone(),
+            20,
+            Arc::new(|_| panic!("no download expected")),
+        );
+        let folder = fuse.create_directory(ROOT_INODE, "folder").unwrap();
+        let store = DirectoryStore::open(&draft_root).unwrap();
+        let local = store.list().unwrap().remove(0);
+        store.record_created(&local, "remote-folder").unwrap();
+        assert_eq!(
+            fuse.rename_local_file(
+                ROOT_INODE,
+                "folder",
+                ROOT_INODE,
+                "renamed",
+                fuser::RenameFlags::empty(),
+            ),
+            Err(Errno::EBUSY)
+        );
+        assert_eq!(
+            fuse.remove_local_directory(ROOT_INODE, "folder"),
+            Err(Errno::EBUSY)
+        );
+        assert_eq!(
+            fuse.lookup_node(ROOT_INODE, "folder").unwrap().inode,
+            folder.inode
+        );
+    }
+
+    #[test]
     fn mounted_directory_survives_publication_without_remount() {
         if std::env::var_os("ONEDRIVE_FUSE_SMOKE").is_none() {
             return;
@@ -2752,7 +2797,10 @@ mod tests {
         let lease = controller
             .try_begin_directory("drive", &local.item_id)
             .unwrap();
-        directories.mark_uploaded(&local, "remote-folder").unwrap();
+        let created = directories.record_created(&local, "remote-folder").unwrap();
+        directories
+            .mark_uploaded(&created, "remote-folder")
+            .unwrap();
         controller
             .publish_directory(&lease, &local.item_id, "remote-folder", "v1")
             .unwrap();
@@ -3623,8 +3671,11 @@ mod tests {
             .unwrap()
             .begin_empty(identity)
             .unwrap();
+        let created = directories
+            .record_created(&local_dir, "remote-folder")
+            .unwrap();
         directories
-            .mark_uploaded(&local_dir, "remote-folder")
+            .mark_uploaded(&created, "remote-folder")
             .unwrap();
         let mut remote_folder = file_item();
         remote_folder.item_id = "remote-folder".into();
