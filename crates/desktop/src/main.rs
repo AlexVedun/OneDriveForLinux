@@ -385,6 +385,10 @@ fn virtual_directories_text(directories: &[UiVirtualDirectory]) -> String {
         .iter()
         .filter(|item| item.status == "waiting-parent")
         .count();
+    let verifying = directories
+        .iter()
+        .filter(|item| item.status == "verifying")
+        .count();
     let uploaded = directories
         .iter()
         .filter(|item| item.status == "uploaded")
@@ -397,7 +401,7 @@ fn virtual_directories_text(directories: &[UiVirtualDirectory]) -> String {
         return String::new();
     }
     let mut text = format!(
-        "Новые папки: {pending} ожидают отправки, {waiting} ждут родителя, {uploaded} созданы в OneDrive, {} требуют сверки.",
+        "Новые папки: {pending} ожидают отправки, {waiting} ждут родителя, {verifying} ждут проверки в OneDrive, {uploaded} созданы в OneDrive, {} требуют сверки.",
         issues.len()
     );
     if let Some(issue) = issues.first() {
@@ -2496,12 +2500,17 @@ mod tests {
                 status: "waiting-parent".into(),
             },
             UiVirtualDirectory {
+                name: "checking".into(),
+                status: "verifying".into(),
+            },
+            UiVirtualDirectory {
                 name: "duplicate".into(),
                 status: "name-conflict".into(),
             },
         ];
         let text = virtual_directories_text(&directories);
         assert!(text.contains("1 ждут родителя"));
+        assert!(text.contains("1 ждут проверки в OneDrive"));
         assert!(text.contains("1 созданы в OneDrive"));
         assert!(text.contains("Папка «duplicate»: имя занято"));
     }
