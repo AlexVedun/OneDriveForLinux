@@ -1,7 +1,7 @@
 mod tray;
 
 use adw::{gio, gtk, prelude::*};
-use onedrive_core::{BUS_NAME, INTERFACE_NAME, OBJECT_PATH};
+use onedrive_core::{BUS_NAME, DAEMON_API_REVISION, INTERFACE_NAME, OBJECT_PATH};
 use serde::Deserialize;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -112,7 +112,19 @@ fn login_error_text(error: &str) -> String {
 }
 
 fn read_status() -> String {
-    daemon_call("Status").unwrap_or_else(|_| "daemon-unavailable".to_owned())
+    let status = daemon_call("Status").ok();
+    let revision = status
+        .as_ref()
+        .and_then(|_| daemon_call("ApiRevision").ok());
+    classify_daemon_status(status, revision)
+}
+
+fn classify_daemon_status(status: Option<String>, revision: Option<u32>) -> String {
+    match (status, revision) {
+        (Some(status), Some(DAEMON_API_REVISION)) => status,
+        (Some(_), _) => "daemon-outdated".to_owned(),
+        (None, _) => "daemon-unavailable".to_owned(),
+    }
 }
 
 fn state_label(state: &str) -> &str {
@@ -127,6 +139,9 @@ fn state_label(state: &str) -> &str {
         "connected" => "Подключено",
         "synced" => "Синхронизировано",
         "daemon-unavailable" => "Фоновый процесс недоступен",
+        "daemon-outdated" => {
+            "Работает старый фоновый процесс. Завершите прежнее приложение и запустите AppImage заново"
+        }
         _ => state,
     }
 }
@@ -156,6 +171,10 @@ fn attention_notification(
         "daemon-unavailable" => Some((
             "Фоновый процесс недоступен",
             "Запустите демон OneDrive для Linux.",
+        )),
+        "daemon-outdated" => Some((
+            "Запущен старый демон OneDrive",
+            "Завершите прежнее приложение и запустите новый AppImage заново.",
         )),
         _ => None,
     }
@@ -2610,6 +2629,24 @@ mod tests {
             state_label("daemon-unavailable"),
             "Фоновый процесс недоступен"
         );
+    }
+
+    #[test]
+    fn old_daemon_is_not_reported_as_current_after_appimage_rebuild() {
+        assert_eq!(
+            classify_daemon_status(Some("connected".to_owned()), Some(DAEMON_API_REVISION)),
+            "connected"
+        );
+        assert_eq!(
+            classify_daemon_status(Some("connected".to_owned()), None),
+            "daemon-outdated"
+        );
+        assert_eq!(
+            classify_daemon_status(Some("connected".to_owned()), Some(DAEMON_API_REVISION + 1)),
+            "daemon-outdated"
+        );
+        assert_eq!(classify_daemon_status(None, None), "daemon-unavailable");
+        assert!(state_label("daemon-outdated").contains("старый фоновый процесс"));
     }
 
     #[test]
