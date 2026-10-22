@@ -1105,6 +1105,147 @@ impl Daemon {
         })
     }
 
+    /// Resolve an uncertain upload only when the current cloud bytes equal the draft.
+    async fn reconcile_virtual_draft(&self, item_id: String) -> zbus::fdo::Result<String> {
+        if item_id.is_empty() || self.sync_paused()? {
+            return Err(zbus::fdo::Error::Failed(
+                "invalid item or sync is paused".into(),
+            ));
+        }
+        if self.scan_in_progress.load(Ordering::SeqCst)
+            || self.download_in_progress.load(Ordering::SeqCst)
+            || self
+                .upload_in_progress
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+        {
+            return Err(zbus::fdo::Error::Failed(
+                "transfer is already running".into(),
+            ));
+        }
+        let _busy = BusyFlagGuard(Arc::clone(&self.upload_in_progress));
+        let draft_status = self
+            .virtual_draft_statuses()?
+            .into_iter()
+            .find(|draft| draft.item_id == item_id && draft.status == "remote-changed")
+            .ok_or_else(|| {
+                zbus::fdo::Error::Failed("draft is not awaiting cloud comparison".into())
+            })?;
+        let drive_id = draft_status.drive_id;
+        let root = state_directory()
+            .map_err(|_| zbus::fdo::Error::Failed("cannot access draft directory".into()))?
+            .join("virtual-drafts");
+        let identity = DraftStore::open(&root)
+            .and_then(|store| store.recover_item(&drive_id, &item_id))
+            .map_err(|_| zbus::fdo::Error::Failed("cannot read draft".into()))?
+            .ok_or_else(|| zbus::fdo::Error::Failed("draft is missing".into()))?
+            .identity()
+            .clone();
+        if identity.new_file.is_some() {
+            return Err(zbus::fdo::Error::Failed(
+                "cloud comparison requires an existing file".into(),
+            ));
+        }
+        let controller = self
+            .virtual_mount
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|mounted| mounted.published_versions.clone());
+        let _publication = controller
+            .as_ref()
+            .map(|controller| controller.try_begin_existing(&drive_id, &item_id))
+            .transpose()
+            .map_err(|_| {
+                zbus::fdo::Error::Failed("close the virtual file before comparing".into())
+            })?;
+        let snapshot_root = root.clone();
+        let snapshot = tokio::task::spawn_blocking(move || {
+            DraftStore::open(&snapshot_root)?.snapshot(&identity)
+        })
+        .await
+        .map_err(|_| zbus::fdo::Error::Failed("draft snapshot task failed".into()))?
+        .map_err(|_| zbus::fdo::Error::Failed("cannot snapshot draft".into()))?
+        .ok_or_else(|| zbus::fdo::Error::Failed("draft is missing".into()))?;
+        let client_id = client_id().ok_or_else(|| {
+            zbus::fdo::Error::Failed("ONEDRIVE_CLIENT_ID is not configured".into())
+        })?;
+        let token = access_token(&client_id)
+            .await
+            .map_err(|_| zbus::fdo::Error::Failed("login is required".into()))?;
+        let graph = GraphClient::new()
+            .map_err(|_| zbus::fdo::Error::Failed("cannot create Graph client".into()))?;
+        let mut transfer_state = TransferStateGuard::start(&self.state);
+        let Some(etag) = graph
+            .identical_remote_file_version(
+                &drive_id,
+                &item_id,
+                snapshot.size,
+                &snapshot.sha256,
+                &token,
+            )
+            .await
+            .map_err(|_| zbus::fdo::Error::Failed("cannot compare cloud contents".into()))?
+        else {
+            transfer_state.finish();
+            return Ok("different".into());
+        };
+        let catalog_matches = self
+            .catalog
+            .lock()
+            .unwrap()
+            .item(&drive_id, &item_id)
+            .map_err(|_| zbus::fdo::Error::Failed("cannot recheck catalog".into()))?
+            .is_some_and(|item| {
+                !item.deleted
+                    && item.kind == "file"
+                    && item.etag.as_deref() == Some(&etag)
+                    && item.size == i64::try_from(snapshot.size).ok()
+            });
+        if !catalog_matches {
+            return Err(zbus::fdo::Error::Failed(
+                "catalog changed during comparison; draft retained".into(),
+            ));
+        }
+        if controller.is_some() {
+            let request = DownloadRequest {
+                drive_id: drive_id.clone(),
+                item_id: item_id.clone(),
+                etag: etag.clone(),
+                size: snapshot.size,
+            };
+            let cache_root = state_directory()
+                .map_err(|_| zbus::fdo::Error::Failed("cannot access cache".into()))?
+                .join("virtual-cache");
+            let path = snapshot.file.path().to_path_buf();
+            tokio::task::spawn_blocking(move || {
+                CacheStore::open_waiting(&cache_root, VIRTUAL_CACHE_BYTES)
+                    .and_then(|mut cache| cache.put(&request.cache_key(), &path, request.size))
+            })
+            .await
+            .map_err(|_| zbus::fdo::Error::Failed("cache task failed; draft retained".into()))?
+            .map_err(|_| {
+                zbus::fdo::Error::Failed("cannot cache matching file; draft retained".into())
+            })?;
+        }
+        let size = snapshot.size;
+        let acknowledged =
+            tokio::task::spawn_blocking(move || DraftStore::open(&root)?.acknowledge(&snapshot))
+                .await
+                .map_err(|_| zbus::fdo::Error::Failed("draft acknowledgement task failed".into()))?
+                .map_err(|_| zbus::fdo::Error::Failed("cannot acknowledge draft".into()))?;
+        if acknowledged && let Some(controller) = controller {
+            controller.publish_existing(&item_id, etag, size);
+        }
+        transfer_state.finish();
+        Ok(if acknowledged {
+            "identical-acknowledged"
+        } else {
+            "changed-locally"
+        }
+        .into())
+    }
+
     /// Device status and optional unprivileged mount helper status.
     fn virtual_fuse_diagnostics(&self) -> (String, bool) {
         let device = match preflight::check_fuse_device() {

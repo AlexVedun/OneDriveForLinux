@@ -498,6 +498,15 @@ fn upload_virtual_draft(item_id: &str) -> Result<String, String> {
         .map_err(|error| error.to_string())
 }
 
+fn reconcile_virtual_draft(item_id: &str) -> Result<String, String> {
+    let connection = zbus::blocking::Connection::session().map_err(|error| error.to_string())?;
+    let proxy = zbus::blocking::Proxy::new(&connection, BUS_NAME, OBJECT_PATH, INTERFACE_NAME)
+        .map_err(|error| error.to_string())?;
+    proxy
+        .call("ReconcileVirtualDraft", &(item_id))
+        .map_err(|error| error.to_string())
+}
+
 fn export_virtual_draft(drive_id: &str, item_id: &str, destination: &str) -> Result<(), String> {
     let connection = zbus::blocking::Connection::session().map_err(|error| error.to_string())?;
     let proxy = zbus::blocking::Proxy::new(&connection, BUS_NAME, OBJECT_PATH, INTERFACE_NAME)
@@ -1595,6 +1604,60 @@ fn present_virtual_drafts_dialog(
                 },
             );
         });
+        if draft.status == "remote-changed" && upload_enabled {
+            let compare = gtk::Button::with_label("Проверить содержимое в OneDrive");
+            row.append(&compare);
+            let item_id = draft.item_id.clone();
+            let result = result.clone();
+            let controls = controls.clone();
+            let rows = rows.clone();
+            let row = row.clone();
+            let state = state.clone();
+            compare.connect_clicked(move |button| {
+                button.set_sensitive(false);
+                result.set_text("Сравнение облачного файла с локальным черновиком…");
+                let (sender, receiver) = std::sync::mpsc::channel();
+                let item_id = item_id.clone();
+                std::thread::spawn(move || {
+                    let _ = sender.send(reconcile_virtual_draft(&item_id));
+                });
+                let button = button.clone();
+                let result = result.clone();
+                let controls = controls.clone();
+                let rows = rows.clone();
+                let row = row.clone();
+                let state = state.clone();
+                gtk::glib::timeout_add_local(Duration::from_millis(100), move || {
+                    match receiver.try_recv() {
+                        Ok(Ok(outcome)) if outcome == "identical-acknowledged" => {
+                            rows.remove(&row);
+                            result.set_text("Содержимое совпадает. Облачная копия подтверждена, черновик закрыт.");
+                            controls.refresh();
+                        }
+                        Ok(Ok(outcome)) => {
+                            state.set_text(if outcome == "different" {
+                                "Облачный файл отличается. Черновик сохранён; сравните копии вручную."
+                            } else {
+                                "Во время проверки появились новые локальные правки. Черновик сохранён."
+                            });
+                            result.set_text("Черновик оставлен без изменений.");
+                            button.set_sensitive(true);
+                            controls.refresh();
+                        }
+                        Ok(Err(error)) => {
+                            result.set_text(&format!("Не удалось сравнить файлы: {error}"));
+                            button.set_sensitive(true);
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Empty) => return gtk::glib::ControlFlow::Continue,
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            result.set_text("Не удалось получить результат сравнения");
+                            button.set_sensitive(true);
+                        }
+                    }
+                    gtk::glib::ControlFlow::Break
+                });
+            });
+        }
         if upload_enabled && matches!(draft.status.as_str(), "ready" | "ready-new") {
             let send = gtk::Button::with_label("Отправить в OneDrive");
             row.append(&send);
