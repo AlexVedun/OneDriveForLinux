@@ -54,6 +54,7 @@ const KEYRING_USER: &str = "personal";
 const VIRTUAL_CACHE_BYTES: u64 = 1024 * 1024 * 1024;
 const MIN_VIRTUAL_CACHE_BYTES: u64 = VIRTUAL_CACHE_BYTES / 4;
 const MAX_VIRTUAL_CACHE_BYTES: u64 = VIRTUAL_CACHE_BYTES * 64;
+const MAX_AUTO_RECONCILE_BYTES: u64 = 16 * 1024 * 1024;
 
 struct BusyFlagGuard(Arc<AtomicBool>);
 
@@ -567,7 +568,10 @@ impl Daemon {
             .collect::<zbus::fdo::Result<Vec<_>>>()
     }
 
-    fn virtual_auto_upload_candidate(&self, after: Option<&str>) -> Option<(String, String)> {
+    fn virtual_auto_upload_candidate(
+        &self,
+        after: Option<&str>,
+    ) -> Option<(String, String, virtual_drafts::AutoDraftAction)> {
         if !matches!(
             *self.state.lock().unwrap(),
             EngineState::Connected | EngineState::Synced
@@ -580,12 +584,24 @@ impl Daemon {
         {
             return None;
         }
-        let statuses = self.virtual_draft_statuses().ok()?;
-        let item_id = virtual_drafts::next_ready_item_id(&statuses, after)?;
-        statuses
-            .iter()
-            .find(|draft| draft.item_id == item_id && matches!(draft.status, "ready" | "ready-new"))
-            .map(|draft| (draft.drive_id.clone(), draft.item_id.clone()))
+        let mut statuses = self.virtual_draft_statuses().ok()?;
+        let root = state_directory().ok()?.join("virtual-drafts");
+        let store = DraftStore::open(&root).ok()?;
+        statuses.retain(|draft| {
+            if draft.status != "remote-changed"
+                || draft.last_upload_issue != Some(DraftUploadIssue::TransferFailed)
+            {
+                return true;
+            }
+            store
+                .recover_item(&draft.drive_id, &draft.item_id)
+                .ok()
+                .flatten()
+                .and_then(|file| file.len().ok())
+                .is_some_and(|size| size <= MAX_AUTO_RECONCILE_BYTES)
+        });
+        virtual_drafts::next_auto_candidate(&statuses, after)
+            .map(|(draft, action)| (draft.drive_id.clone(), draft.item_id.clone(), action))
     }
 }
 
@@ -3759,15 +3775,46 @@ async fn poll_virtual_drafts(daemon: Daemon) {
     let mut last_attempted = None;
     loop {
         interval.tick().await;
-        let Some((drive_id, item_id)) =
+        let Some((drive_id, item_id, action)) =
             daemon.virtual_auto_upload_candidate(last_attempted.as_deref())
         else {
             continue;
         };
         last_attempted = Some(item_id.clone());
-        if let Err(error) = daemon.run_virtual_draft_upload(item_id.clone()).await {
-            let issue = virtual_upload_issue(&error);
-            let http_status = virtual_upload_http_status(&error);
+        let result = match action {
+            virtual_drafts::AutoDraftAction::Upload => {
+                daemon.run_virtual_draft_upload(item_id.clone()).await
+            }
+            virtual_drafts::AutoDraftAction::Reconcile => {
+                daemon.reconcile_virtual_draft(item_id.clone()).await
+            }
+        };
+        let failure = match result {
+            Ok(outcome)
+                if action == virtual_drafts::AutoDraftAction::Reconcile
+                    && matches!(outcome.as_str(), "different" | "changed-locally") =>
+            {
+                Some((DraftUploadIssue::RemoteChanged, None, false))
+            }
+            Ok(_) => None,
+            Err(error) => {
+                let issue = if action == virtual_drafts::AutoDraftAction::Reconcile {
+                    if error.to_string().contains("catalog changed") {
+                        DraftUploadIssue::RemoteChanged
+                    } else {
+                        DraftUploadIssue::TransferFailed
+                    }
+                } else {
+                    virtual_upload_issue(&error)
+                };
+                Some((
+                    issue,
+                    virtual_upload_http_status(&error),
+                    issue != DraftUploadIssue::RemoteChanged,
+                ))
+            }
+        };
+        if let Some((issue, http_status, retry)) = failure {
             let result = tokio::task::spawn_blocking(move || {
                 record_virtual_upload_failure(&drive_id, &item_id, issue, http_status)
             })
@@ -3775,8 +3822,10 @@ async fn poll_virtual_drafts(daemon: Daemon) {
             if !matches!(result, Ok(Ok(()))) {
                 eprintln!("cannot record automatic virtual draft upload failure");
             }
-            eprintln!("automatic virtual draft upload failed; local draft retained");
-            tokio::time::sleep(Duration::from_secs(300)).await;
+            if retry {
+                eprintln!("automatic virtual draft upload failed; local draft retained");
+                tokio::time::sleep(Duration::from_secs(300)).await;
+            }
         }
     }
 }

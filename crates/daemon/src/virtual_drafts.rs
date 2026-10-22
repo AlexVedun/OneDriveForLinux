@@ -12,6 +12,39 @@ pub struct VirtualDraftStatus {
     pub last_upload_http_status: Option<u16>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AutoDraftAction {
+    Upload,
+    Reconcile,
+}
+
+pub fn next_auto_candidate<'a>(
+    statuses: &'a [VirtualDraftStatus],
+    after: Option<&str>,
+) -> Option<(&'a VirtualDraftStatus, AutoDraftAction)> {
+    let ready = next_ready_item_id(statuses, after);
+    if let Some(item_id) = ready {
+        return statuses
+            .iter()
+            .find(|draft| draft.item_id == item_id)
+            .map(|draft| (draft, AutoDraftAction::Upload));
+    }
+    statuses
+        .iter()
+        .find(|draft| {
+            draft.item_id.as_str() > after.unwrap_or("")
+                && draft.status == "remote-changed"
+                && draft.last_upload_issue == Some(DraftUploadIssue::TransferFailed)
+        })
+        .or_else(|| {
+            statuses.iter().find(|draft| {
+                draft.status == "remote-changed"
+                    && draft.last_upload_issue == Some(DraftUploadIssue::TransferFailed)
+            })
+        })
+        .map(|draft| (draft, AutoDraftAction::Reconcile))
+}
+
 pub fn next_ready_item_id<'a>(
     statuses: &'a [VirtualDraftStatus],
     after: Option<&str>,
@@ -166,5 +199,25 @@ mod tests {
         let mut new = statuses[1].clone();
         new.status = "ready-new";
         assert_eq!(next_ready_item_id(&[new], None), Some("second"));
+    }
+
+    #[test]
+    fn automatic_reconcile_only_follows_uncertain_transfer() {
+        let base = classify(&draft(), Some("drive"), true, Some(&item()));
+        let mut changed = base.clone();
+        changed.item_id = "changed".into();
+        changed.status = "remote-changed";
+        assert!(next_auto_candidate(&[changed.clone()], None).is_none());
+        changed.last_upload_issue = Some(DraftUploadIssue::RemoteChanged);
+        assert!(next_auto_candidate(&[changed.clone()], None).is_none());
+        changed.last_upload_issue = Some(DraftUploadIssue::TransferFailed);
+        assert_eq!(
+            next_auto_candidate(&[changed.clone()], None).map(|(_, action)| action),
+            Some(AutoDraftAction::Reconcile)
+        );
+        assert_eq!(
+            next_auto_candidate(&[changed, base], None).map(|(_, action)| action),
+            Some(AutoDraftAction::Upload)
+        );
     }
 }

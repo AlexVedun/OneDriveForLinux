@@ -543,7 +543,7 @@ fn valid_comparison_version<'a>(
     size: u64,
 ) -> Option<&'a str> {
     (item.id == id && item.size == Some(size) && item.file.is_some())
-        .then(|| item.etag.as_deref())
+        .then_some(item.etag.as_deref())
         .flatten()
         .filter(|etag| !etag.is_empty())
 }
