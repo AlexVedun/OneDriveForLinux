@@ -39,7 +39,7 @@ revision=$(gdbus call --session \
     --dest io.github.onedrive_linux.Daemon \
     --object-path /io/github/onedrive_linux/Daemon \
     --method io.github.onedrive_linux.Daemon.ApiRevision)
-test "$revision" = "(uint32 1,)"
+test "$revision" = "(uint32 2,)"
 
 # A second client can still query the daemon after the first one disconnects.
 result=$(gdbus call --session \
@@ -61,6 +61,9 @@ gdbus introspect --session \
 gdbus introspect --session \
     --dest io.github.onedrive_linux.Daemon \
     --object-path /io/github/onedrive_linux/Daemon | grep -q MountVirtualDrive
+gdbus introspect --session \
+    --dest io.github.onedrive_linux.Daemon \
+    --object-path /io/github/onedrive_linux/Daemon | grep -q ReconcileVirtualDraft
 cache_stats=$(gdbus call --session \
     --dest io.github.onedrive_linux.Daemon \
     --object-path /io/github/onedrive_linux/Daemon \

@@ -6,7 +6,7 @@ pub const BUS_NAME: &str = "io.github.onedrive_linux.Daemon";
 pub const OBJECT_PATH: &str = "/io/github/onedrive_linux/Daemon";
 pub const INTERFACE_NAME: &str = "io.github.onedrive_linux.Daemon";
 /// Bump when the desktop needs a new daemon API to handle virtual uploads safely.
-pub const DAEMON_API_REVISION: u32 = 1;
+pub const DAEMON_API_REVISION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EngineState {

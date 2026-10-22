@@ -10,6 +10,7 @@ use reqwest::{
     header::{CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, IF_MATCH, RETRY_AFTER},
 };
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use std::path::Path;
 use std::time::Duration;
 
@@ -534,6 +535,33 @@ fn version_matches(item: &DownloadItemVersion, id: &str, etag: &str, size: u64) 
         && item.etag.as_deref() == Some(etag)
         && item.size == Some(size)
         && item.file.is_some()
+}
+
+fn valid_comparison_version<'a>(
+    item: &'a DownloadItemVersion,
+    id: &str,
+    size: u64,
+) -> Option<&'a str> {
+    (item.id == id && item.size == Some(size) && item.file.is_some())
+        .then(|| item.etag.as_deref())
+        .flatten()
+        .filter(|etag| !etag.is_empty())
+}
+
+fn confirmed_identical_content(
+    before: &DownloadItemVersion,
+    after: &DownloadItemVersion,
+    item_id: &str,
+    expected_size: u64,
+    expected_sha256: &str,
+    actual_size: u64,
+    actual_sha256: &str,
+) -> Option<String> {
+    let etag = valid_comparison_version(before, item_id, expected_size)?;
+    (actual_size == expected_size
+        && actual_sha256 == expected_sha256
+        && valid_comparison_version(after, item_id, expected_size) == Some(etag))
+    .then(|| etag.to_owned())
 }
 
 async fn upload_error(response: reqwest::Response) -> UploadError {
@@ -1239,6 +1267,47 @@ impl GraphClient {
         )
     }
 
+    /// Confirm a possibly committed upload without trusting a changed eTag alone.
+    /// A stable remote version and an exact byte hash are both required.
+    pub async fn identical_remote_file_version(
+        &self,
+        drive_id: &str,
+        item_id: &str,
+        expected_size: u64,
+        expected_sha256: &str,
+        access_token: &str,
+    ) -> Result<Option<String>, FetchError> {
+        let before = self.item_version(drive_id, item_id, access_token).await?;
+        if valid_comparison_version(&before, item_id, expected_size).is_none() {
+            return Ok(None);
+        }
+        let mut response = self
+            .content_response(drive_id, item_id, access_token)
+            .await?;
+        let mut hasher = Sha256::new();
+        let mut size = 0_u64;
+        while let Some(chunk) = response.chunk().await.map_err(transport_fetch_error)? {
+            size = size
+                .checked_add(chunk.len() as u64)
+                .ok_or(FetchError::Failed)?;
+            if size > expected_size {
+                return Ok(None);
+            }
+            hasher.update(&chunk);
+        }
+        let after = self.item_version(drive_id, item_id, access_token).await?;
+        let digest = format!("{:x}", hasher.finalize());
+        Ok(confirmed_identical_content(
+            &before,
+            &after,
+            item_id,
+            expected_size,
+            expected_sha256,
+            size,
+            &digest,
+        ))
+    }
+
     pub async fn matches_created_virtual_file(
         &self,
         drive_id: &str,
@@ -1348,6 +1417,45 @@ mod tests {
     use super::*;
     use reqwest::header::AUTHORIZATION;
 
+    #[test]
+    fn identical_cloud_content_requires_stable_file_version_and_exact_bytes() {
+        let version = DownloadItemVersion {
+            id: "item".into(),
+            etag: Some("new-etag".into()),
+            size: Some(4),
+            file: Some(serde_json::json!({})),
+        };
+        let digest = format!("{:x}", Sha256::digest(b"edit"));
+        assert_eq!(
+            confirmed_identical_content(&version, &version, "item", 4, &digest, 4, &digest),
+            Some("new-etag".into())
+        );
+        assert_eq!(
+            confirmed_identical_content(&version, &version, "item", 4, &digest, 4, "wrong"),
+            None
+        );
+        let changed = DownloadItemVersion {
+            etag: Some("later-etag".into()),
+            ..version
+        };
+        assert_eq!(
+            confirmed_identical_content(
+                &changed,
+                &DownloadItemVersion {
+                    id: "item".into(),
+                    etag: Some("new-etag".into()),
+                    size: Some(4),
+                    file: Some(serde_json::json!({}))
+                },
+                "item",
+                4,
+                &digest,
+                4,
+                &digest
+            ),
+            None
+        );
+    }
     #[test]
     fn virtual_download_preserves_offline_and_version_failures() {
         assert_eq!(
