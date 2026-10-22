@@ -10,8 +10,8 @@ use crate::{
 use fuser::{
     BackgroundSession, Config, CopyFileRangeFlags, Errno, FileAttr, FileHandle, FileType,
     Filesystem, FopenFlags, Generation, INodeNo, MountOption, OpenAccMode, OpenFlags, ReplyAttr,
-    ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyLseek, ReplyOpen,
-    ReplyStatfs, ReplyWrite, Request,
+    ReplyCreate, ReplyData, ReplyDirectory, ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyLseek,
+    ReplyOpen, ReplyStatfs, ReplyWrite, Request,
 };
 use onedrive_cache::CacheStore;
 use std::collections::{HashMap, HashSet};
@@ -445,11 +445,30 @@ impl VirtualFuse {
     }
 
     fn attr(&self, node: &Node) -> Result<FileAttr, Errno> {
+        let store = if node.kind == NodeKind::Directory {
+            None
+        } else {
+            self.draft_root
+                .as_ref()
+                .map(|root| DraftStore::open(root).map_err(|_| Errno::EIO))
+                .transpose()?
+        };
+        self.attr_with_store(node, store.as_ref())
+    }
+
+    fn attr_with_store(&self, node: &Node, store: Option<&DraftStore>) -> Result<FileAttr, Errno> {
         let directory = node.kind == NodeKind::Directory;
         let draft_attributes = if directory {
             None
         } else {
-            self.draft_for_node(node)?
+            store
+                .map(|store| {
+                    store
+                        .recover_item(self.tree.drive_id(), &node.item_id)
+                        .map_err(|_| Errno::EIO)
+                })
+                .transpose()?
+                .flatten()
                 .map(|draft| draft.attributes().map_err(|_| Errno::EIO))
                 .transpose()?
         };
@@ -485,6 +504,15 @@ impl VirtualFuse {
             blksize: 4096,
             flags: 0,
         })
+    }
+
+    fn directory_entry_attr(
+        &self,
+        inode: u64,
+        store: Option<&DraftStore>,
+    ) -> Result<FileAttr, Errno> {
+        let node = self.node(inode).ok_or(Errno::ENOENT)?;
+        self.attr_with_store(&node, store)
     }
 
     fn draft_for_node(&self, node: &Node) -> Result<Option<DraftFile>, Errno> {
@@ -2027,6 +2055,63 @@ impl Filesystem for VirtualFuse {
             .min(entries.len());
         for (index, (ino, kind, name)) in entries.into_iter().enumerate().skip(start) {
             if reply.add(INodeNo(ino), (index + 1) as u64, kind, name) {
+                break;
+            }
+        }
+        reply.ok();
+    }
+
+    fn readdirplus(
+        &self,
+        _request: &Request,
+        inode: INodeNo,
+        _handle: FileHandle,
+        offset: u64,
+        mut reply: ReplyDirectoryPlus,
+    ) {
+        let Some(entries) = self.directory_entries(inode.0) else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        let start = usize::try_from(offset)
+            .unwrap_or(entries.len())
+            .min(entries.len());
+        let store = if entries[start..]
+            .iter()
+            .any(|(_, kind, _)| *kind == FileType::RegularFile)
+        {
+            match self
+                .draft_root
+                .as_ref()
+                .map(|root| DraftStore::open(root).map_err(|_| Errno::EIO))
+                .transpose()
+            {
+                Ok(store) => store,
+                Err(error) => {
+                    reply.error(error);
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        for (index, (entry_inode, _, name)) in entries.into_iter().enumerate().skip(start) {
+            let attr = self.directory_entry_attr(entry_inode, store.as_ref());
+            let attr = match attr {
+                Ok(attr) => attr,
+                Err(error) => {
+                    reply.error(error);
+                    return;
+                }
+            };
+            if reply.add(
+                attr.ino,
+                (index + 1) as u64,
+                name,
+                &TTL,
+                &attr,
+                Generation(0),
+            ) {
                 break;
             }
         }
@@ -3871,6 +3956,62 @@ mod tests {
         assert!(fuse.read_file(inode, handle, 0, 1).is_err());
         fuse.open_file(inode, OpenFlags(libc::O_RDONLY)).unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn directory_plus_entry_attributes_follow_local_edits() {
+        let dir = tempfile::tempdir().unwrap();
+        let draft_root = dir.path().join("drafts");
+        let fuse = VirtualFuse::new_writable(
+            VirtualTree::from_items("drive", "root", [file_item()]).unwrap(),
+            dir.path().join("cache"),
+            draft_root.clone(),
+            10,
+            Arc::new(|_| Err(io::ErrorKind::NotConnected.into())),
+        );
+        let (created, handle) = fuse
+            .create_file(ROOT_INODE, "new.txt", OpenFlags(libc::O_RDWR))
+            .unwrap();
+        fuse.write_file(created.inode, handle, 0, b"local data")
+            .unwrap();
+        let remote_inode = fuse.lookup_node(ROOT_INODE, "текст.txt").unwrap().inode;
+        let remote_handle = fuse
+            .open_file(remote_inode, OpenFlags(libc::O_WRONLY | libc::O_TRUNC))
+            .unwrap();
+        fuse.write_file(remote_inode, remote_handle, 0, b"edited!")
+            .unwrap();
+
+        let store = DraftStore::open(&draft_root).unwrap();
+        let entries: Vec<_> = fuse
+            .directory_entries(ROOT_INODE)
+            .unwrap()
+            .into_iter()
+            .map(|(inode, _, name)| {
+                (
+                    name,
+                    fuse.directory_entry_attr(inode, Some(&store)).unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            entries
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>(),
+            [".", "..", "new.txt", "текст.txt"]
+        );
+        assert_eq!(entries[0].1.ino, INodeNo(ROOT_INODE));
+        assert_eq!(entries[0].1.kind, FileType::Directory);
+        assert_eq!(entries[1].1.ino, INodeNo(ROOT_INODE));
+        assert_eq!(entries[2].1.ino, INodeNo(created.inode));
+        assert_eq!(entries[2].1.size, 10);
+        assert_eq!(entries[2].1.kind, FileType::RegularFile);
+        assert_eq!(entries[3].1.size, 7);
+        assert_eq!(
+            fuse.directory_entry_attr(u64::MAX, Some(&store))
+                .unwrap_err(),
+            Errno::ENOENT
+        );
     }
 
     #[test]
