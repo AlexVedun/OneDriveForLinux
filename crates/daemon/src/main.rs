@@ -15,7 +15,7 @@ use keyring::v1::Entry;
 use oauth2::{TokenResponse, basic::BasicTokenResponse};
 use onedrive_cache::{CacheError, CacheStore};
 use onedrive_catalog::{Catalog, CatalogItem, FetchError};
-use onedrive_core::{BUS_NAME, EngineState, OBJECT_PATH};
+use onedrive_core::{BUS_NAME, DAEMON_API_REVISION, EngineState, OBJECT_PATH};
 use onedrive_mount::{DownloadRequest, VirtualTree};
 use onedrive_mount::{
     directory::DirectoryStore,
@@ -1374,6 +1374,11 @@ impl Daemon {
         .await
         .map_err(|_| zbus::fdo::Error::Failed("cache limit task failed".to_owned()))?
         .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))
+    }
+
+    #[zbus(name = "ApiRevision")]
+    fn api_revision(&self) -> u32 {
+        DAEMON_API_REVISION
     }
 
     fn status(&self) -> String {

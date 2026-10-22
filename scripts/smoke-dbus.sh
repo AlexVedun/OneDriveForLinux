@@ -35,6 +35,11 @@ while [ "$attempt" -lt 10 ]; do
 done
 
 test "${result:-}" = "('needs-login',)"
+revision=$(gdbus call --session \
+    --dest io.github.onedrive_linux.Daemon \
+    --object-path /io/github/onedrive_linux/Daemon \
+    --method io.github.onedrive_linux.Daemon.ApiRevision)
+test "$revision" = "(uint32 1,)"
 
 # A second client can still query the daemon after the first one disconnects.
 result=$(gdbus call --session \
