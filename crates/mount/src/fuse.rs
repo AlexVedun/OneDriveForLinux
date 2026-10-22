@@ -328,6 +328,13 @@ struct OpenFile {
     writable: bool,
 }
 
+type DirectoryEntry = (u64, FileType, String);
+
+struct OpenDirectory {
+    inode: u64,
+    entries: Arc<Vec<DirectoryEntry>>,
+}
+
 #[derive(Clone)]
 enum OpenHandle {
     Cached(Arc<CachedHandle>),
@@ -344,6 +351,7 @@ pub struct VirtualFuse {
     open_lock: Arc<Mutex<()>>,
     download_lock: Mutex<()>,
     files: Arc<Mutex<HashMap<u64, OpenFile>>>,
+    directories: Mutex<HashMap<u64, OpenDirectory>>,
     local_files: Arc<Mutex<HashMap<u64, Node>>>,
     directory_aliases: Arc<Mutex<HashMap<String, u64>>>,
     remote_changes: Mutex<HashMap<u64, Mutation>>,
@@ -370,6 +378,7 @@ impl VirtualFuse {
             open_lock: Arc::new(Mutex::new(())),
             download_lock: Mutex::new(()),
             files: Arc::new(Mutex::new(HashMap::new())),
+            directories: Mutex::new(HashMap::new()),
             local_files: Arc::new(Mutex::new(HashMap::new())),
             directory_aliases: Arc::new(Mutex::new(HashMap::new())),
             remote_changes: Mutex::new(HashMap::new()),
@@ -1385,7 +1394,7 @@ impl VirtualFuse {
         Ok(())
     }
 
-    fn directory_entries(&self, inode: u64) -> Option<Vec<(u64, FileType, String)>> {
+    fn directory_entries(&self, inode: u64) -> Option<Vec<DirectoryEntry>> {
         let directory = self.node(inode)?;
         if directory.kind != NodeKind::Directory {
             return None;
@@ -1472,6 +1481,49 @@ impl VirtualFuse {
         entries.extend(local_entries);
         entries[2..].sort_by(|left, right| left.2.cmp(&right.2));
         Some(entries)
+    }
+
+    fn open_directory(&self, inode: u64) -> Result<u64, Errno> {
+        let node = self.node(inode).ok_or(Errno::ENOENT)?;
+        if node.kind != NodeKind::Directory {
+            return Err(Errno::ENOTDIR);
+        }
+        let entries = self.directory_entries(inode).ok_or(Errno::ENOENT)?;
+        let handle = self.next_handle.fetch_add(1, Ordering::Relaxed);
+        self.directories.lock().unwrap().insert(
+            handle,
+            OpenDirectory {
+                inode,
+                entries: Arc::new(entries),
+            },
+        );
+        Ok(handle)
+    }
+
+    fn directory_entries_for_handle(
+        &self,
+        inode: u64,
+        handle: u64,
+    ) -> Result<Arc<Vec<DirectoryEntry>>, Errno> {
+        self.directories
+            .lock()
+            .unwrap()
+            .get(&handle)
+            .filter(|open| open.inode == inode)
+            .map(|open| Arc::clone(&open.entries))
+            .ok_or(Errno::EBADF)
+    }
+
+    fn close_directory(&self, inode: u64, handle: u64) -> Result<(), Errno> {
+        let mut directories = self.directories.lock().unwrap();
+        if directories
+            .get(&handle)
+            .is_none_or(|open| open.inode != inode)
+        {
+            return Err(Errno::EBADF);
+        }
+        directories.remove(&handle);
+        Ok(())
     }
 
     fn open_file(&self, inode: u64, flags: OpenFlags) -> Result<u64, Errno> {
@@ -2093,23 +2145,33 @@ impl Filesystem for VirtualFuse {
         }
     }
 
+    fn opendir(&self, _request: &Request, inode: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+        match self.open_directory(inode.0) {
+            Ok(handle) => reply.opened(FileHandle(handle), FopenFlags::empty()),
+            Err(error) => reply.error(error),
+        }
+    }
+
     fn readdir(
         &self,
         _request: &Request,
         inode: INodeNo,
-        _handle: FileHandle,
+        handle: FileHandle,
         offset: u64,
         mut reply: ReplyDirectory,
     ) {
-        let Some(entries) = self.directory_entries(inode.0) else {
-            reply.error(Errno::ENOENT);
-            return;
+        let entries = match self.directory_entries_for_handle(inode.0, handle.0) {
+            Ok(entries) => entries,
+            Err(error) => {
+                reply.error(error);
+                return;
+            }
         };
         let start = usize::try_from(offset)
             .unwrap_or(entries.len())
             .min(entries.len());
-        for (index, (ino, kind, name)) in entries.into_iter().enumerate().skip(start) {
-            if reply.add(INodeNo(ino), (index + 1) as u64, kind, name) {
+        for (index, (ino, kind, name)) in entries.iter().enumerate().skip(start) {
+            if reply.add(INodeNo(*ino), (index + 1) as u64, *kind, name) {
                 break;
             }
         }
@@ -2120,13 +2182,16 @@ impl Filesystem for VirtualFuse {
         &self,
         _request: &Request,
         inode: INodeNo,
-        _handle: FileHandle,
+        handle: FileHandle,
         offset: u64,
         mut reply: ReplyDirectoryPlus,
     ) {
-        let Some(entries) = self.directory_entries(inode.0) else {
-            reply.error(Errno::ENOENT);
-            return;
+        let entries = match self.directory_entries_for_handle(inode.0, handle.0) {
+            Ok(entries) => entries,
+            Err(error) => {
+                reply.error(error);
+                return;
+            }
         };
         let start = usize::try_from(offset)
             .unwrap_or(entries.len())
@@ -2150,10 +2215,11 @@ impl Filesystem for VirtualFuse {
         } else {
             None
         };
-        for (index, (entry_inode, _, name)) in entries.into_iter().enumerate().skip(start) {
-            let attr = self.directory_entry_attr(entry_inode, store.as_ref());
+        for (index, (entry_inode, _, name)) in entries.iter().enumerate().skip(start) {
+            let attr = self.directory_entry_attr(*entry_inode, store.as_ref());
             let attr = match attr {
                 Ok(attr) => attr,
+                Err(Errno::ENOENT) => continue,
                 Err(error) => {
                     reply.error(error);
                     return;
@@ -2171,6 +2237,20 @@ impl Filesystem for VirtualFuse {
             }
         }
         reply.ok();
+    }
+
+    fn releasedir(
+        &self,
+        _request: &Request,
+        inode: INodeNo,
+        handle: FileHandle,
+        _flags: OpenFlags,
+        reply: ReplyEmpty,
+    ) {
+        match self.close_directory(inode.0, handle.0) {
+            Ok(()) => reply.ok(),
+            Err(error) => reply.error(error),
+        }
     }
 
     fn create(
@@ -4158,6 +4238,78 @@ mod tests {
                 .unwrap_err(),
             Errno::ENOENT
         );
+    }
+
+    #[test]
+    fn open_directory_keeps_entry_offsets_stable_until_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let fuse = VirtualFuse::new_writable(
+            VirtualTree::from_items("drive", "root", [file_item()]).unwrap(),
+            dir.path().join("cache"),
+            dir.path().join("drafts"),
+            10,
+            Arc::new(|_| Err(io::ErrorKind::NotConnected.into())),
+        );
+        let (middle, file_handle) = fuse
+            .create_file(ROOT_INODE, "middle.txt", OpenFlags(libc::O_WRONLY))
+            .unwrap();
+        fuse.files.lock().unwrap().remove(&file_handle);
+        let handle = fuse.open_directory(ROOT_INODE).unwrap();
+        let snapshot = fuse
+            .directory_entries_for_handle(ROOT_INODE, handle)
+            .unwrap();
+        assert_eq!(
+            snapshot[2..]
+                .iter()
+                .map(|(_, _, name)| name.as_str())
+                .collect::<Vec<_>>(),
+            ["middle.txt", "текст.txt"]
+        );
+
+        let (_, file_handle) = fuse
+            .create_file(ROOT_INODE, "alpha.txt", OpenFlags(libc::O_WRONLY))
+            .unwrap();
+        fuse.files.lock().unwrap().remove(&file_handle);
+        assert_eq!(snapshot[2].0, middle.inode);
+        assert_eq!(
+            fuse.directory_entries_for_handle(ROOT_INODE, handle)
+                .unwrap()[3]
+                .2,
+            "текст.txt"
+        );
+        assert_eq!(
+            fuse.directory_entries(ROOT_INODE).unwrap()[2].2,
+            "alpha.txt"
+        );
+        fuse.remove_local_file(ROOT_INODE, "middle.txt").unwrap();
+        assert_eq!(snapshot[2].2, "middle.txt");
+        assert_eq!(
+            fuse.directory_entry_attr(middle.inode, None).unwrap_err(),
+            Errno::ENOENT
+        );
+        assert_eq!(
+            fuse.directory_entries_for_handle(middle.inode, handle)
+                .unwrap_err(),
+            Errno::EBADF
+        );
+        let remote_file = fuse.lookup_node(ROOT_INODE, "текст.txt").unwrap();
+        assert_eq!(fuse.open_directory(remote_file.inode), Err(Errno::ENOTDIR));
+        assert_eq!(fuse.open_directory(u64::MAX), Err(Errno::ENOENT));
+
+        assert_eq!(fuse.close_directory(ROOT_INODE, handle), Ok(()));
+        assert_eq!(
+            fuse.directory_entries_for_handle(ROOT_INODE, handle)
+                .unwrap_err(),
+            Errno::EBADF
+        );
+        let reopened = fuse.open_directory(ROOT_INODE).unwrap();
+        assert_eq!(
+            fuse.directory_entries_for_handle(ROOT_INODE, reopened)
+                .unwrap()[2]
+                .2,
+            "alpha.txt"
+        );
+        assert_eq!(fuse.close_directory(ROOT_INODE, reopened), Ok(()));
     }
 
     #[test]
