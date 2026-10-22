@@ -11,7 +11,7 @@ use fuser::{
     BackgroundSession, Config, CopyFileRangeFlags, Errno, FileAttr, FileHandle, FileType,
     Filesystem, FopenFlags, Generation, INodeNo, MountOption, OpenAccMode, OpenFlags, ReplyAttr,
     ReplyCreate, ReplyData, ReplyDirectory, ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyLseek,
-    ReplyOpen, ReplyStatfs, ReplyWrite, Request,
+    ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr, Request,
 };
 use onedrive_cache::CacheStore;
 use std::collections::{HashMap, HashSet};
@@ -513,6 +513,20 @@ impl VirtualFuse {
     ) -> Result<FileAttr, Errno> {
         let node = self.node(inode).ok_or(Errno::ENOENT)?;
         self.attr_with_store(&node, store)
+    }
+
+    fn check_xattr_node(&self, inode: u64) -> Result<(), Errno> {
+        self.node(inode).map(|_| ()).ok_or(Errno::ENOENT)
+    }
+
+    fn reject_xattr_write(&self, inode: u64) -> Errno {
+        if self.check_xattr_node(inode).is_err() {
+            Errno::ENOENT
+        } else if self.draft_root.is_some() {
+            Errno::EOPNOTSUPP
+        } else {
+            Errno::EROFS
+        }
     }
 
     fn draft_for_node(&self, node: &Node) -> Result<Option<DraftFile>, Errno> {
@@ -1974,6 +1988,47 @@ impl Filesystem for VirtualFuse {
         }
     }
 
+    fn setxattr(
+        &self,
+        _request: &Request,
+        inode: INodeNo,
+        _name: &OsStr,
+        _value: &[u8],
+        _flags: i32,
+        _position: u32,
+        reply: ReplyEmpty,
+    ) {
+        reply.error(self.reject_xattr_write(inode.0));
+    }
+
+    fn getxattr(
+        &self,
+        _request: &Request,
+        inode: INodeNo,
+        _name: &OsStr,
+        _size: u32,
+        reply: ReplyXattr,
+    ) {
+        match self.check_xattr_node(inode.0) {
+            Ok(()) => reply.error(Errno::ENODATA),
+            Err(error) => reply.error(error),
+        }
+    }
+
+    fn listxattr(&self, _request: &Request, inode: INodeNo, size: u32, reply: ReplyXattr) {
+        if let Err(error) = self.check_xattr_node(inode.0) {
+            reply.error(error);
+        } else if size == 0 {
+            reply.size(0);
+        } else {
+            reply.data(&[]);
+        }
+    }
+
+    fn removexattr(&self, _request: &Request, inode: INodeNo, _name: &OsStr, reply: ReplyEmpty) {
+        reply.error(self.reject_xattr_write(inode.0));
+    }
+
     fn setattr(
         &self,
         _request: &Request,
@@ -2446,6 +2501,97 @@ mod tests {
         let file_inode = fuse.lookup_node(ROOT_INODE, "текст.txt").unwrap().inode;
         assert_eq!(fuse.sync_directory(file_inode), Err(Errno::ENOTDIR));
         assert_eq!(fuse.sync_directory(u64::MAX), Err(Errno::ENOENT));
+    }
+
+    #[test]
+    fn xattrs_are_absent_and_cannot_be_written_to_virtual_items() {
+        let dir = tempfile::tempdir().unwrap();
+        let tree = VirtualTree::from_items("drive", "root", [file_item()]).unwrap();
+        let fuse = VirtualFuse::new_writable(
+            tree,
+            dir.path().join("cache"),
+            dir.path().join("drafts"),
+            10,
+            Arc::new(|_| Err(io::ErrorKind::NotConnected.into())),
+        );
+        let file = fuse.lookup_node(ROOT_INODE, "текст.txt").unwrap();
+        let (local, handle) = fuse
+            .create_file(ROOT_INODE, "local.txt", OpenFlags(libc::O_WRONLY))
+            .unwrap();
+        fuse.files.lock().unwrap().remove(&handle);
+
+        for inode in [ROOT_INODE, file.inode, local.inode] {
+            assert_eq!(fuse.check_xattr_node(inode), Ok(()));
+            assert_eq!(fuse.reject_xattr_write(inode), Errno::EOPNOTSUPP);
+        }
+        assert_eq!(fuse.check_xattr_node(u64::MAX), Err(Errno::ENOENT));
+        assert_eq!(fuse.reject_xattr_write(u64::MAX), Errno::ENOENT);
+
+        let readonly = VirtualFuse::new(
+            VirtualTree::from_items("drive", "root", [file_item()]).unwrap(),
+            dir.path().join("readonly-cache"),
+            10,
+            Arc::new(|_| Err(io::ErrorKind::NotConnected.into())),
+        );
+        assert_eq!(readonly.reject_xattr_write(file.inode), Errno::EROFS);
+    }
+
+    #[test]
+    fn mounted_virtual_xattrs_have_explicit_absent_and_unsupported_results() {
+        if std::env::var_os("ONEDRIVE_FUSE_SMOKE").is_none() {
+            return;
+        }
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mountpoint = dir.path().join("mount");
+        fs::create_dir(&mountpoint).unwrap();
+        let session = VirtualFuse::new_writable(
+            VirtualTree::from_items("drive", "root", [file_item()]).unwrap(),
+            dir.path().join("cache"),
+            dir.path().join("drafts"),
+            10,
+            Arc::new(|_| Err(io::ErrorKind::NotConnected.into())),
+        )
+        .mount(&mountpoint)
+        .unwrap();
+        let path = CString::new(mountpoint.join("текст.txt").as_os_str().as_bytes()).unwrap();
+        let name = CString::new("user.example").unwrap();
+        assert_eq!(
+            unsafe { libc::listxattr(path.as_ptr(), std::ptr::null_mut(), 0) },
+            0
+        );
+        let mut names = [0_u8; 16];
+        assert_eq!(
+            unsafe { libc::listxattr(path.as_ptr(), names.as_mut_ptr().cast(), names.len()) },
+            0
+        );
+        assert_eq!(
+            unsafe { libc::getxattr(path.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0) },
+            -1
+        );
+        assert_eq!(
+            io::Error::last_os_error().raw_os_error(),
+            Some(libc::ENODATA)
+        );
+        assert_eq!(
+            unsafe { libc::setxattr(path.as_ptr(), name.as_ptr(), b"x".as_ptr().cast(), 1, 0) },
+            -1
+        );
+        assert_eq!(
+            io::Error::last_os_error().raw_os_error(),
+            Some(libc::EOPNOTSUPP)
+        );
+        assert_eq!(
+            unsafe { libc::removexattr(path.as_ptr(), name.as_ptr()) },
+            -1
+        );
+        assert_eq!(
+            io::Error::last_os_error().raw_os_error(),
+            Some(libc::EOPNOTSUPP)
+        );
+        session.umount_and_join().unwrap();
     }
 
     #[test]
