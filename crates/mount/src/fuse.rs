@@ -11,12 +11,14 @@ use fuser::{
     BackgroundSession, Config, CopyFileRangeFlags, Errno, FileAttr, FileHandle, FileType,
     Filesystem, FopenFlags, Generation, INodeNo, MountOption, OpenAccMode, OpenFlags, ReplyAttr,
     ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyLseek, ReplyOpen,
-    ReplyWrite, Request,
+    ReplyStatfs, ReplyWrite, Request,
 };
 use onedrive_cache::CacheStore;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
+use std::fs::File;
 use std::io;
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Mutex,
@@ -25,6 +27,37 @@ use std::sync::{
 use std::time::{Duration, UNIX_EPOCH};
 
 const TTL: Duration = Duration::from_secs(1);
+
+struct LocalSpace {
+    blocks: u64,
+    free_blocks: u64,
+    available_blocks: u64,
+    files: u64,
+    free_files: u64,
+    block_size: u32,
+    fragment_size: u32,
+    name_length: u32,
+}
+
+fn local_space(path: &Path) -> io::Result<LocalSpace> {
+    let directory = File::open(path)?;
+    let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    if unsafe { libc::fstatvfs(directory.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let stat = unsafe { stat.assume_init() };
+    let block_size = u32::try_from(stat.f_bsize).unwrap_or(u32::MAX).max(1);
+    Ok(LocalSpace {
+        blocks: stat.f_blocks,
+        free_blocks: stat.f_bfree,
+        available_blocks: stat.f_bavail,
+        files: stat.f_files,
+        free_files: stat.f_ffree,
+        block_size,
+        fragment_size: u32::try_from(stat.f_frsize).unwrap_or(block_size).max(1),
+        name_length: u32::try_from(stat.f_namemax.min(255)).unwrap_or(255),
+    })
+}
 
 pub type ContentLoader = dyn Fn(&DownloadRequest) -> io::Result<()> + Send + Sync;
 
@@ -1654,6 +1687,23 @@ impl VirtualFuse {
         Ok(())
     }
 
+    fn sync_directory(&self, inode: u64) -> Result<(), Errno> {
+        let node = self.node(inode).ok_or(Errno::ENOENT)?;
+        if node.kind != NodeKind::Directory {
+            return Err(Errno::ENOTDIR);
+        }
+        if let Some(root) = &self.draft_root {
+            File::open(root)
+                .and_then(|directory| directory.sync_all())
+                .map_err(map_draft_error)?;
+        }
+        Ok(())
+    }
+
+    fn local_space(&self) -> Result<LocalSpace, Errno> {
+        local_space(self.draft_root.as_deref().unwrap_or(&self.cache_root)).map_err(map_draft_error)
+    }
+
     fn truncate_file(&self, inode: u64, handle: Option<u64>, size: u64) -> Result<(), Errno> {
         if size > i64::MAX as u64 {
             return Err(Errno::EINVAL);
@@ -2218,6 +2268,36 @@ impl Filesystem for VirtualFuse {
         }
     }
 
+    fn fsyncdir(
+        &self,
+        _request: &Request,
+        inode: INodeNo,
+        _handle: FileHandle,
+        _datasync: bool,
+        reply: ReplyEmpty,
+    ) {
+        match self.sync_directory(inode.0) {
+            Ok(()) => reply.ok(),
+            Err(error) => reply.error(error),
+        }
+    }
+
+    fn statfs(&self, _request: &Request, _inode: INodeNo, reply: ReplyStatfs) {
+        match self.local_space() {
+            Ok(space) => reply.statfs(
+                space.blocks,
+                space.free_blocks,
+                space.available_blocks,
+                space.files,
+                space.free_files,
+                space.block_size,
+                space.name_length,
+                space.fragment_size,
+            ),
+            Err(error) => reply.error(error),
+        }
+    }
+
     fn release(
         &self,
         _request: &Request,
@@ -2258,6 +2338,53 @@ mod tests {
             modified: None,
             deleted: false,
         }
+    }
+
+    #[test]
+    fn virtual_storage_reports_local_draft_space_and_syncs_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let draft_root = dir.path().join("drafts");
+        fs::create_dir(&draft_root).unwrap();
+        let fuse = VirtualFuse::new_writable(
+            VirtualTree::from_items("drive", "root", [file_item()]).unwrap(),
+            dir.path().join("cache"),
+            draft_root,
+            20,
+            Arc::new(|_| Err(io::ErrorKind::NotConnected.into())),
+        );
+        let space = fuse.local_space().unwrap();
+        assert!(space.blocks > 0);
+        assert!(space.block_size > 0);
+        assert!(space.available_blocks <= space.free_blocks);
+        assert!(space.free_blocks <= space.blocks);
+        assert_eq!(fuse.sync_directory(ROOT_INODE), Ok(()));
+        let file_inode = fuse.lookup_node(ROOT_INODE, "текст.txt").unwrap().inode;
+        assert_eq!(fuse.sync_directory(file_inode), Err(Errno::ENOTDIR));
+        assert_eq!(fuse.sync_directory(u64::MAX), Err(Errno::ENOENT));
+    }
+
+    #[test]
+    fn mounted_virtual_directory_supports_fsync_and_statvfs() {
+        if std::env::var_os("ONEDRIVE_FUSE_SMOKE").is_none() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mountpoint = dir.path().join("mount");
+        fs::create_dir(&mountpoint).unwrap();
+        let session = VirtualFuse::new_writable(
+            VirtualTree::from_items("drive", "root", [file_item()]).unwrap(),
+            dir.path().join("cache"),
+            dir.path().join("drafts"),
+            20,
+            Arc::new(|_| Err(io::ErrorKind::NotConnected.into())),
+        )
+        .mount(&mountpoint)
+        .unwrap();
+        File::open(&mountpoint).unwrap().sync_all().unwrap();
+        let space = local_space(&mountpoint).unwrap();
+        assert!(space.blocks > 0);
+        assert!(space.available_blocks > 0);
+        session.umount_and_join().unwrap();
     }
 
     #[test]
