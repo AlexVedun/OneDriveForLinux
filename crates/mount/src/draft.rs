@@ -339,11 +339,12 @@ impl DraftStore {
         identity: &DraftIdentity,
     ) -> io::Result<Option<DraftUploadCheckpoint>> {
         identity.validate()?;
+        let _lock = lock_store(&self.root)?;
         let path = self.checkpoint_path(identity);
         let mut file = match OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW)
-            .open(path)
+            .open(&path)
         {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -367,6 +368,11 @@ impl DraftStore {
                 io::ErrorKind::InvalidData,
                 "draft checkpoint identity mismatch",
             ));
+        }
+        if checkpoint.identity != *identity {
+            fs::remove_file(path)?;
+            File::open(&self.root)?.sync_all()?;
+            return Ok(None);
         }
         Ok(Some(checkpoint))
     }
@@ -1399,6 +1405,60 @@ mod tests {
         assert_eq!(
             reopened.upload_failure(&current).unwrap(),
             Some(latest_failure)
+        );
+    }
+
+    #[test]
+    fn stale_upload_checkpoint_is_removed_after_renamed_draft_reopens() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("drafts");
+        let store = DraftStore::open(&root).unwrap();
+        let original = DraftIdentity {
+            drive_id: "drive".into(),
+            item_id: "local:new".into(),
+            base_etag: "local-new".into(),
+            new_file: Some(NewFileLocation {
+                parent_id: "root".into(),
+                name: "before.txt".into(),
+            }),
+        };
+        store.begin_empty(original.clone()).unwrap();
+        let old_checkpoint = DraftUploadCheckpoint {
+            identity: original.clone(),
+            sha256: "a".repeat(64),
+            size: 100,
+            upload_url: "https://upload.example/old-session".into(),
+            next_offset: 50,
+        };
+        store.save_upload_checkpoint(&old_checkpoint).unwrap();
+        let checkpoint_path = store.checkpoint_path(&original);
+        let previous_record = fs::read(&checkpoint_path).unwrap();
+        store
+            .relocate_new(
+                "drive",
+                "local:new",
+                NewFileLocation {
+                    parent_id: "root".into(),
+                    name: "after.txt".into(),
+                },
+            )
+            .unwrap();
+        // Recreate a checkpoint left by an older uploader after relocation.
+        fs::write(&checkpoint_path, previous_record).unwrap();
+
+        let reopened = DraftStore::open(&root).unwrap();
+        let current = reopened.list().unwrap().remove(0);
+        assert!(reopened.upload_checkpoint(&current).unwrap().is_none());
+        assert!(!checkpoint_path.exists());
+        let latest_checkpoint = DraftUploadCheckpoint {
+            identity: current.clone(),
+            upload_url: "https://upload.example/new-session".into(),
+            ..old_checkpoint
+        };
+        reopened.save_upload_checkpoint(&latest_checkpoint).unwrap();
+        assert_eq!(
+            reopened.upload_checkpoint(&current).unwrap(),
+            Some(latest_checkpoint)
         );
     }
 
