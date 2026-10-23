@@ -19,7 +19,7 @@ use onedrive_core::{BUS_NAME, DAEMON_API_REVISION, EngineState, OBJECT_PATH};
 use onedrive_mount::{DownloadRequest, VirtualTree};
 use onedrive_mount::{
     directory::DirectoryStore,
-    draft::{DraftStore, DraftUploadFailure, DraftUploadIssue},
+    draft::{DraftIdentity, DraftStore, DraftUploadFailure, DraftUploadIssue},
     fuse::{PublishedVersionController, VirtualFuse},
     mutation::{Mutation, MutationKind, MutationStatus, MutationStore},
     preflight,
@@ -571,7 +571,7 @@ impl Daemon {
     fn virtual_auto_upload_candidate(
         &self,
         after: Option<&str>,
-    ) -> Option<(String, String, virtual_drafts::AutoDraftAction)> {
+    ) -> Option<(DraftIdentity, virtual_drafts::AutoDraftAction)> {
         if !matches!(
             *self.state.lock().unwrap(),
             EngineState::Connected | EngineState::Synced
@@ -600,8 +600,13 @@ impl Daemon {
                 .and_then(|file| file.len().ok())
                 .is_some_and(|size| size <= MAX_AUTO_RECONCILE_BYTES)
         });
-        virtual_drafts::next_auto_candidate(&statuses, after)
-            .map(|(draft, action)| (draft.drive_id.clone(), draft.item_id.clone(), action))
+        virtual_drafts::next_auto_candidate(&statuses, after).and_then(|(draft, action)| {
+            store
+                .recover_item(&draft.drive_id, &draft.item_id)
+                .ok()
+                .flatten()
+                .map(|file| (file.identity().clone(), action))
+        })
     }
 }
 
@@ -3775,11 +3780,12 @@ async fn poll_virtual_drafts(daemon: Daemon) {
     let mut last_attempted = None;
     loop {
         interval.tick().await;
-        let Some((drive_id, item_id, action)) =
+        let Some((identity, action)) =
             daemon.virtual_auto_upload_candidate(last_attempted.as_deref())
         else {
             continue;
         };
+        let item_id = identity.item_id.clone();
         last_attempted = Some(item_id.clone());
         let result = match action {
             virtual_drafts::AutoDraftAction::Upload => {
@@ -3816,7 +3822,7 @@ async fn poll_virtual_drafts(daemon: Daemon) {
         };
         if let Some((issue, http_status, retry)) = failure {
             let result = tokio::task::spawn_blocking(move || {
-                record_virtual_upload_failure(&drive_id, &item_id, issue, http_status)
+                record_virtual_upload_failure(&identity, issue, http_status)
             })
             .await;
             if !matches!(result, Ok(Ok(()))) {
@@ -4214,8 +4220,7 @@ fn virtual_upload_http_status(error: &zbus::fdo::Error) -> Option<u16> {
 }
 
 fn record_virtual_upload_failure(
-    drive_id: &str,
-    item_id: &str,
+    identity: &DraftIdentity,
     issue: DraftUploadIssue,
     http_status: Option<u16>,
 ) -> io::Result<()> {
@@ -4223,18 +4228,35 @@ fn record_virtual_upload_failure(
         .map_err(|_| io::Error::other("cannot access state directory"))?
         .join("virtual-drafts");
     let store = DraftStore::open(&root)?;
-    let Some(draft) = store.recover_item(drive_id, item_id)? else {
-        return Ok(());
-    };
-    store.save_upload_failure(&DraftUploadFailure {
-        identity: draft.identity().clone(),
+    record_virtual_upload_failure_in_store(&store, identity, issue, http_status)
+}
+
+fn record_virtual_upload_failure_in_store(
+    store: &DraftStore,
+    identity: &DraftIdentity,
+    issue: DraftUploadIssue,
+    http_status: Option<u16>,
+) -> io::Result<()> {
+    let result = store.save_upload_failure(&DraftUploadFailure {
+        identity: identity.clone(),
         issue,
         attempted_at_unix: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs(),
         http_status,
-    })
+    });
+    match result {
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::WouldBlock
+            ) =>
+        {
+            Ok(())
+        }
+        result => result,
+    }
 }
 
 fn state_directory() -> Result<PathBuf, Box<dyn std::error::Error>> {
@@ -4375,14 +4397,18 @@ mod tests {
         Baseline, CatalogItem, QueuedOperation, ScanCatalogError, VIRTUAL_CACHE_BYTES,
         VirtualDownloadContext, catalog_ready_for_drive, client_config_path, client_id_from_dotenv,
         client_id_from_sources, inspect_virtual_cache, is_network_failure, local_delete_candidate,
-        prepare_virtual_request, publish_virtual_file, remote_delete_candidate,
-        remote_folder_candidate, remote_rename_candidate, scan_outcome_state,
-        virtual_upload_error_text, virtual_upload_http_status, virtual_upload_issue,
+        prepare_virtual_request, publish_virtual_file, record_virtual_upload_failure_in_store,
+        remote_delete_candidate, remote_folder_candidate, remote_rename_candidate,
+        scan_outcome_state, virtual_upload_error_text, virtual_upload_http_status,
+        virtual_upload_issue,
     };
     use onedrive_cache::{CacheError, CacheStore};
     use onedrive_catalog::{Catalog, DeltaPage};
     use onedrive_core::EngineState;
-    use onedrive_mount::{DownloadRequest, draft::DraftUploadIssue};
+    use onedrive_mount::{
+        DownloadRequest,
+        draft::{DraftIdentity, DraftStore, DraftUploadIssue, NewFileLocation},
+    };
     use onedrive_sync::upload::UploadError;
     use std::fs;
     use std::io;
@@ -4445,6 +4471,53 @@ mod tests {
             virtual_upload_issue(&zbus::fdo::Error::Failed("unexpected secret URL".into())),
             DraftUploadIssue::Other
         );
+    }
+
+    #[test]
+    fn automatic_upload_failure_does_not_follow_renamed_draft() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = DraftStore::open(&temporary.path().join("drafts")).unwrap();
+        let original = DraftIdentity {
+            drive_id: "drive".into(),
+            item_id: "local:file".into(),
+            base_etag: "local-new".into(),
+            new_file: Some(NewFileLocation {
+                parent_id: "root".into(),
+                name: "before.txt".into(),
+            }),
+        };
+        store.begin_empty(original.clone()).unwrap();
+        store
+            .relocate_new(
+                "drive",
+                "local:file",
+                NewFileLocation {
+                    parent_id: "root".into(),
+                    name: "after.txt".into(),
+                },
+            )
+            .unwrap();
+
+        record_virtual_upload_failure_in_store(
+            &store,
+            &original,
+            DraftUploadIssue::TransferFailed,
+            Some(503),
+        )
+        .unwrap();
+        let current = store.recover_item("drive", "local:file").unwrap().unwrap();
+        assert!(store.upload_failure(current.identity()).unwrap().is_none());
+
+        record_virtual_upload_failure_in_store(
+            &store,
+            current.identity(),
+            DraftUploadIssue::TransferFailed,
+            Some(503),
+        )
+        .unwrap();
+        let failure = store.upload_failure(current.identity()).unwrap().unwrap();
+        assert_eq!(failure.identity, *current.identity());
+        assert_eq!(failure.http_status, Some(503));
     }
 
     #[test]
