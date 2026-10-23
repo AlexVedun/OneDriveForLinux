@@ -753,6 +753,54 @@ impl DraftStore {
         File::open(&self.root)?.sync_all()?;
         Ok(true)
     }
+
+    /// Keep later local edits based on the version that this upload just published.
+    pub fn rebase_existing_after_upload(
+        &self,
+        snapshot: &DraftSnapshot,
+        uploaded_etag: &str,
+    ) -> io::Result<bool> {
+        if snapshot.identity.new_file.is_some() || uploaded_etag.is_empty() {
+            return Err(io::Error::from(io::ErrorKind::InvalidInput));
+        }
+        let _store_lock = lock_store(&self.root)?;
+        let Some(draft) = self.recover(&snapshot.identity)? else {
+            return Ok(false);
+        };
+        if draft.identity() != &snapshot.identity {
+            return Ok(false);
+        }
+        let _lock = lock_exclusive(&draft.file)?;
+        if draft.file.metadata()?.nlink() == 0 {
+            return Ok(false);
+        }
+        let mut hasher = Sha256::new();
+        let mut offset = 0_u64;
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let read = draft.file.read_at(&mut buffer, offset)?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+            offset += read as u64;
+        }
+        if offset == snapshot.size && format!("{:x}", hasher.finalize()) == snapshot.sha256 {
+            return Ok(false);
+        }
+        let mut identity = snapshot.identity.clone();
+        identity.base_etag = uploaded_etag.to_owned();
+        self.clear_stale_upload_state(&identity)?;
+        let mut temporary = tempfile::NamedTempFile::new_in(&self.root)?;
+        serde_json::to_writer(&mut temporary, &identity)?;
+        temporary.flush()?;
+        temporary.as_file().sync_all()?;
+        temporary
+            .persist(self.paths(&identity).0)
+            .map_err(|error| error.error)?;
+        File::open(&self.root)?.sync_all()?;
+        Ok(true)
+    }
 }
 
 fn read_metadata(path: &Path) -> io::Result<DraftIdentity> {
@@ -1153,6 +1201,47 @@ mod tests {
             draft.write_at(0, b"late").unwrap_err().kind(),
             io::ErrorKind::NotFound
         );
+    }
+
+    #[test]
+    fn later_local_edits_rebase_on_uploaded_existing_version() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("drafts");
+        let store = DraftStore::open(&root).unwrap();
+        let draft = store.begin_empty(identity()).unwrap();
+        draft.write_at(0, b"first").unwrap();
+        let snapshot = store.snapshot(&identity()).unwrap().unwrap();
+        assert!(!store.rebase_existing_after_upload(&snapshot, "v2").unwrap());
+
+        draft.write_at(0, b"later").unwrap();
+        assert!(!store.acknowledge(&snapshot).unwrap());
+        let failure = DraftUploadFailure {
+            identity: identity(),
+            issue: DraftUploadIssue::TransferFailed,
+            attempted_at_unix: 123,
+            http_status: Some(503),
+        };
+        store.save_upload_failure(&failure).unwrap();
+        assert!(store.rebase_existing_after_upload(&snapshot, "v2").unwrap());
+
+        let reopened = DraftStore::open(&root).unwrap();
+        let current = reopened.recover_item("drive", "file").unwrap().unwrap();
+        assert_eq!(current.identity().base_etag, "v2");
+        let mut bytes = [0; 5];
+        current.read_at(0, &mut bytes).unwrap();
+        assert_eq!(&bytes, b"later");
+        assert!(
+            reopened
+                .upload_failure(current.identity())
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            !reopened
+                .rebase_existing_after_upload(&snapshot, "v3")
+                .unwrap()
+        );
+        assert_eq!(reopened.list().unwrap()[0].base_etag, "v2");
     }
 
     #[test]
