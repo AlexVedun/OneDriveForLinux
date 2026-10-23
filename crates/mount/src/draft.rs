@@ -686,12 +686,15 @@ impl DraftStore {
         File::open(parent)?.sync_all()
     }
 
-    /// Forget only bytes that match the uploaded snapshot. A later edit stays local.
+    /// Forget only the bytes and location that match the uploaded snapshot.
     pub fn acknowledge(&self, snapshot: &DraftSnapshot) -> io::Result<bool> {
         let _store_lock = lock_store(&self.root)?;
         let Some(draft) = self.recover(&snapshot.identity)? else {
             return Ok(false);
         };
+        if draft.identity() != &snapshot.identity {
+            return Ok(false);
+        }
         let _lock = lock_exclusive(&draft.file)?;
         if draft.file.metadata()?.nlink() == 0 || self.recover(&snapshot.identity)?.is_none() {
             return Ok(false);
@@ -1130,6 +1133,52 @@ mod tests {
             draft.write_at(0, b"late").unwrap_err().kind(),
             io::ErrorKind::NotFound
         );
+    }
+
+    #[test]
+    fn upload_acknowledgement_keeps_renamed_new_file_with_same_bytes() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("drafts");
+        let store = DraftStore::open(&root).unwrap();
+        let identity = DraftIdentity {
+            drive_id: "drive".into(),
+            item_id: "local:new".into(),
+            base_etag: "local-new".into(),
+            new_file: Some(NewFileLocation {
+                parent_id: "root".into(),
+                name: "before.txt".into(),
+            }),
+        };
+        let draft = store.begin_empty(identity.clone()).unwrap();
+        draft.write_at(0, b"unchanged").unwrap();
+        let snapshot = store.snapshot(&identity).unwrap().unwrap();
+        store
+            .relocate_new(
+                "drive",
+                "local:new",
+                NewFileLocation {
+                    parent_id: "other-folder".into(),
+                    name: "after.txt".into(),
+                },
+            )
+            .unwrap();
+
+        assert!(!store.acknowledge(&snapshot).unwrap());
+        let reopened = DraftStore::open(&root).unwrap();
+        let current = reopened
+            .recover_item("drive", "local:new")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            current.identity().new_file,
+            Some(NewFileLocation {
+                parent_id: "other-folder".into(),
+                name: "after.txt".into(),
+            })
+        );
+        let mut bytes = [0; 9];
+        assert_eq!(current.read_at(0, &mut bytes).unwrap(), 9);
+        assert_eq!(&bytes, b"unchanged");
     }
 
     #[test]
