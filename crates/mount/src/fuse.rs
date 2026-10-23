@@ -811,10 +811,13 @@ impl VirtualFuse {
                 };
                 let inode = crate::stable_inode(&directory.drive_id, &directory.item_id);
                 if self.tree.getattr(inode).is_none() && !local.contains_key(&inode) {
-                    let name = if self.tree.lookup(parent.inode, &directory.name).is_some()
-                        || local.values().any(|node| {
-                            node.parent_inode == parent.inode && node.name == directory.name
-                        }) {
+                    let name = if self.name_taken(
+                        parent.inode,
+                        &parent.item_id,
+                        &directory.name,
+                        None,
+                        &local,
+                    ) {
                         format!(".conflict-{inode}-{}", directory.name)
                     } else {
                         directory.name.clone()
@@ -897,10 +900,7 @@ impl VirtualFuse {
             };
             let mut visible_name = location.name.clone();
             if orphaned
-                || self.tree.lookup(parent.inode, &visible_name).is_some()
-                || local
-                    .values()
-                    .any(|node| node.parent_inode == parent.inode && node.name == visible_name)
+                || self.name_taken(parent.inode, &parent.item_id, &visible_name, None, &local)
             {
                 let short_id = identity
                     .item_id
@@ -5249,6 +5249,83 @@ mod tests {
         let inode = fuse.lookup_node(ROOT_INODE, &conflict.2).unwrap().inode;
         let handle = fuse.open_file(inode, OpenFlags(libc::O_RDONLY)).unwrap();
         assert_eq!(fuse.read_file(inode, handle, 0, 7).unwrap(), b"my copy");
+    }
+
+    #[test]
+    fn case_collisions_after_catalog_refresh_keep_local_file_and_directory_visible() {
+        let dir = tempfile::tempdir().unwrap();
+        let draft_root = dir.path().join("drafts");
+        let identity = DraftIdentity {
+            drive_id: "drive".into(),
+            item_id: "local:pending".into(),
+            base_etag: "local-new".into(),
+            new_file: Some(NewFileLocation {
+                parent_id: "root".into(),
+                name: "ТЕКСТ.txt".into(),
+            }),
+        };
+        DraftStore::open(&draft_root)
+            .unwrap()
+            .begin_empty(identity)
+            .unwrap()
+            .write_at(0, b"local copy")
+            .unwrap();
+        DirectoryStore::open(&draft_root)
+            .unwrap()
+            .create("drive", "root", "docs")
+            .unwrap();
+        let mut remote_folder = file_item();
+        remote_folder.item_id = "remote-folder".into();
+        remote_folder.name = Some("Docs".into());
+        remote_folder.kind = "folder".into();
+        let make_fuse = || {
+            VirtualFuse::new_writable(
+                VirtualTree::from_items("drive", "root", [file_item(), remote_folder.clone()])
+                    .unwrap(),
+                dir.path().join("cache"),
+                draft_root.clone(),
+                10,
+                Arc::new(|_| Err(io::ErrorKind::NotConnected.into())),
+            )
+        };
+        for _ in 0..2 {
+            let fuse = make_fuse();
+            fuse.load_local_files().unwrap();
+            let entries = fuse.directory_entries(ROOT_INODE).unwrap();
+            assert_eq!(entries.len(), 6);
+            assert!(fuse.lookup_node(ROOT_INODE, "текст.txt").is_some());
+            assert!(fuse.lookup_node(ROOT_INODE, "Docs").is_some());
+            assert!(fuse.lookup_node(ROOT_INODE, "ТЕКСТ.txt").is_none());
+            assert!(fuse.lookup_node(ROOT_INODE, "docs").is_none());
+            let local_file = entries
+                .iter()
+                .find(|entry| entry.2.starts_with(".conflict-") && entry.2.ends_with("ТЕКСТ.txt"))
+                .unwrap();
+            let local_folder = entries
+                .iter()
+                .find(|entry| entry.2.starts_with(".conflict-") && entry.2.ends_with("docs"))
+                .unwrap();
+            let handle = fuse
+                .open_file(local_file.0, OpenFlags(libc::O_RDONLY))
+                .unwrap();
+            assert_eq!(
+                fuse.read_file(local_file.0, handle, 0, 10).unwrap(),
+                b"local copy"
+            );
+            assert_eq!(fuse.node(local_folder.0).unwrap().kind, NodeKind::Directory);
+            assert_eq!(
+                DraftStore::open(&draft_root).unwrap().list().unwrap().len(),
+                1
+            );
+            assert_eq!(
+                DirectoryStore::open(&draft_root)
+                    .unwrap()
+                    .list()
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
     }
 
     #[test]
