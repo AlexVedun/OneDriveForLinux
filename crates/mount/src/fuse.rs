@@ -977,6 +977,7 @@ impl VirtualFuse {
         if !NewFileLocation::valid_name(name) {
             return Err(Errno::EINVAL);
         }
+        let _serialized = self.open_lock.lock().unwrap();
         let parent_node = self.node(parent).ok_or(Errno::ENOENT)?;
         if parent_node.kind != NodeKind::Directory {
             return Err(Errno::ENOTDIR);
@@ -1104,6 +1105,7 @@ impl VirtualFuse {
         if !NewFileLocation::valid_name(name) {
             return Err(Errno::EINVAL);
         }
+        let _serialized = self.open_lock.lock().unwrap();
         let mut local = self.local_files.lock().unwrap();
         let parent_node = local
             .get(&parent)
@@ -5217,6 +5219,70 @@ mod tests {
             Err(Errno::EEXIST)
         );
         assert!(fuse.lookup_node(ROOT_INODE, "Queued.txt").is_some());
+    }
+
+    #[test]
+    fn concurrent_virtual_creation_and_remote_rename_cannot_claim_same_name() {
+        use std::sync::Barrier;
+
+        for directory in [false, true] {
+            for _ in 0..8 {
+                let dir = tempfile::tempdir().unwrap();
+                let mut source = file_item();
+                source.name = Some("source".into());
+                if directory {
+                    source.kind = "folder".into();
+                }
+                let fuse = Arc::new(VirtualFuse::new_writable(
+                    VirtualTree::from_items("drive", "root", [source]).unwrap(),
+                    dir.path().join("cache"),
+                    dir.path().join("drafts"),
+                    10,
+                    Arc::new(|_| Err(io::ErrorKind::NotConnected.into())),
+                ));
+                let barrier = Arc::new(Barrier::new(3));
+                let (created, renamed) = std::thread::scope(|scope| {
+                    let create_fuse = Arc::clone(&fuse);
+                    let create_barrier = Arc::clone(&barrier);
+                    let create = scope.spawn(move || {
+                        create_barrier.wait();
+                        if directory {
+                            create_fuse
+                                .create_directory(ROOT_INODE, "Target")
+                                .map(|_| ())
+                        } else {
+                            create_fuse
+                                .create_file(ROOT_INODE, "Target", OpenFlags(libc::O_WRONLY))
+                                .map(|_| ())
+                        }
+                    });
+                    let rename_fuse = Arc::clone(&fuse);
+                    let rename_barrier = Arc::clone(&barrier);
+                    let rename = scope.spawn(move || {
+                        rename_barrier.wait();
+                        rename_fuse.rename_local_file(
+                            ROOT_INODE,
+                            "source",
+                            ROOT_INODE,
+                            "target",
+                            fuser::RenameFlags::empty(),
+                        )
+                    });
+                    barrier.wait();
+                    (create.join().unwrap(), rename.join().unwrap())
+                });
+                assert_ne!(created.is_ok(), renamed.is_ok());
+                assert_eq!(created.err().or_else(|| renamed.err()), Some(Errno::EEXIST));
+                assert_eq!(
+                    fuse.directory_entries(ROOT_INODE)
+                        .unwrap()
+                        .iter()
+                        .filter(|entry| entry.2.to_lowercase() == "target")
+                        .count(),
+                    1
+                );
+            }
+        }
     }
 
     #[test]
