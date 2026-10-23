@@ -624,14 +624,39 @@ impl VirtualFuse {
         }
     }
 
-    fn remote_target_taken(&self, parent_id: &str, name: &str) -> bool {
-        self.remote_changes
+    fn name_taken(
+        &self,
+        parent: u64,
+        parent_id: &str,
+        name: &str,
+        except_inode: Option<u64>,
+        local: &HashMap<u64, Node>,
+    ) -> bool {
+        let folded = name.to_lowercase();
+        self.tree.readdir(parent).is_some_and(|children| {
+            children.into_iter().any(|child| {
+                self.remote_node(child).is_some_and(|visible| {
+                    visible.parent_inode == parent
+                        && Some(visible.inode) != except_inode
+                        && visible.name.to_lowercase() == folded
+                })
+            })
+        }) || local.values().any(|child| {
+            self.remote_node(child).is_some_and(|visible| {
+                visible.parent_inode == parent
+                    && Some(visible.inode) != except_inode
+                    && visible.name.to_lowercase() == folded
+            })
+        }) || self
+            .remote_changes
             .lock()
             .unwrap()
             .values()
             .any(|mutation| {
                 matches!(&mutation.kind, MutationKind::Rename { target_parent_id, target_name }
-                if target_parent_id == parent_id && target_name == name)
+                    if target_parent_id == parent_id
+                        && Some(crate::stable_inode(&mutation.drive_id, &mutation.item_id)) != except_inode
+                        && target_name.to_lowercase() == folded)
             })
     }
 
@@ -926,12 +951,7 @@ impl VirtualFuse {
             return Err(Errno::ENOTDIR);
         }
         let mut local = self.local_files.lock().unwrap();
-        if self.tree.lookup(parent, name).is_some()
-            || self.remote_target_taken(&parent_node.item_id, name)
-            || local
-                .values()
-                .any(|node| node.parent_inode == parent && node.name == name)
-        {
+        if self.name_taken(parent, &parent_node.item_id, name, None, &local) {
             return Err(Errno::EEXIST);
         }
         let store = DraftStore::open(root).map_err(map_draft_error)?;
@@ -1064,12 +1084,7 @@ impl VirtualFuse {
         if parent_node.kind != NodeKind::Directory {
             return Err(Errno::ENOTDIR);
         }
-        if self.tree.lookup(parent, name).is_some()
-            || self.remote_target_taken(&parent_node.item_id, name)
-            || local
-                .values()
-                .any(|node| node.parent_inode == parent && node.name == name)
-        {
+        if self.name_taken(parent, &parent_node.item_id, name, None, &local) {
             return Err(Errno::EEXIST);
         }
         DraftStore::open(root).map_err(map_draft_error)?;
@@ -1338,12 +1353,13 @@ impl VirtualFuse {
             moved.name = new_name.to_owned();
             return Ok(());
         }
-        if self.tree.lookup(new_parent, new_name).is_some()
-            || self.remote_target_taken(&parent_node.item_id, new_name)
-            || local
-                .values()
-                .any(|node| node.parent_inode == new_parent && node.name == new_name)
-        {
+        if self.name_taken(
+            new_parent,
+            &parent_node.item_id,
+            new_name,
+            Some(node.inode),
+            &local,
+        ) {
             return Err(Errno::EEXIST);
         }
         if node.kind == NodeKind::Directory {
@@ -4966,6 +4982,147 @@ mod tests {
             fuse.read_file(created.inode, reader, 0, 4).unwrap(),
             b"data"
         );
+    }
+
+    #[test]
+    fn virtual_creation_rejects_case_collisions_with_remote_and_local_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let draft_root = dir.path().join("drafts");
+        let fuse = VirtualFuse::new_writable(
+            VirtualTree::from_items("drive", "root", [file_item()]).unwrap(),
+            dir.path().join("cache"),
+            draft_root.clone(),
+            10,
+            Arc::new(|_| Err(io::ErrorKind::NotConnected.into())),
+        );
+        assert_eq!(
+            fuse.create_file(ROOT_INODE, "ТЕКСТ.txt", OpenFlags(libc::O_WRONLY)),
+            Err(Errno::EEXIST)
+        );
+        assert_eq!(
+            fuse.create_directory(ROOT_INODE, "ТЕКСТ.TXT"),
+            Err(Errno::EEXIST)
+        );
+        let (file, handle) = fuse
+            .create_file(ROOT_INODE, "Local.txt", OpenFlags(libc::O_WRONLY))
+            .unwrap();
+        fuse.files.lock().unwrap().remove(&handle);
+        assert_eq!(
+            fuse.create_directory(ROOT_INODE, "local.TXT"),
+            Err(Errno::EEXIST)
+        );
+        let folder = fuse.create_directory(ROOT_INODE, "Folder").unwrap();
+        assert_eq!(
+            fuse.create_file(ROOT_INODE, "folder", OpenFlags(libc::O_WRONLY)),
+            Err(Errno::EEXIST)
+        );
+        assert_eq!(
+            DraftStore::open(&draft_root).unwrap().list().unwrap().len(),
+            1
+        );
+        assert_eq!(
+            DirectoryStore::open(&draft_root)
+                .unwrap()
+                .list()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            fuse.lookup_node(ROOT_INODE, "Local.txt").unwrap().inode,
+            file.inode
+        );
+        assert_eq!(
+            fuse.lookup_node(ROOT_INODE, "Folder").unwrap().inode,
+            folder.inode
+        );
+    }
+
+    #[test]
+    fn virtual_rename_rejects_case_collision_but_allows_own_case_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let fuse = VirtualFuse::new_writable(
+            VirtualTree::from_items("drive", "root", [file_item()]).unwrap(),
+            dir.path().join("cache"),
+            dir.path().join("drafts"),
+            10,
+            Arc::new(|_| Err(io::ErrorKind::NotConnected.into())),
+        );
+        let (local, handle) = fuse
+            .create_file(ROOT_INODE, "draft.txt", OpenFlags(libc::O_WRONLY))
+            .unwrap();
+        fuse.files.lock().unwrap().remove(&handle);
+        assert_eq!(
+            fuse.rename_local_file(
+                ROOT_INODE,
+                "draft.txt",
+                ROOT_INODE,
+                "ТЕКСТ.txt",
+                fuser::RenameFlags::empty(),
+            ),
+            Err(Errno::EEXIST)
+        );
+        assert!(fuse.lookup_node(ROOT_INODE, "draft.txt").is_some());
+        fuse.rename_local_file(
+            ROOT_INODE,
+            "draft.txt",
+            ROOT_INODE,
+            "DRAFT.txt",
+            fuser::RenameFlags::empty(),
+        )
+        .unwrap();
+        assert_eq!(
+            fuse.lookup_node(ROOT_INODE, "DRAFT.txt").unwrap().inode,
+            local.inode
+        );
+        assert_eq!(
+            fuse.rename_local_file(
+                ROOT_INODE,
+                "текст.txt",
+                ROOT_INODE,
+                "draft.TXT",
+                fuser::RenameFlags::empty(),
+            ),
+            Err(Errno::EEXIST)
+        );
+        fuse.rename_local_file(
+            ROOT_INODE,
+            "текст.txt",
+            ROOT_INODE,
+            "ТЕКСТ.txt",
+            fuser::RenameFlags::empty(),
+        )
+        .unwrap();
+        assert!(fuse.lookup_node(ROOT_INODE, "ТЕКСТ.txt").is_some());
+    }
+
+    #[test]
+    fn virtual_creation_rejects_case_collision_with_queued_remote_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        let fuse = VirtualFuse::new_writable(
+            VirtualTree::from_items("drive", "root", [file_item()]).unwrap(),
+            dir.path().join("cache"),
+            dir.path().join("drafts"),
+            10,
+            Arc::new(|_| Err(io::ErrorKind::NotConnected.into())),
+        );
+        fuse.rename_local_file(
+            ROOT_INODE,
+            "текст.txt",
+            ROOT_INODE,
+            "Queued.txt",
+            fuser::RenameFlags::empty(),
+        )
+        .unwrap();
+        assert_eq!(
+            fuse.create_file(ROOT_INODE, "queued.TXT", OpenFlags(libc::O_WRONLY)),
+            Err(Errno::EEXIST)
+        );
+        assert_eq!(
+            fuse.create_directory(ROOT_INODE, "QUEUED.txt"),
+            Err(Errno::EEXIST)
+        );
+        assert!(fuse.lookup_node(ROOT_INODE, "Queued.txt").is_some());
     }
 
     #[test]
