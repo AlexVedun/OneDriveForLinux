@@ -325,6 +325,7 @@ impl PublishedVersionController {
 struct OpenFile {
     inode: u64,
     handle: OpenHandle,
+    readable: bool,
     writable: bool,
     append: bool,
 }
@@ -1631,6 +1632,7 @@ impl VirtualFuse {
             OpenFile {
                 inode,
                 handle,
+                readable: flags.acc_mode() != OpenAccMode::O_WRONLY,
                 writable: flags.acc_mode() != OpenAccMode::O_RDONLY,
                 append: flags.0 & libc::O_APPEND != 0,
             },
@@ -1645,6 +1647,7 @@ impl VirtualFuse {
             .unwrap()
             .get(&handle)
             .filter(|open| open.inode == inode)
+            .filter(|open| open.readable)
             .ok_or(Errno::EBADF)?
             .handle
             .clone();
@@ -1665,6 +1668,7 @@ impl VirtualFuse {
                 .unwrap()
                 .get(&handle)
                 .filter(|open| open.inode == inode)
+                .filter(|open| open.readable)
                 .ok_or(Errno::EBADF)?
                 .handle
                 .clone();
@@ -1936,7 +1940,7 @@ impl VirtualFuse {
             let files = self.files.lock().unwrap();
             if files
                 .get(&source_handle)
-                .is_none_or(|open| open.inode != source_inode)
+                .is_none_or(|open| open.inode != source_inode || !open.readable)
                 || files
                     .get(&target_handle)
                     .is_none_or(|open| open.inode != target_inode || !open.writable)
@@ -3553,6 +3557,25 @@ mod tests {
             fuse.copy_range(source.inode, source_handle, 0, target.inode, readonly, 0, 1),
             Err(Errno::EBADF)
         );
+        let write_only_source = fuse
+            .open_file(source.inode, OpenFlags(libc::O_WRONLY))
+            .unwrap();
+        assert_eq!(
+            fuse.copy_range(
+                source.inode,
+                write_only_source,
+                0,
+                target.inode,
+                target_handle,
+                0,
+                1
+            ),
+            Err(Errno::EBADF)
+        );
+        assert_eq!(
+            fuse.read_file(target.inode, target_handle, 0, 10).unwrap(),
+            b"\0\0\0cdef"
+        );
         assert_eq!(
             fuse.copy_range(
                 source.inode,
@@ -4933,7 +4956,14 @@ mod tests {
             Errno::EEXIST
         );
         assert_eq!(
-            fuse.read_file(created.inode, handle, 0, 4).unwrap(),
+            fuse.read_file(created.inode, handle, 0, 4),
+            Err(Errno::EBADF)
+        );
+        let reader = fuse
+            .open_file(created.inode, OpenFlags(libc::O_RDONLY))
+            .unwrap();
+        assert_eq!(
+            fuse.read_file(created.inode, reader, 0, 4).unwrap(),
             b"data"
         );
     }
@@ -5081,7 +5111,9 @@ mod tests {
             .open_file(inode, OpenFlags(libc::O_WRONLY | libc::O_TRUNC))
             .unwrap();
         assert_eq!(fuse.write_file(inode, handle, 0, b"local").unwrap(), 5);
-        assert_eq!(fuse.read_file(inode, handle, 0, 5).unwrap(), b"local");
+        assert_eq!(fuse.read_file(inode, handle, 0, 5), Err(Errno::EBADF));
+        let reader = fuse.open_file(inode, OpenFlags(libc::O_RDONLY)).unwrap();
+        assert_eq!(fuse.read_file(inode, reader, 0, 5).unwrap(), b"local");
         assert_eq!(
             DraftStore::open(&draft_root).unwrap().list().unwrap().len(),
             1
