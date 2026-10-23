@@ -326,6 +326,7 @@ struct OpenFile {
     inode: u64,
     handle: OpenHandle,
     writable: bool,
+    append: bool,
 }
 
 type DirectoryEntry = (u64, FileType, String);
@@ -962,11 +963,7 @@ impl VirtualFuse {
             ctag: None,
         };
         local.insert(inode, node.clone());
-        let handle = self.insert_open(
-            inode,
-            OpenHandle::Draft(Arc::new(draft)),
-            flags.acc_mode() != OpenAccMode::O_RDONLY,
-        );
+        let handle = self.insert_open(inode, OpenHandle::Draft(Arc::new(draft)), flags);
         Ok((node, handle))
     }
 
@@ -1543,7 +1540,7 @@ impl VirtualFuse {
             if writable && flags.0 & libc::O_TRUNC != 0 {
                 draft.set_len(0).map_err(map_draft_error)?;
             }
-            return Ok(self.insert_open(inode, OpenHandle::Draft(Arc::new(draft)), writable));
+            return Ok(self.insert_open(inode, OpenHandle::Draft(Arc::new(draft)), flags));
         }
         if node.item_id.starts_with("local:") {
             return Err(Errno::EIO);
@@ -1560,7 +1557,7 @@ impl VirtualFuse {
                     new_file: None,
                 })
                 .map_err(map_draft_error)?;
-            return Ok(self.insert_open(inode, OpenHandle::Draft(Arc::new(draft)), true));
+            return Ok(self.insert_open(inode, OpenHandle::Draft(Arc::new(draft)), flags));
         }
         if writable {
             let request = self.request_for_node(&node).map_err(map_open_error)?;
@@ -1572,7 +1569,7 @@ impl VirtualFuse {
                     base_etag: request.etag,
                     new_file: None,
                 }),
-                true,
+                flags,
             ));
         }
         let _opening = self.mark_opening(inode);
@@ -1584,9 +1581,9 @@ impl VirtualFuse {
         }
         let node = self.node(inode).ok_or(Errno::ENOENT)?;
         if let Some(draft) = self.draft_for_node(&node)? {
-            return Ok(self.insert_open(inode, OpenHandle::Draft(Arc::new(draft)), false));
+            return Ok(self.insert_open(inode, OpenHandle::Draft(Arc::new(draft)), flags));
         }
-        Ok(self.insert_open(inode, OpenHandle::Cached(Arc::new(opened)), false))
+        Ok(self.insert_open(inode, OpenHandle::Cached(Arc::new(opened)), flags))
     }
 
     fn open_cached(&self, inode: u64) -> Result<CachedHandle, Errno> {
@@ -1618,14 +1615,15 @@ impl VirtualFuse {
         VirtualTree::open_cached_request(self.request_for_node(&node)?, &mut cache)
     }
 
-    fn insert_open(&self, inode: u64, handle: OpenHandle, writable: bool) -> u64 {
+    fn insert_open(&self, inode: u64, handle: OpenHandle, flags: OpenFlags) -> u64 {
         let id = self.next_handle.fetch_add(1, Ordering::Relaxed);
         self.files.lock().unwrap().insert(
             id,
             OpenFile {
                 inode,
                 handle,
-                writable,
+                writable: flags.acc_mode() != OpenAccMode::O_RDONLY,
+                append: flags.0 & libc::O_APPEND != 0,
             },
         );
         id
@@ -1760,8 +1758,14 @@ impl VirtualFuse {
             return Err(Errno::EROFS);
         };
         let draft = Arc::clone(draft);
+        let append = open.append;
         drop(files);
-        let written = draft.write_at(offset, data).map_err(map_draft_error)?;
+        let written = if append {
+            draft.append(data)
+        } else {
+            draft.write_at(offset, data)
+        }
+        .map_err(map_draft_error)?;
         u32::try_from(written).map_err(|_| Errno::EIO)
     }
 
@@ -4367,6 +4371,69 @@ mod tests {
         let mut bytes = [0; 5];
         draft.read_at(0, &mut bytes).unwrap();
         assert_eq!(&bytes, b"hallo");
+    }
+
+    #[test]
+    fn append_open_ignores_supplied_offsets_and_preserves_positioned_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let fuse = VirtualFuse::new_writable(
+            VirtualTree::from_items("drive", "root", []).unwrap(),
+            dir.path().join("cache"),
+            dir.path().join("drafts"),
+            10,
+            Arc::new(|_| Err(io::ErrorKind::NotConnected.into())),
+        );
+        let (node, normal) = fuse
+            .create_file(ROOT_INODE, "append.txt", OpenFlags(libc::O_RDWR))
+            .unwrap();
+        fuse.write_file(node.inode, normal, 0, b"first").unwrap();
+        let append = fuse
+            .open_file(node.inode, OpenFlags(libc::O_WRONLY | libc::O_APPEND))
+            .unwrap();
+        fuse.write_file(node.inode, append, 0, b" second").unwrap();
+        fuse.write_file(node.inode, normal, 0, b"F").unwrap();
+        fuse.write_file(node.inode, append, 1, b" third").unwrap();
+        assert_eq!(
+            fuse.read_file(node.inode, normal, 0, 64).unwrap(),
+            b"First second third"
+        );
+    }
+
+    #[test]
+    fn mounted_append_survives_remount() {
+        if std::env::var_os("ONEDRIVE_FUSE_SMOKE").is_none() {
+            return;
+        }
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mountpoint = dir.path().join("mount");
+        let draft_root = dir.path().join("drafts");
+        fs::create_dir(&mountpoint).unwrap();
+        let mount = || {
+            VirtualFuse::new_writable(
+                VirtualTree::from_items("drive", "root", []).unwrap(),
+                dir.path().join("cache"),
+                draft_root.clone(),
+                10,
+                Arc::new(|_| Err(io::ErrorKind::NotConnected.into())),
+            )
+            .mount(&mountpoint)
+            .unwrap()
+        };
+        let path = mountpoint.join("append.txt");
+        let session = mount();
+        fs::write(&path, b"first").unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b" second")
+            .unwrap();
+        session.umount_and_join().unwrap();
+        let session = mount();
+        assert_eq!(fs::read(&path).unwrap(), b"first second");
+        session.umount_and_join().unwrap();
     }
 
     #[test]

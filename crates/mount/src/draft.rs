@@ -847,6 +847,17 @@ impl DraftFile {
     /// A successful write is durably stored locally; upload is a separate step.
     pub fn write_at(&self, offset: u64, bytes: &[u8]) -> io::Result<usize> {
         let _lock = lock_exclusive(&self.file)?;
+        self.write_at_locked(offset, bytes)
+    }
+
+    /// Append while holding the same file lock used by positioned writes.
+    pub fn append(&self, bytes: &[u8]) -> io::Result<usize> {
+        let _lock = lock_exclusive(&self.file)?;
+        let offset = self.file.metadata()?.len();
+        self.write_at_locked(offset, bytes)
+    }
+
+    fn write_at_locked(&self, offset: u64, bytes: &[u8]) -> io::Result<usize> {
         if self.file.metadata()?.nlink() == 0 {
             return Err(io::Error::from(io::ErrorKind::NotFound));
         }
@@ -878,6 +889,32 @@ impl DraftFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn append_serializes_offset_selection_across_draft_handles() {
+        let root = tempfile::tempdir().unwrap();
+        let store = DraftStore::open(root.path()).unwrap();
+        let first = store.begin_empty(identity()).unwrap();
+        first.write_at(0, b"start").unwrap();
+        let second = store.recover_item("drive", "file").unwrap().unwrap();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                for _ in 0..20 {
+                    first.append(b"A").unwrap();
+                }
+            });
+            scope.spawn(|| {
+                for _ in 0..20 {
+                    second.append(b"B").unwrap();
+                }
+            });
+        });
+        let mut bytes = vec![0; 45];
+        assert_eq!(first.read_at(0, &mut bytes).unwrap(), 45);
+        assert_eq!(&bytes[..5], b"start");
+        assert_eq!(bytes[5..].iter().filter(|byte| **byte == b'A').count(), 20);
+        assert_eq!(bytes[5..].iter().filter(|byte| **byte == b'B').count(), 20);
+    }
 
     #[test]
     fn allocate_preserves_bytes_and_respects_keep_size() {
