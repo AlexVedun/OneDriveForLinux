@@ -1083,13 +1083,18 @@ impl Daemon {
         let completed_identity = snapshot.identity.clone();
         let uploaded_new_file = snapshot.identity.new_file.is_some();
         let uploaded_size = snapshot.size;
-        let acknowledged =
-            tokio::task::spawn_blocking(move || DraftStore::open(&root)?.acknowledge(&snapshot))
-                .await
-                .map_err(|_| {
-                    zbus::fdo::Error::Failed("draft acknowledgement task failed".to_owned())
-                })?
-                .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
+        let uploaded_etag_for_rebase = uploaded_etag.clone();
+        let acknowledged = tokio::task::spawn_blocking(move || {
+            let store = DraftStore::open(&root)?;
+            let acknowledged = store.acknowledge(&snapshot)?;
+            if !acknowledged && !uploaded_new_file {
+                store.rebase_existing_after_upload(&snapshot, &uploaded_etag_for_rebase)?;
+            }
+            Ok::<_, io::Error>(acknowledged)
+        })
+        .await
+        .map_err(|_| zbus::fdo::Error::Failed("draft acknowledgement task failed".to_owned()))?
+        .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
         if acknowledged
             && uploaded_new_file
             && let Some(controller) = &mounted_controller
