@@ -646,8 +646,15 @@ impl DraftStore {
         let Some(draft) = self.recover(identity)? else {
             return Ok(None);
         };
+        if draft.identity() != identity {
+            return Ok(None);
+        }
         let _lock = lock_exclusive(&draft.file)?;
-        if draft.file.metadata()?.nlink() == 0 || self.recover(identity)?.is_none() {
+        if draft.file.metadata()?.nlink() == 0
+            || self
+                .recover(identity)?
+                .is_none_or(|current| current.identity() != identity)
+        {
             return Ok(None);
         }
         let mut snapshot = tempfile::NamedTempFile::new_in(&self.root)?;
@@ -664,6 +671,12 @@ impl DraftStore {
             offset += read as u64;
         }
         snapshot.as_file().sync_all()?;
+        if self
+            .recover(identity)?
+            .is_none_or(|current| current.identity() != identity)
+        {
+            return Ok(None);
+        }
         Ok(Some(DraftSnapshot {
             identity: draft.identity,
             file: snapshot,
@@ -1288,6 +1301,42 @@ mod tests {
         let mut bytes = [0; 9];
         assert_eq!(current.read_at(0, &mut bytes).unwrap(), 9);
         assert_eq!(&bytes, b"unchanged");
+    }
+
+    #[test]
+    fn snapshot_rejects_old_location_after_new_file_moves() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = DraftStore::open(&temporary.path().join("drafts")).unwrap();
+        let original = DraftIdentity {
+            drive_id: "drive".into(),
+            item_id: "local:new".into(),
+            base_etag: "local-new".into(),
+            new_file: Some(NewFileLocation {
+                parent_id: "root".into(),
+                name: "before.txt".into(),
+            }),
+        };
+        let draft = store.begin_empty(original.clone()).unwrap();
+        draft.write_at(0, b"content").unwrap();
+        store
+            .relocate_new(
+                &original.drive_id,
+                &original.item_id,
+                NewFileLocation {
+                    parent_id: "other".into(),
+                    name: "moved.txt".into(),
+                },
+            )
+            .unwrap();
+
+        assert!(store.snapshot(&original).unwrap().is_none());
+        let current = store
+            .recover_item(&original.drive_id, &original.item_id)
+            .unwrap()
+            .unwrap();
+        let snapshot = store.snapshot(current.identity()).unwrap().unwrap();
+        assert_eq!(snapshot.identity, *current.identity());
+        assert_eq!(fs::read(snapshot.file.path()).unwrap(), b"content");
     }
 
     #[test]
