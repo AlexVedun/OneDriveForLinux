@@ -624,6 +624,16 @@ impl VirtualFuse {
         }
     }
 
+    fn target_parent_matches(&self, parent: u64, parent_id: &str, target_parent_id: &str) -> bool {
+        parent_id == target_parent_id
+            || self
+                .directory_aliases
+                .lock()
+                .unwrap()
+                .get(target_parent_id)
+                .is_some_and(|inode| *inode == parent)
+    }
+
     fn name_taken(
         &self,
         parent: u64,
@@ -654,7 +664,7 @@ impl VirtualFuse {
             .values()
             .any(|mutation| {
                 matches!(&mutation.kind, MutationKind::Rename { target_parent_id, target_name }
-                    if target_parent_id == parent_id
+                    if self.target_parent_matches(parent, parent_id, target_parent_id)
                         && Some(crate::stable_inode(&mutation.drive_id, &mutation.item_id)) != except_inode
                         && target_name.to_lowercase() == folded)
             })
@@ -695,9 +705,9 @@ impl VirtualFuse {
                 target_name,
             } = &mutation.kind
                 && target_name == name
-                && self
-                    .node(parent)
-                    .is_some_and(|node| node.item_id == *target_parent_id)
+                && self.node(parent).is_some_and(|node| {
+                    self.target_parent_matches(parent, &node.item_id, target_parent_id)
+                })
             {
                 return self
                     .tree
@@ -727,7 +737,8 @@ impl VirtualFuse {
                     .values()
                     .find(|mutation| {
                         matches!(&mutation.kind, MutationKind::Rename { target_parent_id, target_name }
-                            if target_parent_id == parent_id && target_name == name)
+                            if self.target_parent_matches(parent, parent_id, target_parent_id)
+                                && target_name == name)
                     })
                     .cloned()?;
                 self.tree
@@ -1471,7 +1482,7 @@ impl VirtualFuse {
             if let MutationKind::Rename {
                 target_parent_id, ..
             } = &mutation.kind
-                && directory.item_id == *target_parent_id
+                && self.target_parent_matches(inode, &directory.item_id, target_parent_id)
                 && let Some(source) = self
                     .tree
                     .getattr(crate::stable_inode(&mutation.drive_id, &mutation.item_id))
@@ -4315,6 +4326,71 @@ mod tests {
         assert_eq!(folder.item_id, "remote-folder");
         assert!(fuse.lookup_node(folder.inode, "inside.txt").is_some());
         assert!(DirectoryStore::open(&draft_root).unwrap().list().unwrap()[0].seen_remote);
+    }
+
+    #[test]
+    fn queued_move_into_uploaded_local_directory_survives_remount() {
+        let dir = tempfile::tempdir().unwrap();
+        let draft_root = dir.path().join("drafts");
+        DraftStore::open(&draft_root).unwrap();
+        let directories = DirectoryStore::open(&draft_root).unwrap();
+        let local_folder = directories.create("drive", "root", "folder").unwrap();
+        let created = directories
+            .record_created(&local_folder, "remote-folder")
+            .unwrap();
+        directories
+            .mark_uploaded(&created, "remote-folder")
+            .unwrap();
+        let make_fuse = || {
+            VirtualFuse::new_writable(
+                VirtualTree::from_items("drive", "root", [file_item()]).unwrap(),
+                dir.path().join("cache"),
+                draft_root.clone(),
+                10,
+                Arc::new(|_| Err(io::ErrorKind::NotConnected.into())),
+            )
+        };
+        let fuse = make_fuse();
+        fuse.load_local_files().unwrap();
+        let folder = fuse.lookup_node(ROOT_INODE, "folder").unwrap();
+        fuse.rename_local_file(
+            ROOT_INODE,
+            "текст.txt",
+            folder.inode,
+            "Moved.txt",
+            fuser::RenameFlags::empty(),
+        )
+        .unwrap();
+        drop(fuse);
+
+        let fuse = make_fuse();
+        fuse.load_local_files().unwrap();
+        let folder = fuse.lookup_node(ROOT_INODE, "folder").unwrap();
+        assert_eq!(folder.item_id, local_folder.item_id);
+        let moved = fuse.lookup_node(folder.inode, "Moved.txt").unwrap();
+        assert_eq!(moved.item_id, "file");
+        assert!(
+            fuse.directory_entries(folder.inode)
+                .unwrap()
+                .iter()
+                .any(|entry| entry.2 == "Moved.txt")
+        );
+        assert_eq!(
+            fuse.create_file(folder.inode, "moved.TXT", OpenFlags(libc::O_WRONLY)),
+            Err(Errno::EEXIST)
+        );
+        assert_eq!(
+            fuse.remove_local_file(folder.inode, "Moved.txt"),
+            Err(Errno::EBUSY)
+        );
+        assert_eq!(
+            MutationStore::open(&draft_root)
+                .unwrap()
+                .list()
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]
