@@ -1932,6 +1932,7 @@ impl VirtualFuse {
         };
         let result = (|| {
             self.materialize_pending(inode, owned_handle, size == 0)?;
+            let _serialized = self.open_lock.lock().unwrap();
             let files = self.files.lock().unwrap();
             let open = files
                 .get(&owned_handle)
@@ -1969,6 +1970,7 @@ impl VirtualFuse {
             return Err(Errno::EINVAL);
         }
         self.materialize_pending(inode, handle, false)?;
+        let _serialized = self.open_lock.lock().unwrap();
         let files = self.files.lock().unwrap();
         let open = files
             .get(&handle)
@@ -4258,6 +4260,56 @@ mod tests {
         assert_eq!(
             DraftStore::open(&draft_root).unwrap().list().unwrap().len(),
             1
+        );
+    }
+
+    #[test]
+    fn resized_editor_replacement_survives_remount() {
+        let dir = tempfile::tempdir().unwrap();
+        let draft_root = dir.path().join("drafts");
+        let make_fuse = || {
+            VirtualFuse::new_writable(
+                VirtualTree::from_items("drive", "root", [file_item()]).unwrap(),
+                dir.path().join("cache"),
+                draft_root.clone(),
+                10,
+                Arc::new(|_| panic!("no download expected")),
+            )
+        };
+        let fuse = make_fuse();
+        let (temporary, handle) = fuse
+            .create_file(ROOT_INODE, "swap.tmp", OpenFlags(libc::O_RDWR))
+            .unwrap();
+        fuse.write_file(temporary.inode, handle, 0, b"replacement")
+            .unwrap();
+        fuse.rename_local_file(
+            ROOT_INODE,
+            "swap.tmp",
+            ROOT_INODE,
+            "текст.txt",
+            fuser::RenameFlags::empty(),
+        )
+        .unwrap();
+        fuse.truncate_file(temporary.inode, Some(handle), 4)
+            .unwrap();
+        fuse.allocate_file(temporary.inode, handle, 8, 2, 0)
+            .unwrap();
+        assert_eq!(
+            fuse.read_file(temporary.inode, handle, 0, 10).unwrap(),
+            b"repl\0\0\0\0\0\0"
+        );
+        fuse.files.lock().unwrap().remove(&handle);
+        drop(fuse);
+
+        let fuse = make_fuse();
+        fuse.load_local_files().unwrap();
+        let saved = fuse.lookup_node(ROOT_INODE, "текст.txt").unwrap();
+        let handle = fuse
+            .open_file(saved.inode, OpenFlags(libc::O_RDONLY))
+            .unwrap();
+        assert_eq!(
+            fuse.read_file(saved.inode, handle, 0, 10).unwrap(),
+            b"repl\0\0\0\0\0\0"
         );
     }
 
