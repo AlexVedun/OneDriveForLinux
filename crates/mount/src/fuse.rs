@@ -587,7 +587,7 @@ impl VirtualFuse {
         DirectoryStore::open(root)
             .and_then(|store| store.remote_parent_id(&parent.item_id))
             .map_err(map_draft_error)?
-            .ok_or(Errno::EINVAL)
+            .ok_or(Errno::EBUSY)
     }
 
     fn remote_node(&self, node: &Node) -> Option<Node> {
@@ -3431,6 +3431,52 @@ mod tests {
         assert_eq!(
             MutationStore::open(&draft_root).unwrap().list().unwrap()[0].kind,
             MutationKind::Delete
+        );
+    }
+
+    #[test]
+    fn moving_remote_file_waits_for_local_parent_to_be_uploaded() {
+        let dir = tempfile::tempdir().unwrap();
+        let draft_root = dir.path().join("drafts");
+        let fuse = VirtualFuse::new_writable(
+            VirtualTree::from_items("drive", "root", [file_item()]).unwrap(),
+            dir.path().join("cache"),
+            draft_root.clone(),
+            20,
+            Arc::new(|_| panic!("no download expected")),
+        );
+        let folder = fuse.create_directory(ROOT_INODE, "folder").unwrap();
+        let store = DirectoryStore::open(&draft_root).unwrap();
+        let move_file = || {
+            fuse.rename_local_file(
+                ROOT_INODE,
+                "текст.txt",
+                folder.inode,
+                "moved.txt",
+                fuser::RenameFlags::empty(),
+            )
+        };
+        assert_eq!(move_file(), Err(Errno::EBUSY));
+        let local = store.list().unwrap().remove(0);
+        let created = store.record_created(&local, "remote-folder").unwrap();
+        assert_eq!(move_file(), Err(Errno::EBUSY));
+        assert!(fuse.lookup_node(ROOT_INODE, "текст.txt").is_some());
+        assert!(
+            MutationStore::open(&draft_root)
+                .unwrap()
+                .list()
+                .unwrap()
+                .is_empty()
+        );
+
+        store.mark_uploaded(&created, "remote-folder").unwrap();
+        move_file().unwrap();
+        assert_eq!(
+            MutationStore::open(&draft_root).unwrap().list().unwrap()[0].kind,
+            MutationKind::Rename {
+                target_parent_id: "remote-folder".into(),
+                target_name: "moved.txt".into(),
+            }
         );
     }
 
