@@ -1206,6 +1206,13 @@ impl VirtualFuse {
         if self.directory_entries(node.inode).ok_or(Errno::EIO)?.len() > 2 {
             return Err(Errno::ENOTEMPTY);
         }
+        if self
+            .tree
+            .readdir(node.inode)
+            .is_some_and(|children| !children.is_empty())
+        {
+            return Err(Errno::EBUSY);
+        }
         if !node.item_id.starts_with("local-dir:") {
             return self.queue_remote_change(&node, MutationKind::Delete);
         }
@@ -4472,6 +4479,63 @@ mod tests {
         let mutations = MutationStore::open(&draft_root).unwrap().list().unwrap();
         assert_eq!(mutations.len(), 1);
         assert_eq!(mutations[0].item_id, "file");
+    }
+
+    #[test]
+    fn remote_parent_waits_for_queued_child_removal_to_reach_catalog() {
+        for delete_child in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let draft_root = dir.path().join("drafts");
+            let mut folder = file_item();
+            folder.item_id = "folder".into();
+            folder.name = Some("folder".into());
+            folder.kind = "folder".into();
+            let mut child = file_item();
+            child.parent_id = Some("folder".into());
+            child.name = Some("child.txt".into());
+            let make_fuse = || {
+                VirtualFuse::new_writable(
+                    VirtualTree::from_items("drive", "root", [folder.clone(), child.clone()])
+                        .unwrap(),
+                    dir.path().join("cache"),
+                    draft_root.clone(),
+                    10,
+                    Arc::new(|_| Err(io::ErrorKind::NotConnected.into())),
+                )
+            };
+            let fuse = make_fuse();
+            let folder_inode = fuse.lookup_node(ROOT_INODE, "folder").unwrap().inode;
+            if delete_child {
+                fuse.remove_local_file(folder_inode, "child.txt").unwrap();
+            } else {
+                fuse.rename_local_file(
+                    folder_inode,
+                    "child.txt",
+                    ROOT_INODE,
+                    "moved.txt",
+                    fuser::RenameFlags::empty(),
+                )
+                .unwrap();
+            }
+            for fuse in [Some(fuse), None] {
+                let fuse = match fuse {
+                    Some(fuse) => fuse,
+                    None => {
+                        let fuse = make_fuse();
+                        fuse.load_local_files().unwrap();
+                        fuse
+                    }
+                };
+                assert_eq!(fuse.directory_entries(folder_inode).unwrap().len(), 2);
+                assert_eq!(
+                    fuse.remove_local_directory(ROOT_INODE, "folder"),
+                    Err(Errno::EBUSY)
+                );
+            }
+            let mutations = MutationStore::open(&draft_root).unwrap().list().unwrap();
+            assert_eq!(mutations.len(), 1);
+            assert_eq!(mutations[0].item_id, "file");
+        }
     }
 
     #[test]
