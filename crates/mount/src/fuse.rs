@@ -1224,6 +1224,9 @@ impl VirtualFuse {
             .into_iter()
             .find(|directory| directory.item_id == node.item_id)
             .ok_or(Errno::EIO)?;
+        if directory.remote_id.is_some() || directory.created_remote_id.is_some() {
+            return Err(Errno::EBUSY);
+        }
         store.remove(&directory).map_err(map_draft_error)?;
         local.remove(&node.inode);
         Ok(())
@@ -1405,7 +1408,11 @@ impl VirtualFuse {
                 .iter()
                 .find(|directory| directory.item_id == target.item_id)
                 .ok_or(Errno::EIO)?;
-            if source.remote_id.is_some() || destination.remote_id.is_some() {
+            if source.remote_id.is_some()
+                || source.created_remote_id.is_some()
+                || destination.remote_id.is_some()
+                || destination.created_remote_id.is_some()
+            {
                 return Err(Errno::EBUSY);
             }
             store
@@ -1462,6 +1469,9 @@ impl VirtualFuse {
                 .into_iter()
                 .find(|directory| directory.item_id == node.item_id)
                 .ok_or(Errno::EIO)?;
+            if directory.remote_id.is_some() || directory.created_remote_id.is_some() {
+                return Err(Errno::EBUSY);
+            }
             store
                 .relocate(&directory, &parent_node.item_id, new_name)
                 .map_err(map_draft_error)?;
@@ -3345,6 +3355,82 @@ mod tests {
         assert_eq!(
             fuse.lookup_node(ROOT_INODE, "folder").unwrap().inode,
             folder.inode
+        );
+    }
+
+    #[test]
+    fn uploaded_directory_stays_busy_after_remount_until_catalog_confirmation() {
+        let dir = tempfile::tempdir().unwrap();
+        let draft_root = dir.path().join("drafts");
+        let fuse = VirtualFuse::new_writable(
+            VirtualTree::from_items("drive", "root", []).unwrap(),
+            dir.path().join("cache"),
+            draft_root.clone(),
+            20,
+            Arc::new(|_| panic!("no download expected")),
+        );
+        let folder = fuse.create_directory(ROOT_INODE, "folder").unwrap();
+        let store = DirectoryStore::open(&draft_root).unwrap();
+        let directory = store.list().unwrap().remove(0);
+        let created = store.record_created(&directory, "remote-folder").unwrap();
+        store.mark_uploaded(&created, "remote-folder").unwrap();
+        drop(fuse);
+
+        let remounted = VirtualFuse::new_writable(
+            VirtualTree::from_items("drive", "root", []).unwrap(),
+            dir.path().join("cache"),
+            draft_root.clone(),
+            20,
+            Arc::new(|_| panic!("no download expected")),
+        );
+        remounted.load_local_files().unwrap();
+        assert_eq!(
+            remounted.lookup_node(ROOT_INODE, "folder").unwrap().inode,
+            folder.inode
+        );
+        assert_eq!(
+            remounted.rename_local_file(
+                ROOT_INODE,
+                "folder",
+                ROOT_INODE,
+                "renamed",
+                fuser::RenameFlags::empty(),
+            ),
+            Err(Errno::EBUSY)
+        );
+        assert_eq!(
+            remounted.remove_local_directory(ROOT_INODE, "folder"),
+            Err(Errno::EBUSY)
+        );
+        assert_eq!(store.list().unwrap()[0].name, "folder");
+        assert_eq!(
+            store.list().unwrap()[0].remote_id.as_deref(),
+            Some("remote-folder")
+        );
+        drop(remounted);
+
+        let mut remote_folder = file_item();
+        remote_folder.item_id = "remote-folder".into();
+        remote_folder.name = Some("folder".into());
+        remote_folder.kind = "folder".into();
+        let confirmed = VirtualFuse::new_writable(
+            VirtualTree::from_items("drive", "root", [remote_folder]).unwrap(),
+            dir.path().join("cache"),
+            draft_root.clone(),
+            20,
+            Arc::new(|_| panic!("no download expected")),
+        );
+        confirmed.load_local_files().unwrap();
+        assert_eq!(
+            confirmed.lookup_node(ROOT_INODE, "folder").unwrap().item_id,
+            "remote-folder"
+        );
+        confirmed
+            .remove_local_directory(ROOT_INODE, "folder")
+            .unwrap();
+        assert_eq!(
+            MutationStore::open(&draft_root).unwrap().list().unwrap()[0].kind,
+            MutationKind::Delete
         );
     }
 
