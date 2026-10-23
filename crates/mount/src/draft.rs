@@ -308,9 +308,7 @@ impl DraftStore {
     pub fn save_upload_failure(&self, failure: &DraftUploadFailure) -> io::Result<()> {
         failure.identity.validate()?;
         let _lock = lock_store(&self.root)?;
-        if self.recover(&failure.identity)?.is_none() {
-            return Err(io::Error::from(io::ErrorKind::NotFound));
-        }
+        self.require_current_identity(&failure.identity)?;
         let mut temporary = tempfile::NamedTempFile::new_in(&self.root)?;
         serde_json::to_writer(&mut temporary, failure)?;
         temporary.flush()?;
@@ -371,6 +369,7 @@ impl DraftStore {
     pub fn save_upload_checkpoint(&self, checkpoint: &DraftUploadCheckpoint) -> io::Result<()> {
         checkpoint.validate()?;
         let _lock = lock_store(&self.root)?;
+        self.require_current_identity(&checkpoint.identity)?;
         let mut temporary = tempfile::NamedTempFile::new_in(&self.root)?;
         serde_json::to_writer(&mut temporary, checkpoint)?;
         temporary.flush()?;
@@ -379,6 +378,16 @@ impl DraftStore {
             .persist(self.checkpoint_path(&checkpoint.identity))
             .map_err(|error| error.error)?;
         File::open(&self.root)?.sync_all()
+    }
+
+    fn require_current_identity(&self, identity: &DraftIdentity) -> io::Result<()> {
+        let draft = self
+            .recover(identity)?
+            .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
+        if draft.identity() != identity {
+            return Err(io::Error::from(io::ErrorKind::WouldBlock));
+        }
+        Ok(())
     }
 
     pub fn clear_upload_checkpoint(&self, identity: &DraftIdentity) -> io::Result<()> {
@@ -1236,6 +1245,7 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         let root = temporary.path().join("drafts");
         let store = DraftStore::open(&root).unwrap();
+        store.begin_empty(identity()).unwrap();
         let checkpoint = DraftUploadCheckpoint {
             identity: identity(),
             sha256: "a".repeat(64),
@@ -1259,6 +1269,79 @@ mod tests {
         );
         reopened.clear_upload_checkpoint(&identity()).unwrap();
         assert!(reopened.upload_checkpoint(&identity()).unwrap().is_none());
+    }
+
+    #[test]
+    fn renamed_new_file_rejects_stale_upload_progress_and_failure() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("drafts");
+        let store = DraftStore::open(&root).unwrap();
+        let original = DraftIdentity {
+            drive_id: "drive".into(),
+            item_id: "local:new".into(),
+            base_etag: "local-new".into(),
+            new_file: Some(NewFileLocation {
+                parent_id: "root".into(),
+                name: "before.txt".into(),
+            }),
+        };
+        store.begin_empty(original.clone()).unwrap();
+        store
+            .relocate_new(
+                "drive",
+                "local:new",
+                NewFileLocation {
+                    parent_id: "root".into(),
+                    name: "after.txt".into(),
+                },
+            )
+            .unwrap();
+        let checkpoint = DraftUploadCheckpoint {
+            identity: original.clone(),
+            sha256: "a".repeat(64),
+            size: 100,
+            upload_url: "https://upload.example/old".into(),
+            next_offset: 50,
+        };
+        let failure = DraftUploadFailure {
+            identity: original.clone(),
+            issue: DraftUploadIssue::TransferFailed,
+            attempted_at_unix: 123,
+            http_status: None,
+        };
+        assert_eq!(
+            store
+                .save_upload_checkpoint(&checkpoint)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(
+            store.save_upload_failure(&failure).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+
+        let reopened = DraftStore::open(&root).unwrap();
+        let current = reopened
+            .recover_item("drive", "local:new")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            current.identity().new_file.as_ref().unwrap().name,
+            "after.txt"
+        );
+        assert!(
+            reopened
+                .upload_checkpoint(current.identity())
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            reopened
+                .upload_failure(current.identity())
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
