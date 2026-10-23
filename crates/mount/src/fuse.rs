@@ -711,6 +711,37 @@ impl VirtualFuse {
             .filter(|node| node.parent_inode == parent && node.name == name)
     }
 
+    fn visible_child(&self, parent: u64, name: &str, local: &HashMap<u64, Node>) -> Option<Node> {
+        local
+            .values()
+            .filter_map(|node| self.remote_node(node))
+            .find(|node| node.parent_inode == parent && node.name == name)
+            .or_else(|| {
+                let parent_id = &local
+                    .get(&parent)
+                    .or_else(|| self.tree.getattr(parent))?
+                    .item_id;
+                let mutation = self.remote_changes
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .find(|mutation| {
+                        matches!(&mutation.kind, MutationKind::Rename { target_parent_id, target_name }
+                            if target_parent_id == parent_id && target_name == name)
+                    })
+                    .cloned()?;
+                self.tree
+                    .getattr(crate::stable_inode(&mutation.drive_id, &mutation.item_id))
+                    .and_then(|node| self.remote_node(node))
+            })
+            .or_else(|| {
+                self.tree
+                    .lookup(parent, name)
+                    .and_then(|node| self.remote_node(node))
+                    .filter(|node| node.parent_inode == parent && node.name == name)
+            })
+    }
+
     fn load_local_files(&self) -> io::Result<()> {
         let Some(root) = &self.draft_root else {
             return Ok(());
@@ -1037,11 +1068,8 @@ impl VirtualFuse {
             return Err(Errno::EROFS);
         };
         let mut local = self.local_files.lock().unwrap();
-        let node = local
-            .values()
-            .filter_map(|node| self.remote_node(node))
-            .find(|node| node.parent_inode == parent && node.name == name)
-            .or_else(|| self.tree.lookup(parent, name).cloned())
+        let node = self
+            .visible_child(parent, name, &local)
             .ok_or(Errno::ENOENT)?;
         if node.kind != NodeKind::File {
             return Err(Errno::EISDIR);
@@ -1112,11 +1140,8 @@ impl VirtualFuse {
             return Err(Errno::EROFS);
         };
         let mut local = self.local_files.lock().unwrap();
-        let node = local
-            .values()
-            .filter_map(|node| self.remote_node(node))
-            .find(|node| node.parent_inode == parent && node.name == name)
-            .or_else(|| self.tree.lookup(parent, name).cloned())
+        let node = self
+            .visible_child(parent, name, &local)
             .ok_or(Errno::ENOENT)?;
         if node.kind != NodeKind::Directory {
             return Err(Errno::ENOTDIR);
@@ -1173,24 +1198,13 @@ impl VirtualFuse {
             return Err(Errno::ENOTDIR);
         }
         let mut local = self.local_files.lock().unwrap();
-        let node = local
-            .values()
-            .find(|node| node.parent_inode == parent && node.name == name)
-            .cloned()
-            .or_else(|| self.tree.lookup(parent, name).cloned())
+        let node = self
+            .visible_child(parent, name, &local)
             .ok_or(Errno::ENOENT)?;
         if parent == new_parent && name == new_name {
             return Ok(());
         }
-        let target = local
-            .values()
-            .filter_map(|entry| self.remote_node(entry))
-            .find(|entry| entry.parent_inode == new_parent && entry.name == new_name)
-            .or_else(|| {
-                self.tree
-                    .lookup(new_parent, new_name)
-                    .and_then(|entry| self.remote_node(entry))
-            });
+        let target = self.visible_child(new_parent, new_name, &local);
         if self.is_publishing(node.inode)
             || target
                 .as_ref()
@@ -4166,6 +4180,86 @@ mod tests {
         fuse.load_local_files().unwrap();
         assert!(fuse.lookup_node(ROOT_INODE, "moved.txt").is_some());
         assert!(fuse.lookup_node(ROOT_INODE, "remove.txt").is_none());
+        assert_eq!(
+            MutationStore::open(&draft_root)
+                .unwrap()
+                .list()
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn old_remote_names_cannot_be_mutated_after_queued_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        let draft_root = dir.path().join("drafts");
+        let mut folder = file_item();
+        folder.item_id = "folder".into();
+        folder.name = Some("old-folder".into());
+        folder.kind = "folder".into();
+        let make_fuse = || {
+            VirtualFuse::new_writable(
+                VirtualTree::from_items("drive", "root", [file_item(), folder.clone()]).unwrap(),
+                dir.path().join("cache"),
+                draft_root.clone(),
+                10,
+                Arc::new(|_| Err(io::ErrorKind::NotConnected.into())),
+            )
+        };
+        let fuse = make_fuse();
+        fuse.rename_local_file(
+            ROOT_INODE,
+            "текст.txt",
+            ROOT_INODE,
+            "new.txt",
+            fuser::RenameFlags::empty(),
+        )
+        .unwrap();
+        fuse.rename_local_file(
+            ROOT_INODE,
+            "old-folder",
+            ROOT_INODE,
+            "new-folder",
+            fuser::RenameFlags::empty(),
+        )
+        .unwrap();
+        for fuse in [Some(fuse), None] {
+            let fuse = match fuse {
+                Some(fuse) => fuse,
+                None => {
+                    let fuse = make_fuse();
+                    fuse.load_local_files().unwrap();
+                    fuse
+                }
+            };
+            assert_eq!(
+                fuse.remove_local_file(ROOT_INODE, "текст.txt"),
+                Err(Errno::ENOENT)
+            );
+            assert_eq!(
+                fuse.remove_local_directory(ROOT_INODE, "old-folder"),
+                Err(Errno::ENOENT)
+            );
+            assert_eq!(
+                fuse.rename_local_file(
+                    ROOT_INODE,
+                    "текст.txt",
+                    ROOT_INODE,
+                    "another.txt",
+                    fuser::RenameFlags::empty(),
+                ),
+                Err(Errno::ENOENT)
+            );
+            assert_eq!(
+                fuse.remove_local_file(ROOT_INODE, "new.txt"),
+                Err(Errno::EBUSY)
+            );
+            assert_eq!(
+                fuse.remove_local_directory(ROOT_INODE, "new-folder"),
+                Err(Errno::EBUSY)
+            );
+        }
         assert_eq!(
             MutationStore::open(&draft_root)
                 .unwrap()
