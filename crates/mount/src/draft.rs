@@ -296,11 +296,16 @@ impl DraftStore {
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)?;
         let failure: DraftUploadFailure = serde_json::from_slice(&bytes)?;
-        if failure.identity != *identity {
+        if failure.identity.drive_id != identity.drive_id
+            || failure.identity.item_id != identity.item_id
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "upload failure identity mismatch",
             ));
+        }
+        if failure.identity != *identity {
+            return Ok(None);
         }
         Ok(Some(failure))
     }
@@ -1341,6 +1346,59 @@ mod tests {
                 .upload_failure(current.identity())
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn stale_upload_failure_does_not_hide_renamed_draft() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("drafts");
+        let store = DraftStore::open(&root).unwrap();
+        let original = DraftIdentity {
+            drive_id: "drive".into(),
+            item_id: "local:new".into(),
+            base_etag: "local-new".into(),
+            new_file: Some(NewFileLocation {
+                parent_id: "root".into(),
+                name: "before.txt".into(),
+            }),
+        };
+        store.begin_empty(original.clone()).unwrap();
+        let old_failure = DraftUploadFailure {
+            identity: original.clone(),
+            issue: DraftUploadIssue::TransferFailed,
+            attempted_at_unix: 123,
+            http_status: None,
+        };
+        store.save_upload_failure(&old_failure).unwrap();
+        let failure_path = store.failure_path(&original);
+        let previous_record = fs::read(&failure_path).unwrap();
+        store
+            .relocate_new(
+                "drive",
+                "local:new",
+                NewFileLocation {
+                    parent_id: "root".into(),
+                    name: "after.txt".into(),
+                },
+            )
+            .unwrap();
+        // Simulate a failure record written by an older process after relocation.
+        fs::write(&failure_path, previous_record).unwrap();
+
+        let reopened = DraftStore::open(&root).unwrap();
+        let current = reopened.list().unwrap().remove(0);
+        assert_eq!(current.new_file.as_ref().unwrap().name, "after.txt");
+        assert!(reopened.upload_failure(&current).unwrap().is_none());
+        let latest_failure = DraftUploadFailure {
+            identity: current.clone(),
+            attempted_at_unix: 124,
+            ..old_failure
+        };
+        reopened.save_upload_failure(&latest_failure).unwrap();
+        assert_eq!(
+            reopened.upload_failure(&current).unwrap(),
+            Some(latest_failure)
         );
     }
 
