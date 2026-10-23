@@ -931,12 +931,30 @@ impl VirtualFuse {
             }
         }
         for identity in store.list()? {
-            let Some(location) = &identity.new_file else {
-                continue;
-            };
             if identity.drive_id != self.tree.drive_id() {
                 continue;
             }
+            let inode = crate::stable_inode(&identity.drive_id, &identity.item_id);
+            let Some(location) = &identity.new_file else {
+                if self.tree.getattr(inode).is_none() && !local.contains_key(&inode) {
+                    let root = self.tree.getattr(crate::ROOT_INODE).expect("virtual root");
+                    let name = self.recovery_name(root, inode, "remote-file", true, &local);
+                    local.insert(
+                        inode,
+                        Node {
+                            inode,
+                            parent_inode: crate::ROOT_INODE,
+                            item_id: identity.item_id,
+                            name,
+                            kind: NodeKind::File,
+                            size: 0,
+                            etag: None,
+                            ctag: None,
+                        },
+                    );
+                }
+                continue;
+            };
             let parent_id = mappings
                 .get(&location.parent_id)
                 .filter(|remote_id| {
@@ -977,7 +995,6 @@ impl VirtualFuse {
                 let inode = crate::stable_inode(&identity.drive_id, &identity.item_id);
                 visible_name = self.recovery_name(parent, inode, &location.name, orphaned, &local);
             }
-            let inode = crate::stable_inode(&identity.drive_id, &identity.item_id);
             if self.tree.getattr(inode).is_some() || local.contains_key(&inode) {
                 continue;
             }
@@ -5689,6 +5706,70 @@ mod tests {
         assert!(name.starts_with(".conflict-"));
         assert!(name.len() <= 255);
         assert!(name.is_char_boundary(name.len()));
+    }
+
+    #[test]
+    fn missing_remote_item_keeps_existing_draft_visible_until_catalog_recovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let draft_root = dir.path().join("drafts");
+        DraftStore::open(&draft_root)
+            .unwrap()
+            .begin_empty(DraftIdentity {
+                drive_id: "drive".into(),
+                item_id: "file".into(),
+                base_etag: "v1".into(),
+                new_file: None,
+            })
+            .unwrap()
+            .write_at(0, b"unsent changes")
+            .unwrap();
+        let missing = VirtualFuse::new_writable(
+            VirtualTree::from_items("drive", "root", []).unwrap(),
+            dir.path().join("cache"),
+            draft_root.clone(),
+            10,
+            Arc::new(|_| Err(io::ErrorKind::NotConnected.into())),
+        );
+        missing.load_local_files().unwrap();
+        let orphan_name = format!(
+            ".orphan-{}-remote-file",
+            crate::stable_inode("drive", "file")
+        );
+        let orphan = missing.lookup_node(ROOT_INODE, &orphan_name).unwrap();
+        let handle = missing
+            .open_file(orphan.inode, OpenFlags(libc::O_RDONLY))
+            .unwrap();
+        assert_eq!(
+            missing.read_file(orphan.inode, handle, 0, 14).unwrap(),
+            b"unsent changes"
+        );
+        assert_eq!(
+            missing.remove_local_file(ROOT_INODE, &orphan_name),
+            Err(Errno::EBUSY)
+        );
+        drop(missing);
+
+        let restored = VirtualFuse::new_writable(
+            VirtualTree::from_items("drive", "root", [file_item()]).unwrap(),
+            dir.path().join("cache"),
+            draft_root.clone(),
+            10,
+            Arc::new(|_| Err(io::ErrorKind::NotConnected.into())),
+        );
+        restored.load_local_files().unwrap();
+        assert!(restored.lookup_node(ROOT_INODE, &orphan_name).is_none());
+        let file = restored.lookup_node(ROOT_INODE, "текст.txt").unwrap();
+        let handle = restored
+            .open_file(file.inode, OpenFlags(libc::O_RDONLY))
+            .unwrap();
+        assert_eq!(
+            restored.read_file(file.inode, handle, 0, 14).unwrap(),
+            b"unsent changes"
+        );
+        assert_eq!(
+            DraftStore::open(&draft_root).unwrap().list().unwrap().len(),
+            1
+        );
     }
 
     #[test]
