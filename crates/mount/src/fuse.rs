@@ -670,6 +670,34 @@ impl VirtualFuse {
             })
     }
 
+    fn recovery_name(
+        &self,
+        parent: &Node,
+        inode: u64,
+        original: &str,
+        orphaned: bool,
+        local: &HashMap<u64, Node>,
+    ) -> String {
+        let kind = if orphaned { "orphan" } else { "conflict" };
+        for attempt in 1_u64.. {
+            let mut candidate = if attempt == 1 {
+                format!(".{kind}-{inode}-")
+            } else {
+                format!(".{kind}-{inode}-{attempt}-")
+            };
+            for character in original.chars() {
+                if candidate.len() + character.len_utf8() > 255 {
+                    break;
+                }
+                candidate.push(character);
+            }
+            if !self.name_taken(parent.inode, &parent.item_id, &candidate, None, local) {
+                return candidate;
+            }
+        }
+        unreachable!("recovery name space exhausted")
+    }
+
     fn lookup_node(&self, parent: u64, name: &str) -> Option<Node> {
         if name == "." {
             return self.node(parent);
@@ -860,7 +888,7 @@ impl VirtualFuse {
                         None,
                         &local,
                     ) {
-                        format!(".conflict-{inode}-{}", directory.name)
+                        self.recovery_name(&parent, inode, &directory.name, false, &local)
                     } else {
                         directory.name.clone()
                     };
@@ -884,13 +912,15 @@ impl VirtualFuse {
                 // Keep descendants available even if a remote parent vanished.
                 for directory in directories.drain(..) {
                     let inode = crate::stable_inode(&directory.drive_id, &directory.item_id);
+                    let root = self.tree.getattr(crate::ROOT_INODE).expect("virtual root");
+                    let name = self.recovery_name(root, inode, &directory.name, true, &local);
                     local.insert(
                         inode,
                         Node {
                             inode,
                             parent_inode: crate::ROOT_INODE,
                             item_id: directory.item_id,
-                            name: format!(".orphan-{inode}-{}", directory.name),
+                            name,
                             kind: NodeKind::Directory,
                             size: 0,
                             etag: None,
@@ -944,15 +974,8 @@ impl VirtualFuse {
             if orphaned
                 || self.name_taken(parent.inode, &parent.item_id, &visible_name, None, &local)
             {
-                let short_id = identity
-                    .item_id
-                    .strip_prefix("local:")
-                    .unwrap_or(&identity.item_id);
-                let prefix = if orphaned { "orphan" } else { "conflict" };
-                visible_name = format!(
-                    ".{prefix}-{short_id}-{}",
-                    location.name.chars().take(120).collect::<String>()
-                );
+                let inode = crate::stable_inode(&identity.drive_id, &identity.item_id);
+                visible_name = self.recovery_name(parent, inode, &location.name, orphaned, &local);
             }
             let inode = crate::stable_inode(&identity.drive_id, &identity.item_id);
             if self.tree.getattr(inode).is_some() || local.contains_key(&inode) {
@@ -5562,6 +5585,110 @@ mod tests {
                 1
             );
         }
+    }
+
+    #[test]
+    fn recovery_names_do_not_hide_existing_remote_items() {
+        let dir = tempfile::tempdir().unwrap();
+        let draft_root = dir.path().join("drafts");
+        let local_file_id = "local:pending";
+        let file_inode = crate::stable_inode("drive", local_file_id);
+        DraftStore::open(&draft_root)
+            .unwrap()
+            .begin_empty(DraftIdentity {
+                drive_id: "drive".into(),
+                item_id: local_file_id.into(),
+                base_etag: "local-new".into(),
+                new_file: Some(NewFileLocation {
+                    parent_id: "root".into(),
+                    name: "ТЕКСТ.txt".into(),
+                }),
+            })
+            .unwrap()
+            .write_at(0, b"local copy")
+            .unwrap();
+        let local_directory = DirectoryStore::open(&draft_root)
+            .unwrap()
+            .create("drive", "root", "docs")
+            .unwrap();
+        let directory_inode = crate::stable_inode("drive", &local_directory.item_id);
+        let file_alias = format!(".conflict-{file_inode}-ТЕКСТ.txt");
+        let directory_alias = format!(".conflict-{directory_inode}-docs");
+        let mut existing_file_alias = file_item();
+        existing_file_alias.item_id = "existing-file-alias".into();
+        existing_file_alias.name = Some(file_alias.clone());
+        let mut remote_directory = file_item();
+        remote_directory.item_id = "remote-directory".into();
+        remote_directory.name = Some("Docs".into());
+        remote_directory.kind = "folder".into();
+        let mut existing_directory_alias = file_item();
+        existing_directory_alias.item_id = "existing-directory-alias".into();
+        existing_directory_alias.name = Some(directory_alias.clone());
+        let make_fuse = || {
+            VirtualFuse::new_writable(
+                VirtualTree::from_items(
+                    "drive",
+                    "root",
+                    [
+                        file_item(),
+                        existing_file_alias.clone(),
+                        remote_directory.clone(),
+                        existing_directory_alias.clone(),
+                    ],
+                )
+                .unwrap(),
+                dir.path().join("cache"),
+                draft_root.clone(),
+                10,
+                Arc::new(|_| Err(io::ErrorKind::NotConnected.into())),
+            )
+        };
+        for _ in 0..2 {
+            let fuse = make_fuse();
+            fuse.load_local_files().unwrap();
+            assert_eq!(
+                fuse.lookup_node(ROOT_INODE, &file_alias).unwrap().item_id,
+                "existing-file-alias"
+            );
+            assert_eq!(
+                fuse.lookup_node(ROOT_INODE, &directory_alias)
+                    .unwrap()
+                    .item_id,
+                "existing-directory-alias"
+            );
+            let recovered_file = fuse
+                .lookup_node(ROOT_INODE, &format!(".conflict-{file_inode}-2-ТЕКСТ.txt"))
+                .unwrap();
+            let recovered_directory = fuse
+                .lookup_node(ROOT_INODE, &format!(".conflict-{directory_inode}-2-docs"))
+                .unwrap();
+            assert_eq!(recovered_directory.item_id, local_directory.item_id);
+            let handle = fuse
+                .open_file(recovered_file.inode, OpenFlags(libc::O_RDONLY))
+                .unwrap();
+            assert_eq!(
+                fuse.read_file(recovered_file.inode, handle, 0, 10).unwrap(),
+                b"local copy"
+            );
+            assert_eq!(fuse.directory_entries(ROOT_INODE).unwrap().len(), 8);
+        }
+    }
+
+    #[test]
+    fn recovery_name_stays_within_linux_component_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let fuse = VirtualFuse::new_writable(
+            VirtualTree::from_items("drive", "root", []).unwrap(),
+            dir.path().join("cache"),
+            dir.path().join("drafts"),
+            10,
+            Arc::new(|_| Err(io::ErrorKind::NotConnected.into())),
+        );
+        let parent = fuse.tree.getattr(ROOT_INODE).unwrap();
+        let name = fuse.recovery_name(parent, u64::MAX, &"💾".repeat(100), false, &HashMap::new());
+        assert!(name.starts_with(".conflict-"));
+        assert!(name.len() <= 255);
+        assert!(name.is_char_boundary(name.len()));
     }
 
     #[test]
