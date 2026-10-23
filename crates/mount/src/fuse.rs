@@ -967,6 +967,15 @@ impl VirtualFuse {
         Ok((node, handle))
     }
 
+    fn create_regular_node(&self, parent: u64, name: &str, mode: u32) -> Result<Node, Errno> {
+        if !matches!(mode & libc::S_IFMT, 0 | libc::S_IFREG) {
+            return Err(Errno::EOPNOTSUPP);
+        }
+        let (node, handle) = self.create_file(parent, name, OpenFlags(libc::O_WRONLY))?;
+        self.files.lock().unwrap().remove(&handle);
+        Ok(node)
+    }
+
     fn queue_remote_change(&self, node: &Node, kind: MutationKind) -> Result<(), Errno> {
         let Some(root) = &self.draft_root else {
             return Err(Errno::EROFS);
@@ -2280,6 +2289,29 @@ impl Filesystem for VirtualFuse {
                     FileHandle(handle),
                     FopenFlags::FOPEN_DIRECT_IO,
                 ),
+                Err(error) => reply.error(error),
+            },
+            Err(error) => reply.error(error),
+        }
+    }
+
+    fn mknod(
+        &self,
+        _request: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        mode: u32,
+        _umask: u32,
+        _rdev: u32,
+        reply: ReplyEntry,
+    ) {
+        let result = name
+            .to_str()
+            .ok_or(Errno::EINVAL)
+            .and_then(|name| self.create_regular_node(parent.0, name, mode));
+        match result {
+            Ok(node) => match self.attr(&node) {
+                Ok(attr) => reply.entry(&TTL, &attr, Generation(0)),
                 Err(error) => reply.error(error),
             },
             Err(error) => reply.error(error),
@@ -4904,6 +4936,94 @@ mod tests {
             fuse.read_file(created.inode, handle, 0, 4).unwrap(),
             b"data"
         );
+    }
+
+    #[test]
+    fn regular_mknod_creates_durable_file_and_rejects_special_nodes() {
+        let dir = tempfile::tempdir().unwrap();
+        let draft_root = dir.path().join("drafts");
+        let tree = VirtualTree::from_items("drive", "root", [file_item()]).unwrap();
+        let fuse = VirtualFuse::new_writable(
+            tree,
+            dir.path().join("cache"),
+            draft_root.clone(),
+            10,
+            Arc::new(|_| Err(io::ErrorKind::NotConnected.into())),
+        );
+        for mode in [libc::S_IFDIR, libc::S_IFLNK, libc::S_IFIFO, libc::S_IFCHR] {
+            assert_eq!(
+                fuse.create_regular_node(ROOT_INODE, "special", mode | 0o600),
+                Err(Errno::EOPNOTSUPP)
+            );
+        }
+        assert!(fuse.lookup_node(ROOT_INODE, "special").is_none());
+        let node = fuse
+            .create_regular_node(ROOT_INODE, "created.txt", libc::S_IFREG | 0o644)
+            .unwrap();
+        assert!(fuse.files.lock().unwrap().is_empty());
+        assert_eq!(fuse.attr(&node).unwrap().kind, FileType::RegularFile);
+        assert_eq!(fuse.attr(&node).unwrap().size, 0);
+        assert_eq!(
+            fuse.create_regular_node(ROOT_INODE, "created.txt", libc::S_IFREG),
+            Err(Errno::EEXIST)
+        );
+        assert_eq!(
+            DraftStore::open(&draft_root).unwrap().list().unwrap().len(),
+            1
+        );
+
+        let reopened = VirtualFuse::new_writable(
+            VirtualTree::from_items("drive", "root", [file_item()]).unwrap(),
+            dir.path().join("cache"),
+            draft_root,
+            10,
+            Arc::new(|_| Err(io::ErrorKind::NotConnected.into())),
+        );
+        reopened.load_local_files().unwrap();
+        assert_eq!(
+            reopened
+                .lookup_node(ROOT_INODE, "created.txt")
+                .unwrap()
+                .inode,
+            node.inode
+        );
+    }
+
+    #[test]
+    fn mounted_regular_mknod_survives_remount() {
+        if std::env::var_os("ONEDRIVE_FUSE_SMOKE").is_none() {
+            return;
+        }
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mountpoint = dir.path().join("mount");
+        let draft_root = dir.path().join("drafts");
+        fs::create_dir(&mountpoint).unwrap();
+        let mount = || {
+            VirtualFuse::new_writable(
+                VirtualTree::from_items("drive", "root", []).unwrap(),
+                dir.path().join("cache"),
+                draft_root.clone(),
+                10,
+                Arc::new(|_| Err(io::ErrorKind::NotConnected.into())),
+            )
+            .mount(&mountpoint)
+            .unwrap()
+        };
+        let path = mountpoint.join("created.txt");
+        let raw_path = CString::new(path.as_os_str().as_bytes()).unwrap();
+        let session = mount();
+        assert_eq!(
+            unsafe { libc::mknod(raw_path.as_ptr(), libc::S_IFREG | 0o600, 0) },
+            0
+        );
+        fs::write(&path, b"data").unwrap();
+        session.umount_and_join().unwrap();
+        let session = mount();
+        assert_eq!(fs::read(&path).unwrap(), b"data");
+        session.umount_and_join().unwrap();
     }
 
     #[test]
