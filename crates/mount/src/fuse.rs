@@ -1276,6 +1276,15 @@ impl VirtualFuse {
             && flags.bits() & libc::RENAME_NOREPLACE == 0
         {
             if self
+                .files
+                .lock()
+                .unwrap()
+                .values()
+                .any(|open| open.inode == target.inode)
+            {
+                return Err(Errno::EBUSY);
+            }
+            if self
                 .remote_changes
                 .lock()
                 .unwrap()
@@ -4184,6 +4193,72 @@ mod tests {
         let mut bytes = [0; 11];
         assert_eq!(draft.read_at(0, &mut bytes).unwrap(), 11);
         assert_eq!(&bytes, b"replacement");
+    }
+
+    #[test]
+    fn editor_rename_waits_for_open_remote_target_before_replacing_its_draft() {
+        let dir = tempfile::tempdir().unwrap();
+        let draft_root = dir.path().join("drafts");
+        let fuse = VirtualFuse::new_writable(
+            VirtualTree::from_items("drive", "root", [file_item()]).unwrap(),
+            dir.path().join("cache"),
+            draft_root.clone(),
+            10,
+            Arc::new(|_| panic!("no download expected")),
+        );
+        let target = fuse.lookup_node(ROOT_INODE, "текст.txt").unwrap();
+        let target_handle = fuse
+            .open_file(target.inode, OpenFlags(libc::O_RDWR | libc::O_TRUNC))
+            .unwrap();
+        fuse.write_file(target.inode, target_handle, 0, b"old")
+            .unwrap();
+        let (temporary, source_handle) = fuse
+            .create_file(ROOT_INODE, "swap.tmp", OpenFlags(libc::O_RDWR))
+            .unwrap();
+        fuse.write_file(temporary.inode, source_handle, 0, b"new")
+            .unwrap();
+
+        assert_eq!(
+            fuse.rename_local_file(
+                ROOT_INODE,
+                "swap.tmp",
+                ROOT_INODE,
+                "текст.txt",
+                fuser::RenameFlags::empty(),
+            ),
+            Err(Errno::EBUSY)
+        );
+        fuse.write_file(target.inode, target_handle, 3, b"!")
+            .unwrap();
+        assert_eq!(
+            fuse.read_file(target.inode, target_handle, 0, 4).unwrap(),
+            b"old!"
+        );
+        assert!(fuse.lookup_node(ROOT_INODE, "swap.tmp").is_some());
+        assert_eq!(
+            DraftStore::open(&draft_root).unwrap().list().unwrap().len(),
+            2
+        );
+
+        fuse.files.lock().unwrap().remove(&target_handle);
+        fuse.rename_local_file(
+            ROOT_INODE,
+            "swap.tmp",
+            ROOT_INODE,
+            "текст.txt",
+            fuser::RenameFlags::empty(),
+        )
+        .unwrap();
+        assert!(fuse.lookup_node(ROOT_INODE, "swap.tmp").is_none());
+        assert_eq!(
+            fuse.read_file(temporary.inode, source_handle, 0, 3)
+                .unwrap(),
+            b"new"
+        );
+        assert_eq!(
+            DraftStore::open(&draft_root).unwrap().list().unwrap().len(),
+            1
+        );
     }
 
     #[test]
