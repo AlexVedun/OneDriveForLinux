@@ -2070,7 +2070,7 @@ impl VirtualFuse {
                 .is_none_or(|open| open.inode != source_inode || !open.readable)
                 || files
                     .get(&target_handle)
-                    .is_none_or(|open| open.inode != target_inode || !open.writable)
+                    .is_none_or(|open| open.inode != target_inode || !open.writable || open.append)
             {
                 return Err(Errno::EBADF);
             }
@@ -3804,6 +3804,21 @@ mod tests {
             .unwrap();
         assert_eq!(
             fuse.copy_range(source.inode, source_handle, 0, target.inode, readonly, 0, 1),
+            Err(Errno::EBADF)
+        );
+        let append_target = fuse
+            .open_file(target.inode, OpenFlags(libc::O_WRONLY | libc::O_APPEND))
+            .unwrap();
+        assert_eq!(
+            fuse.copy_range(
+                source.inode,
+                source_handle,
+                0,
+                target.inode,
+                append_target,
+                0,
+                1
+            ),
             Err(Errno::EBADF)
         );
         let write_only_source = fuse
