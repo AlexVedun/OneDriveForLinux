@@ -535,6 +535,9 @@ fn virtual_draft_status_label(status: &str) -> &'static str {
         "uncertain-empty-existing" => {
             "результат отправки пустого файла неизвестен; требуется проверка в OneDrive"
         }
+        "uncertain-existing" => {
+            "результат отправки файла неизвестен; требуется проверка содержимого в OneDrive"
+        }
         "uncertain-empty-new" => {
             "результат создания пустого файла неизвестен; проверьте OneDrive вручную"
         }
@@ -1616,7 +1619,7 @@ fn present_virtual_drafts_dialog(
         });
         if matches!(
             draft.status.as_str(),
-            "remote-changed" | "uncertain-empty-existing"
+            "remote-changed" | "uncertain-empty-existing" | "uncertain-existing"
         ) && upload_enabled
         {
             let compare = gtk::Button::with_label("Проверить содержимое в OneDrive");
