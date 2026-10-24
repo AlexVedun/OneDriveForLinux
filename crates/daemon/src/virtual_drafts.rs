@@ -29,6 +29,9 @@ pub fn mark_uncertain_upload(
     };
     if draft.new_file.is_none() && status.status == "remote-changed" {
         status.last_upload_issue = Some(DraftUploadIssue::TransferFailed);
+    } else if draft.new_file.is_some() && status.status == "name-conflict" {
+        status.status = "uncertain-new";
+        status.last_upload_issue = Some(DraftUploadIssue::TransferFailed);
     } else if checkpoint.size == 0 {
         match (draft.new_file.is_some(), status.status) {
             (false, "ready") => status.status = "uncertain-empty-existing",
@@ -329,5 +332,45 @@ mod tests {
         mark_uncertain_upload(&mut new_status, &local_new, Some(&new_checkpoint));
         assert_eq!(new_status.status, "uncertain-empty-new");
         assert!(next_auto_candidate(&[new_status], None).is_none());
+    }
+
+    #[test]
+    fn new_file_name_conflict_with_final_attempt_requires_manual_review() {
+        let identity = DraftIdentity {
+            drive_id: "drive".into(),
+            item_id: "local:new".into(),
+            base_etag: "local-new".into(),
+            new_file: Some(onedrive_mount::draft::NewFileLocation {
+                parent_id: "root".into(),
+                name: "new.txt".into(),
+            }),
+        };
+        let checkpoint = DraftUploadCheckpoint {
+            identity: identity.clone(),
+            sha256: "a".repeat(64),
+            size: 1,
+            upload_url: "https://upload.example/session".into(),
+            next_offset: 0,
+            final_chunk_attempted: true,
+        };
+        let mut status = VirtualDraftStatus {
+            drive_id: "drive".into(),
+            item_id: identity.item_id.clone(),
+            name: Some("new.txt".into()),
+            status: "name-conflict",
+            last_upload_issue: None,
+            last_upload_http_status: None,
+        };
+        mark_uncertain_upload(&mut status, &identity, None);
+        assert_eq!(status.status, "name-conflict");
+        assert!(next_auto_candidate(&[status.clone()], None).is_none());
+
+        mark_uncertain_upload(&mut status, &identity, Some(&checkpoint));
+        assert_eq!(status.status, "uncertain-new");
+        assert_eq!(
+            status.last_upload_issue,
+            Some(DraftUploadIssue::TransferFailed)
+        );
+        assert!(next_auto_candidate(&[status], None).is_none());
     }
 }

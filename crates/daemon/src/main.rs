@@ -526,7 +526,7 @@ impl Daemon {
                         if !parent_exists {
                             "remote-missing"
                         } else if name_taken {
-                            "remote-changed"
+                            "name-conflict"
                         } else if store
                             .recover(draft)
                             .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?

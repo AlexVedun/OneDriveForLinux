@@ -528,6 +528,10 @@ fn virtual_draft_status_label(status: &str) -> &'static str {
         "remote-missing" => "файл отсутствует в каталоге",
         "remote-not-file" => "объект больше не является файлом",
         "remote-changed" => "версия в каталоге изменилась",
+        "name-conflict" => "в OneDrive уже есть объект с таким именем",
+        "uncertain-new" => {
+            "после отправки в OneDrive появился объект с таким именем; проверьте его вручную"
+        }
         "uncertain-empty-existing" => {
             "результат отправки пустого файла неизвестен; требуется проверка в OneDrive"
         }
