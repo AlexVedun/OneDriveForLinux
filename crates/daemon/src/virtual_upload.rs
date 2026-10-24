@@ -66,7 +66,24 @@ async fn upload_operation_snapshot<T: UploadTransport>(
 ) -> Result<UploadStep, UploadError> {
     ensure_snapshot_current(store, snapshot)?;
     if snapshot.size == 0 {
-        store.clear_upload_checkpoint(&snapshot.identity)?;
+        if let Some(previous) = store.upload_checkpoint(&snapshot.identity)? {
+            if previous.final_chunk_attempted {
+                return Err(UploadError::Uncertain);
+            }
+            store.clear_upload_checkpoint(&snapshot.identity)?;
+        }
+        save_current_checkpoint(
+            store,
+            &DraftUploadCheckpoint {
+                identity: snapshot.identity.clone(),
+                sha256: snapshot.sha256.clone(),
+                size: 0,
+                upload_url: String::new(),
+                next_offset: 0,
+                final_chunk_attempted: true,
+            },
+        )?;
+        ensure_snapshot_current(store, snapshot)?;
         let result = transport.upload_empty(&operation).await?;
         return match result {
             UploadStep::Complete { remote_id, etag }
@@ -341,7 +358,79 @@ mod tests {
             matches!(result, UploadStep::Complete { remote_id, etag: Some(etag) }
             if remote_id == "remote-created" && etag == "v1")
         );
+        let checkpoint = store.upload_checkpoint(&identity).unwrap().unwrap();
+        assert_eq!(checkpoint.size, 0);
+        assert!(checkpoint.final_chunk_attempted);
         assert_eq!(snapshot.identity, identity);
+    }
+
+    struct LostEmptyTransport(AtomicUsize);
+
+    impl UploadTransport for LostEmptyTransport {
+        async fn create_session(&self, _: &QueuedOperation, _: u64) -> Result<String, UploadError> {
+            panic!("uncertain empty file must not create a session")
+        }
+
+        async fn session_offset(&self, _: &str) -> Result<u64, UploadError> {
+            panic!("uncertain empty file must not resume a session")
+        }
+
+        async fn send_range(
+            &self,
+            _: &str,
+            _: u64,
+            _: u64,
+            _: Vec<u8>,
+        ) -> Result<UploadStep, UploadError> {
+            panic!("uncertain empty file must not send a range")
+        }
+
+        async fn upload_empty(&self, _: &QueuedOperation) -> Result<UploadStep, UploadError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Err(UploadError::Transient)
+        }
+    }
+
+    #[tokio::test]
+    async fn lost_empty_file_reply_does_not_repeat_create_after_restart() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("drafts");
+        let store = DraftStore::open(&root).unwrap();
+        let identity = DraftIdentity {
+            drive_id: "drive".into(),
+            item_id: "local:empty".into(),
+            base_etag: "local-new".into(),
+            new_file: Some(NewFileLocation {
+                parent_id: "root".into(),
+                name: "new.txt".into(),
+            }),
+        };
+        let draft = store.begin_empty(identity.clone()).unwrap();
+        let snapshot = store.snapshot(&identity).unwrap().unwrap();
+        let transport = LostEmptyTransport(AtomicUsize::new(0));
+        assert!(matches!(
+            upload_new_snapshot_to_parent(&transport, &store, &snapshot, "root").await,
+            Err(UploadError::Transient)
+        ));
+        drop(store);
+
+        let reopened = DraftStore::open(&root).unwrap();
+        let checkpoint = reopened.upload_checkpoint(&identity).unwrap().unwrap();
+        assert_eq!(checkpoint.size, 0);
+        assert_eq!(checkpoint.sha256, snapshot.sha256);
+        assert!(checkpoint.final_chunk_attempted);
+        assert!(matches!(
+            upload_new_snapshot_to_parent(&transport, &reopened, &snapshot, "root").await,
+            Err(UploadError::Uncertain)
+        ));
+        draft.write_at(0, b"later").unwrap();
+        let changed = reopened.snapshot(&identity).unwrap().unwrap();
+        assert!(matches!(
+            upload_new_snapshot_to_parent(&transport, &reopened, &changed, "root").await,
+            Err(UploadError::Uncertain)
+        ));
+        assert_eq!(transport.0.load(Ordering::SeqCst), 1);
+        assert!(reopened.recover(&identity).unwrap().is_some());
     }
 
     #[tokio::test]
@@ -781,7 +870,10 @@ mod tests {
             .await,
             Ok(UploadStep::Complete { .. })
         ));
-        assert!(store.upload_checkpoint(&identity).unwrap().is_none());
+        let checkpoint = store.upload_checkpoint(&identity).unwrap().unwrap();
+        assert_eq!(checkpoint.size, 0);
+        assert!(checkpoint.final_chunk_attempted);
+        store.clear_upload_checkpoint(&identity).unwrap();
         assert!(matches!(
             upload_snapshot(
                 &EmptyTransport {

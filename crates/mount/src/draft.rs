@@ -94,7 +94,7 @@ pub struct DraftUploadCheckpoint {
     pub size: u64,
     pub upload_url: String,
     pub next_offset: u64,
-    /// The last range may have committed remotely even if its reply was lost.
+    /// The final range or an empty upload may have committed remotely even if its reply was lost.
     #[serde(default)]
     pub final_chunk_attempted: bool,
 }
@@ -134,12 +134,16 @@ impl std::fmt::Debug for DraftUploadCheckpoint {
 impl DraftUploadCheckpoint {
     fn validate(&self) -> io::Result<()> {
         self.identity.validate()?;
-        if self.size == 0
-            || self.next_offset >= self.size
+        let valid_transfer = if self.size == 0 {
+            self.final_chunk_attempted && self.next_offset == 0 && self.upload_url.is_empty()
+        } else {
+            self.next_offset < self.size
+                && self.upload_url.starts_with("https://")
+                && self.upload_url.len() <= 16 * 1024
+        };
+        if !valid_transfer
             || self.sha256.len() != 64
             || !self.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
-            || !self.upload_url.starts_with("https://")
-            || self.upload_url.len() > 16 * 1024
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -1440,6 +1444,47 @@ mod tests {
         );
         reopened.clear_upload_checkpoint(&identity()).unwrap();
         assert!(reopened.upload_checkpoint(&identity()).unwrap().is_none());
+    }
+
+    #[test]
+    fn empty_upload_checkpoint_requires_attempt_marker() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("drafts");
+        let store = DraftStore::open(&root).unwrap();
+        store.begin_empty(identity()).unwrap();
+        let mut checkpoint = DraftUploadCheckpoint {
+            identity: identity(),
+            sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".into(),
+            size: 0,
+            upload_url: String::new(),
+            next_offset: 0,
+            final_chunk_attempted: true,
+        };
+        store.save_upload_checkpoint(&checkpoint).unwrap();
+        drop(store);
+
+        let reopened = DraftStore::open(&root).unwrap();
+        assert_eq!(
+            reopened.upload_checkpoint(&identity()).unwrap(),
+            Some(checkpoint.clone())
+        );
+        checkpoint.final_chunk_attempted = false;
+        assert_eq!(
+            reopened
+                .save_upload_checkpoint(&checkpoint)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        checkpoint.final_chunk_attempted = true;
+        checkpoint.upload_url = "https://upload.example/unexpected".into();
+        assert_eq!(
+            reopened
+                .save_upload_checkpoint(&checkpoint)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
     }
 
     #[test]
