@@ -1355,7 +1355,7 @@ impl VirtualFuse {
                 .lock()
                 .unwrap()
                 .values()
-                .any(|open| open.inode == node.inode || open.inode == target.inode)
+                .any(|open| open.inode == target.inode)
             {
                 return Err(Errno::EBUSY);
             }
@@ -4391,7 +4391,7 @@ mod tests {
             ),
             Err(Errno::EBUSY)
         );
-        fuse.files.lock().unwrap().clear();
+        fuse.files.lock().unwrap().remove(&target_handle);
         assert_eq!(
             fuse.rename_local_file(
                 ROOT_INODE,
@@ -4415,6 +4415,13 @@ mod tests {
             fuse.lookup_node(ROOT_INODE, "target.txt").unwrap().inode,
             source.inode
         );
+        fuse.write_file(source.inode, source_handle, 3, b"!")
+            .unwrap();
+        assert_eq!(
+            fuse.read_file(source.inode, source_handle, 0, 4).unwrap(),
+            b"new!"
+        );
+        fuse.files.lock().unwrap().remove(&source_handle);
         drop(fuse);
         let fuse = make_fuse();
         fuse.load_local_files().unwrap();
@@ -4428,9 +4435,9 @@ mod tests {
             .recover(&drafts[0])
             .unwrap()
             .unwrap();
-        let mut bytes = [0; 3];
-        assert_eq!(draft.read_at(0, &mut bytes).unwrap(), 3);
-        assert_eq!(&bytes, b"new");
+        let mut bytes = [0; 4];
+        assert_eq!(draft.read_at(0, &mut bytes).unwrap(), 4);
+        assert_eq!(&bytes, b"new!");
     }
 
     #[test]
