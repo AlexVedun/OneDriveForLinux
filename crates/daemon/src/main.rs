@@ -598,8 +598,10 @@ impl Daemon {
             if !retry_schedule.allows(draft, now) {
                 return false;
             }
-            if !matches!(draft.status, "remote-changed" | "uncertain-empty-existing")
-                || draft.last_upload_issue != Some(DraftUploadIssue::TransferFailed)
+            if !matches!(
+                draft.status,
+                "remote-changed" | "uncertain-empty-existing" | "uncertain-existing"
+            ) || draft.last_upload_issue != Some(DraftUploadIssue::TransferFailed)
             {
                 return true;
             }
@@ -1165,7 +1167,10 @@ impl Daemon {
             .into_iter()
             .find(|draft| {
                 draft.item_id == item_id
-                    && matches!(draft.status, "remote-changed" | "uncertain-empty-existing")
+                    && matches!(
+                        draft.status,
+                        "remote-changed" | "uncertain-empty-existing" | "uncertain-existing"
+                    )
             })
             .ok_or_else(|| {
                 zbus::fdo::Error::Failed("draft is not awaiting cloud comparison".into())

@@ -74,6 +74,13 @@ pub fn mark_uncertain_upload(
             _ => return,
         }
         status.last_upload_issue = Some(DraftUploadIssue::TransferFailed);
+    } else if checkpoint.next_offset == checkpoint.size {
+        match (draft.new_file.is_some(), status.status) {
+            (false, "ready") => status.status = "uncertain-existing",
+            (true, "ready-new") => status.status = "uncertain-new",
+            _ => return,
+        }
+        status.last_upload_issue = Some(DraftUploadIssue::TransferFailed);
     }
 }
 
@@ -86,7 +93,7 @@ pub fn next_auto_candidate<'a>(
         .filter_map(|draft| {
             let action = match draft.status {
                 "ready" | "ready-new" => AutoDraftAction::Upload,
-                "remote-changed" | "uncertain-empty-existing"
+                "remote-changed" | "uncertain-empty-existing" | "uncertain-existing"
                     if draft.last_upload_issue == Some(DraftUploadIssue::TransferFailed) =>
                 {
                     AutoDraftAction::Reconcile
@@ -399,6 +406,56 @@ mod tests {
         };
         mark_uncertain_upload(&mut new_status, &local_new, Some(&new_checkpoint));
         assert_eq!(new_status.status, "uncertain-empty-new");
+        assert!(next_auto_candidate(&[new_status], None).is_none());
+    }
+
+    #[test]
+    fn unavailable_final_session_routes_existing_to_reconcile_and_new_to_review() {
+        let existing_identity = draft();
+        let mut checkpoint = DraftUploadCheckpoint {
+            identity: existing_identity.clone(),
+            sha256: "a".repeat(64),
+            size: 4,
+            upload_url: "https://upload.example/session".into(),
+            next_offset: 0,
+            final_chunk_attempted: true,
+        };
+        let ready = classify(&existing_identity, Some("drive"), true, Some(&item()));
+        let mut resumable = ready.clone();
+        mark_uncertain_upload(&mut resumable, &existing_identity, Some(&checkpoint));
+        assert_eq!(resumable.status, "ready");
+        assert_eq!(
+            next_auto_candidate(&[resumable], None).map(|(_, action)| action),
+            Some(AutoDraftAction::Upload)
+        );
+
+        checkpoint.next_offset = checkpoint.size;
+        let mut uncertain = ready;
+        mark_uncertain_upload(&mut uncertain, &existing_identity, Some(&checkpoint));
+        assert_eq!(uncertain.status, "uncertain-existing");
+        assert_eq!(
+            next_auto_candidate(&[uncertain], None).map(|(_, action)| action),
+            Some(AutoDraftAction::Reconcile)
+        );
+
+        let mut new_identity = existing_identity;
+        new_identity.item_id = "local:new".into();
+        new_identity.base_etag = "local-new".into();
+        new_identity.new_file = Some(onedrive_mount::draft::NewFileLocation {
+            parent_id: "root".into(),
+            name: "new.txt".into(),
+        });
+        checkpoint.identity = new_identity.clone();
+        let mut new_status = VirtualDraftStatus {
+            drive_id: "drive".into(),
+            item_id: new_identity.item_id.clone(),
+            name: Some("new.txt".into()),
+            status: "ready-new",
+            last_upload_issue: None,
+            last_upload_http_status: None,
+        };
+        mark_uncertain_upload(&mut new_status, &new_identity, Some(&checkpoint));
+        assert_eq!(new_status.status, "uncertain-new");
         assert!(next_auto_candidate(&[new_status], None).is_none());
     }
 
