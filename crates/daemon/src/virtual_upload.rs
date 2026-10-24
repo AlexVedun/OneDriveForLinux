@@ -98,6 +98,12 @@ async fn upload_operation_snapshot<T: UploadTransport>(
     }
     let previous = store.upload_checkpoint(&snapshot.identity)?;
     let mut checkpoint = if let Some(mut previous) = previous {
+        if previous.size > 0
+            && previous.next_offset == previous.size
+            && previous.final_chunk_attempted
+        {
+            return Err(UploadError::Uncertain);
+        }
         if previous.sha256 == snapshot.sha256
             && previous.size == snapshot.size
             && previous.identity == snapshot.identity
@@ -109,10 +115,16 @@ async fn upload_operation_snapshot<T: UploadTransport>(
                     save_current_checkpoint(store, &previous)?;
                     previous
                 }
-                Ok(_) if previous.final_chunk_attempted => return Err(UploadError::Uncertain),
+                Ok(_) if previous.final_chunk_attempted => {
+                    previous.next_offset = previous.size;
+                    save_current_checkpoint(store, &previous)?;
+                    return Err(UploadError::Uncertain);
+                }
                 Ok(_) => return Err(UploadError::InvalidResponse),
                 Err(UploadError::Expired) => {
                     if previous.final_chunk_attempted {
+                        previous.next_offset = previous.size;
+                        save_current_checkpoint(store, &previous)?;
                         return Err(UploadError::Uncertain);
                     }
                     store.clear_upload_checkpoint(&snapshot.identity)?;
@@ -685,6 +697,7 @@ mod tests {
 
     struct LostFinalTransport {
         sessions: AtomicUsize,
+        offset_checks: AtomicUsize,
         ranges: AtomicUsize,
     }
 
@@ -695,6 +708,7 @@ mod tests {
         }
 
         async fn session_offset(&self, _: &str) -> Result<u64, UploadError> {
+            self.offset_checks.fetch_add(1, Ordering::SeqCst);
             Err(UploadError::Expired)
         }
 
@@ -729,6 +743,7 @@ mod tests {
         let snapshot = store.snapshot(&identity).unwrap().unwrap();
         let transport = LostFinalTransport {
             sessions: AtomicUsize::new(0),
+            offset_checks: AtomicUsize::new(0),
             ranges: AtomicUsize::new(0),
         };
         assert!(matches!(
@@ -749,15 +764,25 @@ mod tests {
             upload_new_snapshot_to_parent(&transport, &reopened, &snapshot, "root").await,
             Err(UploadError::Uncertain)
         ));
-        draft.write_at(0, b"later").unwrap();
-        let changed = reopened.snapshot(&identity).unwrap().unwrap();
+        let checkpoint = reopened.upload_checkpoint(&identity).unwrap().unwrap();
+        assert_eq!(checkpoint.next_offset, checkpoint.size);
+        drop(reopened);
+
+        let restarted = DraftStore::open(&root).unwrap();
         assert!(matches!(
-            upload_new_snapshot_to_parent(&transport, &reopened, &changed, "root").await,
+            upload_new_snapshot_to_parent(&transport, &restarted, &snapshot, "root").await,
+            Err(UploadError::Uncertain)
+        ));
+        draft.write_at(0, b"later").unwrap();
+        let changed = restarted.snapshot(&identity).unwrap().unwrap();
+        assert!(matches!(
+            upload_new_snapshot_to_parent(&transport, &restarted, &changed, "root").await,
             Err(UploadError::Uncertain)
         ));
         assert_eq!(transport.sessions.load(Ordering::SeqCst), 1);
+        assert_eq!(transport.offset_checks.load(Ordering::SeqCst), 1);
         assert_eq!(transport.ranges.load(Ordering::SeqCst), 1);
-        assert!(reopened.recover(&identity).unwrap().is_some());
+        assert!(restarted.recover(&identity).unwrap().is_some());
     }
 
     #[tokio::test]
