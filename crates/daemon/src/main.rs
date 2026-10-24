@@ -566,11 +566,7 @@ impl Daemon {
                 let checkpoint = store
                     .upload_checkpoint(draft)
                     .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
-                virtual_drafts::mark_uncertain_existing_upload(
-                    &mut status,
-                    draft,
-                    checkpoint.as_ref(),
-                );
+                virtual_drafts::mark_uncertain_upload(&mut status, draft, checkpoint.as_ref());
                 Ok(status)
             })
             .collect::<zbus::fdo::Result<Vec<_>>>()
@@ -596,7 +592,7 @@ impl Daemon {
         let root = state_directory().ok()?.join("virtual-drafts");
         let store = DraftStore::open(&root).ok()?;
         statuses.retain(|draft| {
-            if draft.status != "remote-changed"
+            if !matches!(draft.status, "remote-changed" | "uncertain-empty-existing")
                 || draft.last_upload_issue != Some(DraftUploadIssue::TransferFailed)
             {
                 return true;
@@ -1161,7 +1157,10 @@ impl Daemon {
         let draft_status = self
             .virtual_draft_statuses()?
             .into_iter()
-            .find(|draft| draft.item_id == item_id && draft.status == "remote-changed")
+            .find(|draft| {
+                draft.item_id == item_id
+                    && matches!(draft.status, "remote-changed" | "uncertain-empty-existing")
+            })
             .ok_or_else(|| {
                 zbus::fdo::Error::Failed("draft is not awaiting cloud comparison".into())
             })?;
