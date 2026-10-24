@@ -1763,6 +1763,9 @@ impl VirtualFuse {
             .ok_or(Errno::EBADF)?
             .handle
             .clone();
+        if size == 0 {
+            return Ok(Vec::new());
+        }
         if self.draft_root.is_some()
             && let Some(node) = self.node(inode)
             && let Some(draft) = self.draft_for_node(&node)?
@@ -1869,6 +1872,16 @@ impl VirtualFuse {
     }
 
     fn write_file(&self, inode: u64, handle: u64, offset: u64, data: &[u8]) -> Result<u32, Errno> {
+        if data.is_empty() {
+            let files = self.files.lock().unwrap();
+            if files
+                .get(&handle)
+                .is_none_or(|open| open.inode != inode || !open.writable)
+            {
+                return Err(Errno::EBADF);
+            }
+            return Ok(0);
+        }
         self.materialize_pending(inode, handle, false)?;
         let _serialized = self.open_lock.lock().unwrap();
         let files = self.files.lock().unwrap();
@@ -4934,6 +4947,45 @@ mod tests {
         fuse.files.lock().unwrap().remove(&handle);
         assert!(fuse.read_file(inode, handle, 0, 1).is_err());
         fuse.open_file(inode, OpenFlags(libc::O_RDONLY)).unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn empty_io_on_pending_remote_file_needs_no_download_or_draft() {
+        let dir = tempfile::tempdir().unwrap();
+        let draft_root = dir.path().join("drafts");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_loader = Arc::clone(&calls);
+        let fuse = VirtualFuse::new_writable(
+            VirtualTree::from_items("drive", "root", [file_item()]).unwrap(),
+            dir.path().join("cache"),
+            draft_root.clone(),
+            10,
+            Arc::new(move |_| {
+                calls_for_loader.fetch_add(1, Ordering::SeqCst);
+                Err(io::ErrorKind::NotConnected.into())
+            }),
+        );
+        let inode = fuse.lookup_node(ROOT_INODE, "текст.txt").unwrap().inode;
+        let handle = fuse.open_file(inode, OpenFlags(libc::O_RDWR)).unwrap();
+
+        assert_eq!(fuse.read_file(inode, handle, 0, 0).unwrap(), b"");
+        assert_eq!(fuse.write_file(inode, handle, 0, b"").unwrap(), 0);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(
+            DraftStore::open(&draft_root)
+                .unwrap()
+                .list()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            fuse.write_file(inode, handle + 1, 0, b""),
+            Err(Errno::EBADF)
+        );
+        assert_eq!(fuse.read_file(inode, handle + 1, 0, 0), Err(Errno::EBADF));
+
+        assert_eq!(fuse.read_file(inode, handle, 0, 1), Err(Errno::ENETDOWN));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
