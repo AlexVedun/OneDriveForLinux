@@ -3,6 +3,7 @@ use onedrive_sync::{
     QueuedOperation,
     upload::{CHUNK_SIZE, UploadError, UploadStep, UploadTransport},
 };
+use std::io;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 /// Upload an immutable local copy. The caller must check the live remote eTag
@@ -63,6 +64,7 @@ async fn upload_operation_snapshot<T: UploadTransport>(
     operation: QueuedOperation,
     expected_id: Option<&str>,
 ) -> Result<UploadStep, UploadError> {
+    ensure_snapshot_current(store, snapshot)?;
     if snapshot.size == 0 {
         store.clear_upload_checkpoint(&snapshot.identity)?;
         let result = transport.upload_empty(&operation).await?;
@@ -86,7 +88,7 @@ async fn upload_operation_snapshot<T: UploadTransport>(
             match transport.session_offset(&previous.upload_url).await {
                 Ok(offset) if offset < snapshot.size => {
                     previous.next_offset = offset;
-                    store.save_upload_checkpoint(&previous)?;
+                    save_current_checkpoint(store, &previous)?;
                     previous
                 }
                 Ok(_) => return Err(UploadError::InvalidResponse),
@@ -110,13 +112,14 @@ async fn upload_operation_snapshot<T: UploadTransport>(
         file.seek(std::io::SeekFrom::Start(offset)).await?;
         let mut bytes = vec![0; length];
         file.read_exact(&mut bytes).await?;
+        ensure_snapshot_current(store, snapshot)?;
         match transport
             .send_range(&checkpoint.upload_url, offset, snapshot.size, bytes)
             .await?
         {
             UploadStep::More(next) if next == offset + length as u64 && next < snapshot.size => {
                 checkpoint.next_offset = next;
-                store.save_upload_checkpoint(&checkpoint)?;
+                save_current_checkpoint(store, &checkpoint)?;
             }
             UploadStep::Complete { remote_id, etag }
                 if offset + length as u64 == snapshot.size
@@ -129,6 +132,33 @@ async fn upload_operation_snapshot<T: UploadTransport>(
             _ => return Err(UploadError::InvalidResponse),
         }
     }
+}
+
+fn ensure_snapshot_current(
+    store: &DraftStore,
+    snapshot: &DraftSnapshot,
+) -> Result<(), UploadError> {
+    if store.current_identity_matches(&snapshot.identity)? {
+        Ok(())
+    } else {
+        Err(UploadError::SourceChanged)
+    }
+}
+
+fn save_current_checkpoint(
+    store: &DraftStore,
+    checkpoint: &DraftUploadCheckpoint,
+) -> Result<(), UploadError> {
+    store.save_upload_checkpoint(checkpoint).map_err(|error| {
+        if matches!(
+            error.kind(),
+            io::ErrorKind::NotFound | io::ErrorKind::WouldBlock
+        ) {
+            UploadError::SourceChanged
+        } else {
+            UploadError::Io(error)
+        }
+    })
 }
 
 async fn create_checkpoint<T: UploadTransport>(
@@ -144,7 +174,7 @@ async fn create_checkpoint<T: UploadTransport>(
         upload_url: transport.create_session(operation, snapshot.size).await?,
         next_offset: 0,
     };
-    store.save_upload_checkpoint(&checkpoint)?;
+    save_current_checkpoint(store, &checkpoint)?;
     Ok(checkpoint)
 }
 
@@ -328,6 +358,106 @@ mod tests {
             matches!(result, UploadStep::Complete { remote_id, etag: Some(etag) }
             if remote_id == "remote-created" && etag == "v1")
         );
+    }
+
+    #[tokio::test]
+    async fn moved_new_file_is_not_uploaded_from_stale_snapshot() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = DraftStore::open(&temporary.path().join("drafts")).unwrap();
+        let identity = DraftIdentity {
+            drive_id: "drive".into(),
+            item_id: "local:one".into(),
+            base_etag: "local-new".into(),
+            new_file: Some(NewFileLocation {
+                parent_id: "parent".into(),
+                name: "new.txt".into(),
+            }),
+        };
+        store
+            .begin_empty(identity.clone())
+            .unwrap()
+            .write_at(0, b"abc")
+            .unwrap();
+        let snapshot = store.snapshot(&identity).unwrap().unwrap();
+        store
+            .relocate_new(
+                &identity.drive_id,
+                &identity.item_id,
+                NewFileLocation {
+                    parent_id: "other".into(),
+                    name: "moved.txt".into(),
+                },
+            )
+            .unwrap();
+
+        assert!(matches!(
+            upload_new_snapshot_to_parent(&NewTransport("parent"), &store, &snapshot, "parent")
+                .await,
+            Err(UploadError::SourceChanged)
+        ));
+    }
+
+    struct RelocatingTransport<'a>(&'a DraftStore);
+
+    impl UploadTransport for RelocatingTransport<'_> {
+        async fn create_session(&self, _: &QueuedOperation, _: u64) -> Result<String, UploadError> {
+            self.0.relocate_new(
+                "drive",
+                "local:one",
+                NewFileLocation {
+                    parent_id: "other".into(),
+                    name: "moved.txt".into(),
+                },
+            )?;
+            Ok("https://upload.example/session".into())
+        }
+
+        async fn session_offset(&self, _: &str) -> Result<u64, UploadError> {
+            panic!("there is no previous session")
+        }
+
+        async fn send_range(
+            &self,
+            _: &str,
+            _: u64,
+            _: u64,
+            _: Vec<u8>,
+        ) -> Result<UploadStep, UploadError> {
+            panic!("moved file must not be sent")
+        }
+    }
+
+    #[tokio::test]
+    async fn move_during_session_creation_prevents_final_upload() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = DraftStore::open(&temporary.path().join("drafts")).unwrap();
+        let identity = DraftIdentity {
+            drive_id: "drive".into(),
+            item_id: "local:one".into(),
+            base_etag: "local-new".into(),
+            new_file: Some(NewFileLocation {
+                parent_id: "parent".into(),
+                name: "new.txt".into(),
+            }),
+        };
+        store
+            .begin_empty(identity.clone())
+            .unwrap()
+            .write_at(0, b"abc")
+            .unwrap();
+        let snapshot = store.snapshot(&identity).unwrap().unwrap();
+
+        assert!(matches!(
+            upload_new_snapshot_to_parent(
+                &RelocatingTransport(&store),
+                &store,
+                &snapshot,
+                "parent"
+            )
+            .await,
+            Err(UploadError::SourceChanged)
+        ));
+        assert!(store.upload_checkpoint(&identity).unwrap().is_none());
     }
 
     #[tokio::test]
