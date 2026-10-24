@@ -1,6 +1,41 @@
 use onedrive_catalog::CatalogItem;
 use onedrive_mount::draft::{DraftIdentity, DraftUploadCheckpoint, DraftUploadIssue};
 use serde::Serialize;
+use std::{
+    collections::HashMap,
+    time::{Duration, Instant},
+};
+
+const RETRY_DELAY: Duration = Duration::from_secs(300);
+
+#[derive(Default)]
+pub struct RetrySchedule {
+    next_attempt: HashMap<(String, String), Instant>,
+}
+
+impl RetrySchedule {
+    pub fn allows(&self, draft: &VirtualDraftStatus, now: Instant) -> bool {
+        self.next_attempt
+            .get(&(draft.drive_id.clone(), draft.item_id.clone()))
+            .is_none_or(|deadline| now >= *deadline)
+    }
+
+    pub fn defer(&mut self, draft: &DraftIdentity, now: Instant) {
+        self.next_attempt.insert(
+            (draft.drive_id.clone(), draft.item_id.clone()),
+            now + RETRY_DELAY,
+        );
+    }
+
+    pub fn forget(&mut self, draft: &DraftIdentity) {
+        self.next_attempt
+            .remove(&(draft.drive_id.clone(), draft.item_id.clone()));
+    }
+
+    pub fn prune(&mut self, now: Instant) {
+        self.next_attempt.retain(|_, deadline| now < *deadline);
+    }
+}
 
 #[derive(Clone, Serialize)]
 pub struct VirtualDraftStatus {
@@ -249,6 +284,39 @@ mod tests {
                 .map(|(draft, action)| (draft.item_id.as_str(), action)),
             Some(("changed", AutoDraftAction::Reconcile))
         );
+    }
+
+    #[test]
+    fn failed_draft_waits_without_blocking_other_uploads() {
+        let now = Instant::now();
+        let failed = draft();
+        let mut other = failed.clone();
+        other.item_id = "other".into();
+        let mut other_item = item();
+        other_item.item_id = other.item_id.clone();
+        let statuses = [
+            classify(&failed, Some("drive"), true, Some(&item())),
+            classify(&other, Some("drive"), true, Some(&other_item)),
+        ];
+        let mut schedule = RetrySchedule::default();
+        schedule.defer(&failed, now);
+        let available: Vec<_> = statuses
+            .iter()
+            .filter(|status| schedule.allows(status, now + Duration::from_secs(30)))
+            .cloned()
+            .collect();
+        assert_eq!(
+            next_auto_candidate(&available, None).map(|(draft, _)| draft.item_id.as_str()),
+            Some("other")
+        );
+        assert!(!schedule.allows(&statuses[0], now + Duration::from_secs(299)));
+        assert!(schedule.allows(&statuses[0], now + RETRY_DELAY));
+        schedule.prune(now + RETRY_DELAY);
+        assert!(schedule.next_attempt.is_empty());
+
+        schedule.defer(&failed, now);
+        schedule.forget(&failed);
+        assert!(schedule.allows(&statuses[0], now));
     }
 
     #[test]

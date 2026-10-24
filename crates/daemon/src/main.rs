@@ -41,6 +41,7 @@ use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
+use std::time::Instant;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
@@ -575,6 +576,8 @@ impl Daemon {
     fn virtual_auto_upload_candidate(
         &self,
         after: Option<&str>,
+        retry_schedule: &virtual_drafts::RetrySchedule,
+        now: Instant,
     ) -> Option<(DraftIdentity, virtual_drafts::AutoDraftAction)> {
         if !matches!(
             *self.state.lock().unwrap(),
@@ -592,6 +595,9 @@ impl Daemon {
         let root = state_directory().ok()?.join("virtual-drafts");
         let store = DraftStore::open(&root).ok()?;
         statuses.retain(|draft| {
+            if !retry_schedule.allows(draft, now) {
+                return false;
+            }
             if !matches!(draft.status, "remote-changed" | "uncertain-empty-existing")
                 || draft.last_upload_issue != Some(DraftUploadIssue::TransferFailed)
             {
@@ -3795,10 +3801,13 @@ async fn poll_virtual_drafts(daemon: Daemon) {
     let mut interval = tokio::time::interval(Duration::from_secs(30));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut last_attempted = None;
+    let mut retry_schedule = virtual_drafts::RetrySchedule::default();
     loop {
         interval.tick().await;
+        let now = Instant::now();
+        retry_schedule.prune(now);
         let Some((identity, action)) =
-            daemon.virtual_auto_upload_candidate(last_attempted.as_deref())
+            daemon.virtual_auto_upload_candidate(last_attempted.as_deref(), &retry_schedule, now)
         else {
             continue;
         };
@@ -3838,6 +3847,11 @@ async fn poll_virtual_drafts(daemon: Daemon) {
             }
         };
         if let Some((issue, http_status, retry)) = failure {
+            if retry {
+                retry_schedule.defer(&identity, Instant::now());
+            } else {
+                retry_schedule.forget(&identity);
+            }
             let result = tokio::task::spawn_blocking(move || {
                 record_virtual_upload_failure(&identity, issue, http_status)
             })
@@ -3847,8 +3861,9 @@ async fn poll_virtual_drafts(daemon: Daemon) {
             }
             if retry {
                 eprintln!("automatic virtual draft upload failed; local draft retained");
-                tokio::time::sleep(Duration::from_secs(300)).await;
             }
+        } else {
+            retry_schedule.forget(&identity);
         }
     }
 }
