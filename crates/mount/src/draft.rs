@@ -93,6 +93,7 @@ pub struct DraftUploadCheckpoint {
     pub sha256: String,
     pub size: u64,
     pub upload_url: String,
+    /// Equal to size only when the final result is uncertain and the session is gone.
     pub next_offset: u64,
     /// The final range or an empty upload may have committed remotely even if its reply was lost.
     #[serde(default)]
@@ -137,7 +138,8 @@ impl DraftUploadCheckpoint {
         let valid_transfer = if self.size == 0 {
             self.final_chunk_attempted && self.next_offset == 0 && self.upload_url.is_empty()
         } else {
-            self.next_offset < self.size
+            (self.next_offset < self.size
+                || (self.next_offset == self.size && self.final_chunk_attempted))
                 && self.upload_url.starts_with("https://")
                 && self.upload_url.len() <= 16 * 1024
         };
@@ -1444,6 +1446,47 @@ mod tests {
         );
         reopened.clear_upload_checkpoint(&identity()).unwrap();
         assert!(reopened.upload_checkpoint(&identity()).unwrap().is_none());
+    }
+
+    #[test]
+    fn unavailable_final_session_checkpoint_survives_restart() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("drafts");
+        let store = DraftStore::open(&root).unwrap();
+        store.begin_empty(identity()).unwrap();
+        let mut checkpoint = DraftUploadCheckpoint {
+            identity: identity(),
+            sha256: "a".repeat(64),
+            size: 3,
+            upload_url: "https://upload.example/secret".into(),
+            next_offset: 3,
+            final_chunk_attempted: true,
+        };
+        store.save_upload_checkpoint(&checkpoint).unwrap();
+        drop(store);
+
+        let reopened = DraftStore::open(&root).unwrap();
+        assert_eq!(
+            reopened.upload_checkpoint(&identity()).unwrap(),
+            Some(checkpoint.clone())
+        );
+        checkpoint.final_chunk_attempted = false;
+        assert_eq!(
+            reopened
+                .save_upload_checkpoint(&checkpoint)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        checkpoint.final_chunk_attempted = true;
+        checkpoint.next_offset = 4;
+        assert_eq!(
+            reopened
+                .save_upload_checkpoint(&checkpoint)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
     }
 
     #[test]
