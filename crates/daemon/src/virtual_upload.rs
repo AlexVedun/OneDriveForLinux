@@ -121,12 +121,14 @@ async fn upload_operation_snapshot<T: UploadTransport>(
                     return Err(UploadError::Uncertain);
                 }
                 Ok(_) => return Err(UploadError::InvalidResponse),
+                Err(UploadError::Expired | UploadError::InvalidResponse)
+                    if previous.final_chunk_attempted =>
+                {
+                    previous.next_offset = previous.size;
+                    save_current_checkpoint(store, &previous)?;
+                    return Err(UploadError::Uncertain);
+                }
                 Err(UploadError::Expired) => {
-                    if previous.final_chunk_attempted {
-                        previous.next_offset = previous.size;
-                        save_current_checkpoint(store, &previous)?;
-                        return Err(UploadError::Uncertain);
-                    }
                     store.clear_upload_checkpoint(&snapshot.identity)?;
                     create_checkpoint(transport, store, &operation, snapshot).await?
                 }
@@ -699,6 +701,7 @@ mod tests {
         sessions: AtomicUsize,
         offset_checks: AtomicUsize,
         ranges: AtomicUsize,
+        invalid_offset: bool,
     }
 
     impl UploadTransport for LostFinalTransport {
@@ -709,7 +712,11 @@ mod tests {
 
         async fn session_offset(&self, _: &str) -> Result<u64, UploadError> {
             self.offset_checks.fetch_add(1, Ordering::SeqCst);
-            Err(UploadError::Expired)
+            Err(if self.invalid_offset {
+                UploadError::InvalidResponse
+            } else {
+                UploadError::Expired
+            })
         }
 
         async fn send_range(
@@ -724,8 +731,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn lost_final_reply_does_not_create_a_second_new_file_session() {
+    async fn assert_lost_final_reply_keeps_draft(invalid_offset: bool) {
         let temporary = tempfile::tempdir().unwrap();
         let root = temporary.path().join("drafts");
         let store = DraftStore::open(&root).unwrap();
@@ -745,6 +751,7 @@ mod tests {
             sessions: AtomicUsize::new(0),
             offset_checks: AtomicUsize::new(0),
             ranges: AtomicUsize::new(0),
+            invalid_offset,
         };
         assert!(matches!(
             upload_new_snapshot_to_parent(&transport, &store, &snapshot, "root").await,
@@ -783,6 +790,59 @@ mod tests {
         assert_eq!(transport.offset_checks.load(Ordering::SeqCst), 1);
         assert_eq!(transport.ranges.load(Ordering::SeqCst), 1);
         assert!(restarted.recover(&identity).unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn lost_final_reply_does_not_create_a_second_new_file_session() {
+        assert_lost_final_reply_keeps_draft(false).await;
+    }
+
+    #[tokio::test]
+    async fn invalid_final_session_status_does_not_repeat_new_file_upload() {
+        assert_lost_final_reply_keeps_draft(true).await;
+    }
+
+    #[tokio::test]
+    async fn invalid_session_status_before_final_range_preserves_resumable_checkpoint() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = DraftStore::open(&temporary.path().join("drafts")).unwrap();
+        let identity = DraftIdentity {
+            drive_id: "drive".into(),
+            item_id: "item".into(),
+            base_etag: "old".into(),
+            new_file: None,
+        };
+        store
+            .begin_empty(identity.clone())
+            .unwrap()
+            .write_at(0, b"abc")
+            .unwrap();
+        let snapshot = store.snapshot(&identity).unwrap().unwrap();
+        let checkpoint = DraftUploadCheckpoint {
+            identity: identity.clone(),
+            sha256: snapshot.sha256.clone(),
+            size: snapshot.size,
+            upload_url: "https://upload.example/session".into(),
+            next_offset: 0,
+            final_chunk_attempted: false,
+        };
+        store.save_upload_checkpoint(&checkpoint).unwrap();
+        let transport = LostFinalTransport {
+            sessions: AtomicUsize::new(0),
+            offset_checks: AtomicUsize::new(0),
+            ranges: AtomicUsize::new(0),
+            invalid_offset: true,
+        };
+        assert!(matches!(
+            upload_snapshot(&transport, &store, &snapshot).await,
+            Err(UploadError::InvalidResponse)
+        ));
+        assert_eq!(
+            store.upload_checkpoint(&identity).unwrap(),
+            Some(checkpoint)
+        );
+        assert_eq!(transport.sessions.load(Ordering::SeqCst), 0);
+        assert_eq!(transport.ranges.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
