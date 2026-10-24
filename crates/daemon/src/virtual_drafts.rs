@@ -43,45 +43,26 @@ pub fn next_auto_candidate<'a>(
     statuses: &'a [VirtualDraftStatus],
     after: Option<&str>,
 ) -> Option<(&'a VirtualDraftStatus, AutoDraftAction)> {
-    let ready = next_ready_item_id(statuses, after);
-    if let Some(item_id) = ready {
-        return statuses
-            .iter()
-            .find(|draft| draft.item_id == item_id)
-            .map(|draft| (draft, AutoDraftAction::Upload));
-    }
     statuses
         .iter()
-        .find(|draft| {
-            draft.item_id.as_str() > after.unwrap_or("")
-                && matches!(draft.status, "remote-changed" | "uncertain-empty-existing")
-                && draft.last_upload_issue == Some(DraftUploadIssue::TransferFailed)
+        .filter_map(|draft| {
+            let action = match draft.status {
+                "ready" | "ready-new" => AutoDraftAction::Upload,
+                "remote-changed" | "uncertain-empty-existing"
+                    if draft.last_upload_issue == Some(DraftUploadIssue::TransferFailed) =>
+                {
+                    AutoDraftAction::Reconcile
+                }
+                _ => return None,
+            };
+            Some((draft, action))
         })
-        .or_else(|| {
-            statuses.iter().find(|draft| {
-                matches!(draft.status, "remote-changed" | "uncertain-empty-existing")
-                    && draft.last_upload_issue == Some(DraftUploadIssue::TransferFailed)
-            })
+        .min_by_key(|(draft, _)| {
+            (
+                after.is_some_and(|id| draft.item_id.as_str() <= id),
+                draft.item_id.as_str(),
+            )
         })
-        .map(|draft| (draft, AutoDraftAction::Reconcile))
-}
-
-pub fn next_ready_item_id<'a>(
-    statuses: &'a [VirtualDraftStatus],
-    after: Option<&str>,
-) -> Option<&'a str> {
-    statuses
-        .iter()
-        .find(|draft| {
-            matches!(draft.status, "ready" | "ready-new")
-                && after.is_some_and(|id| draft.item_id.as_str() > id)
-        })
-        .or_else(|| {
-            statuses
-                .iter()
-                .find(|draft| matches!(draft.status, "ready" | "ready-new"))
-        })
-        .map(|draft| draft.item_id.as_str())
 }
 
 pub fn classify(
@@ -199,8 +180,12 @@ mod tests {
             classify(&draft, Some("drive"), true, Some(&changed)),
             classify(&draft, Some("drive"), true, Some(&item())),
         ];
-        assert_eq!(next_ready_item_id(&statuses, None), Some("item"));
-        assert_eq!(next_ready_item_id(&statuses[..1], None), None);
+        assert_eq!(
+            next_auto_candidate(&statuses, None)
+                .map(|(draft, action)| (draft.item_id.as_str(), action)),
+            Some(("item", AutoDraftAction::Upload))
+        );
+        assert!(next_auto_candidate(&statuses[..1], None).is_none());
         let mut other = item();
         other.item_id = "second".into();
         let statuses = [
@@ -215,11 +200,20 @@ mod tests {
                 Some(&other),
             ),
         ];
-        assert_eq!(next_ready_item_id(&statuses, Some("item")), Some("second"));
-        assert_eq!(next_ready_item_id(&statuses, Some("second")), Some("item"));
+        assert_eq!(
+            next_auto_candidate(&statuses, Some("item")).map(|(draft, _)| draft.item_id.as_str()),
+            Some("second")
+        );
+        assert_eq!(
+            next_auto_candidate(&statuses, Some("second")).map(|(draft, _)| draft.item_id.as_str()),
+            Some("item")
+        );
         let mut new = statuses[1].clone();
         new.status = "ready-new";
-        assert_eq!(next_ready_item_id(&[new], None), Some("second"));
+        assert_eq!(
+            next_auto_candidate(&[new], None).map(|(_, action)| action),
+            Some(AutoDraftAction::Upload)
+        );
     }
 
     #[test]
@@ -236,9 +230,21 @@ mod tests {
             next_auto_candidate(&[changed.clone()], None).map(|(_, action)| action),
             Some(AutoDraftAction::Reconcile)
         );
+        let statuses = [base, changed];
         assert_eq!(
-            next_auto_candidate(&[changed, base], None).map(|(_, action)| action),
-            Some(AutoDraftAction::Upload)
+            next_auto_candidate(&statuses, None)
+                .map(|(draft, action)| (draft.item_id.as_str(), action)),
+            Some(("changed", AutoDraftAction::Reconcile))
+        );
+        assert_eq!(
+            next_auto_candidate(&statuses, Some("changed"))
+                .map(|(draft, action)| (draft.item_id.as_str(), action)),
+            Some(("item", AutoDraftAction::Upload))
+        );
+        assert_eq!(
+            next_auto_candidate(&statuses, Some("item"))
+                .map(|(draft, action)| (draft.item_id.as_str(), action)),
+            Some(("changed", AutoDraftAction::Reconcile))
         );
     }
 
