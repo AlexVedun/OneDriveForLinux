@@ -401,6 +401,15 @@ impl DraftStore {
         Ok(())
     }
 
+    /// Check the exact draft version before a network upload request.
+    pub fn current_identity_matches(&self, identity: &DraftIdentity) -> io::Result<bool> {
+        identity.validate()?;
+        let _lock = lock_store(&self.root)?;
+        Ok(self
+            .recover(identity)?
+            .is_some_and(|draft| draft.identity() == identity))
+    }
+
     pub fn clear_upload_checkpoint(&self, identity: &DraftIdentity) -> io::Result<()> {
         identity.validate()?;
         let _lock = lock_store(&self.root)?;
