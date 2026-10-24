@@ -563,6 +563,14 @@ impl Daemon {
                     .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
                 status.last_upload_issue = failure.as_ref().map(|failure| failure.issue);
                 status.last_upload_http_status = failure.and_then(|failure| failure.http_status);
+                let checkpoint = store
+                    .upload_checkpoint(draft)
+                    .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
+                virtual_drafts::mark_uncertain_existing_upload(
+                    &mut status,
+                    draft,
+                    checkpoint.as_ref(),
+                );
                 Ok(status)
             })
             .collect::<zbus::fdo::Result<Vec<_>>>()
@@ -1213,6 +1221,11 @@ impl Daemon {
             .await
             .map_err(|_| zbus::fdo::Error::Failed("cannot compare cloud contents".into()))?
         else {
+            DraftStore::open(&root)
+                .and_then(|store| store.clear_upload_checkpoint(&snapshot.identity))
+                .map_err(|_| {
+                    zbus::fdo::Error::Failed("cannot clear uncertain upload state".into())
+                })?;
             transfer_state.finish();
             return Ok("different".into());
         };
