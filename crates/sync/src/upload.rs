@@ -17,6 +17,8 @@ pub enum UploadError {
     Io(io::Error),
     Store(SyncError),
     SourceChanged,
+    /// The final request may have committed, but its result cannot be confirmed.
+    Uncertain,
     InvalidResponse,
     Transient,
     Conflict,

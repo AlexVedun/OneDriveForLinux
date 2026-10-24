@@ -88,17 +88,25 @@ async fn upload_operation_snapshot<T: UploadTransport>(
             match transport.session_offset(&previous.upload_url).await {
                 Ok(offset) if offset < snapshot.size => {
                     previous.next_offset = offset;
+                    previous.final_chunk_attempted = false;
                     save_current_checkpoint(store, &previous)?;
                     previous
                 }
+                Ok(_) if previous.final_chunk_attempted => return Err(UploadError::Uncertain),
                 Ok(_) => return Err(UploadError::InvalidResponse),
                 Err(UploadError::Expired) => {
+                    if previous.final_chunk_attempted {
+                        return Err(UploadError::Uncertain);
+                    }
                     store.clear_upload_checkpoint(&snapshot.identity)?;
                     create_checkpoint(transport, store, &operation, snapshot).await?
                 }
                 Err(error) => return Err(error),
             }
         } else {
+            if previous.final_chunk_attempted {
+                return Err(UploadError::Uncertain);
+            }
             store.clear_upload_checkpoint(&snapshot.identity)?;
             create_checkpoint(transport, store, &operation, snapshot).await?
         }
@@ -113,6 +121,10 @@ async fn upload_operation_snapshot<T: UploadTransport>(
         let mut bytes = vec![0; length];
         file.read_exact(&mut bytes).await?;
         ensure_snapshot_current(store, snapshot)?;
+        if offset + length as u64 == snapshot.size {
+            checkpoint.final_chunk_attempted = true;
+            save_current_checkpoint(store, &checkpoint)?;
+        }
         match transport
             .send_range(&checkpoint.upload_url, offset, snapshot.size, bytes)
             .await?
@@ -173,6 +185,7 @@ async fn create_checkpoint<T: UploadTransport>(
         size: snapshot.size,
         upload_url: transport.create_session(operation, snapshot.size).await?,
         next_offset: 0,
+        final_chunk_attempted: false,
     };
     save_current_checkpoint(store, &checkpoint)?;
     Ok(checkpoint)
@@ -563,6 +576,13 @@ mod tests {
                 .next_offset,
             CHUNK_SIZE
         );
+        assert!(
+            store
+                .upload_checkpoint(&identity)
+                .unwrap()
+                .unwrap()
+                .final_chunk_attempted
+        );
         drop(store);
 
         let reopened = DraftStore::open(&root).unwrap();
@@ -572,6 +592,83 @@ mod tests {
         ));
         assert_eq!(transport.sessions.load(Ordering::SeqCst), 1);
         assert_eq!(transport.sent.lock().unwrap().len() as u64, CHUNK_SIZE + 1);
+    }
+
+    struct LostFinalTransport {
+        sessions: AtomicUsize,
+        ranges: AtomicUsize,
+    }
+
+    impl UploadTransport for LostFinalTransport {
+        async fn create_session(&self, _: &QueuedOperation, _: u64) -> Result<String, UploadError> {
+            self.sessions.fetch_add(1, Ordering::SeqCst);
+            Ok("https://upload.example/uncertain".into())
+        }
+
+        async fn session_offset(&self, _: &str) -> Result<u64, UploadError> {
+            Err(UploadError::Expired)
+        }
+
+        async fn send_range(
+            &self,
+            _: &str,
+            _: u64,
+            _: u64,
+            _: Vec<u8>,
+        ) -> Result<UploadStep, UploadError> {
+            self.ranges.fetch_add(1, Ordering::SeqCst);
+            Err(UploadError::Transient)
+        }
+    }
+
+    #[tokio::test]
+    async fn lost_final_reply_does_not_create_a_second_new_file_session() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("drafts");
+        let store = DraftStore::open(&root).unwrap();
+        let identity = DraftIdentity {
+            drive_id: "drive".into(),
+            item_id: "local:new".into(),
+            base_etag: "local-new".into(),
+            new_file: Some(NewFileLocation {
+                parent_id: "root".into(),
+                name: "new.txt".into(),
+            }),
+        };
+        let draft = store.begin_empty(identity.clone()).unwrap();
+        draft.write_at(0, b"first").unwrap();
+        let snapshot = store.snapshot(&identity).unwrap().unwrap();
+        let transport = LostFinalTransport {
+            sessions: AtomicUsize::new(0),
+            ranges: AtomicUsize::new(0),
+        };
+        assert!(matches!(
+            upload_new_snapshot_to_parent(&transport, &store, &snapshot, "root").await,
+            Err(UploadError::Transient)
+        ));
+        assert!(
+            store
+                .upload_checkpoint(&identity)
+                .unwrap()
+                .unwrap()
+                .final_chunk_attempted
+        );
+        drop(store);
+
+        let reopened = DraftStore::open(&root).unwrap();
+        assert!(matches!(
+            upload_new_snapshot_to_parent(&transport, &reopened, &snapshot, "root").await,
+            Err(UploadError::Uncertain)
+        ));
+        draft.write_at(0, b"later").unwrap();
+        let changed = reopened.snapshot(&identity).unwrap().unwrap();
+        assert!(matches!(
+            upload_new_snapshot_to_parent(&transport, &reopened, &changed, "root").await,
+            Err(UploadError::Uncertain)
+        ));
+        assert_eq!(transport.sessions.load(Ordering::SeqCst), 1);
+        assert_eq!(transport.ranges.load(Ordering::SeqCst), 1);
+        assert!(reopened.recover(&identity).unwrap().is_some());
     }
 
     #[tokio::test]
@@ -594,6 +691,7 @@ mod tests {
                 size: snapshot.size,
                 upload_url: "https://upload.example/old".into(),
                 next_offset: CHUNK_SIZE,
+                final_chunk_attempted: false,
             })
             .unwrap();
         let transport = FakeTransport {
@@ -669,6 +767,7 @@ mod tests {
                 size: 1,
                 upload_url: "https://upload.example/old".into(),
                 next_offset: 0,
+                final_chunk_attempted: false,
             })
             .unwrap();
         assert!(matches!(

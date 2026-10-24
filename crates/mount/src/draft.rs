@@ -94,6 +94,9 @@ pub struct DraftUploadCheckpoint {
     pub size: u64,
     pub upload_url: String,
     pub next_offset: u64,
+    /// The last range may have committed remotely even if its reply was lost.
+    #[serde(default)]
+    pub final_chunk_attempted: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -123,6 +126,7 @@ impl std::fmt::Debug for DraftUploadCheckpoint {
             .field("size", &self.size)
             .field("upload_url", &"[redacted]")
             .field("next_offset", &self.next_offset)
+            .field("final_chunk_attempted", &self.final_chunk_attempted)
             .finish()
     }
 }
@@ -1364,6 +1368,7 @@ mod tests {
                 size: 8,
                 upload_url: "https://upload.example/secret".into(),
                 next_offset: 0,
+                final_chunk_attempted: false,
             })
             .unwrap();
         fs::rename(&metadata, &marker).unwrap();
@@ -1410,7 +1415,15 @@ mod tests {
             size: 100,
             upload_url: "https://upload.example/secret".into(),
             next_offset: 50,
+            final_chunk_attempted: false,
         };
+        let mut legacy = serde_json::to_value(&checkpoint).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("final_chunk_attempted");
+        let decoded: DraftUploadCheckpoint = serde_json::from_value(legacy).unwrap();
+        assert!(!decoded.final_chunk_attempted);
         store.save_upload_checkpoint(&checkpoint).unwrap();
         assert!(!format!("{checkpoint:?}").contains("secret"));
         let path = store.checkpoint_path(&identity());
@@ -1460,6 +1473,7 @@ mod tests {
             size: 100,
             upload_url: "https://upload.example/old".into(),
             next_offset: 50,
+            final_chunk_attempted: false,
         };
         let failure = DraftUploadFailure {
             identity: original.clone(),
@@ -1576,6 +1590,7 @@ mod tests {
             size: 100,
             upload_url: "https://upload.example/old-session".into(),
             next_offset: 50,
+            final_chunk_attempted: false,
         };
         store.save_upload_checkpoint(&old_checkpoint).unwrap();
         let checkpoint_path = store.checkpoint_path(&original);

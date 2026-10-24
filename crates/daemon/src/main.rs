@@ -4206,6 +4206,9 @@ fn virtual_upload_error_text(error: &UploadError) -> String {
         UploadError::Transient => "network or server temporarily unavailable".to_owned(),
         UploadError::InvalidResponse => "unexpected OneDrive response".to_owned(),
         UploadError::SourceChanged => "local source changed".to_owned(),
+        UploadError::Uncertain => {
+            "final upload result is uncertain; check OneDrive before retrying".to_owned()
+        }
         UploadError::Io(_) | UploadError::Store(_) => "local draft or checkpoint error".to_owned(),
     };
     format!("upload failed: {reason}; local draft retained")
