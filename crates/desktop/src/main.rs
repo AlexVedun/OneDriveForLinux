@@ -528,6 +528,12 @@ fn virtual_draft_status_label(status: &str) -> &'static str {
         "remote-missing" => "файл отсутствует в каталоге",
         "remote-not-file" => "объект больше не является файлом",
         "remote-changed" => "версия в каталоге изменилась",
+        "uncertain-empty-existing" => {
+            "результат отправки пустого файла неизвестен; требуется проверка в OneDrive"
+        }
+        "uncertain-empty-new" => {
+            "результат создания пустого файла неизвестен; проверьте OneDrive вручную"
+        }
         _ => "неизвестное состояние",
     }
 }
@@ -1604,7 +1610,11 @@ fn present_virtual_drafts_dialog(
                 },
             );
         });
-        if draft.status == "remote-changed" && upload_enabled {
+        if matches!(
+            draft.status.as_str(),
+            "remote-changed" | "uncertain-empty-existing"
+        ) && upload_enabled
+        {
             let compare = gtk::Button::with_label("Проверить содержимое в OneDrive");
             row.append(&compare);
             let item_id = draft.item_id.clone();
