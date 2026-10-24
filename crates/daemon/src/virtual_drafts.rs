@@ -1,5 +1,5 @@
 use onedrive_catalog::CatalogItem;
-use onedrive_mount::draft::{DraftIdentity, DraftUploadIssue};
+use onedrive_mount::draft::{DraftIdentity, DraftUploadCheckpoint, DraftUploadIssue};
 use serde::Serialize;
 
 #[derive(Clone, Serialize)]
@@ -16,6 +16,20 @@ pub struct VirtualDraftStatus {
 pub enum AutoDraftAction {
     Upload,
     Reconcile,
+}
+
+/// A lost final reply can survive a daemon crash without a failure record.
+pub fn mark_uncertain_existing_upload(
+    status: &mut VirtualDraftStatus,
+    draft: &DraftIdentity,
+    checkpoint: Option<&DraftUploadCheckpoint>,
+) {
+    if draft.new_file.is_none()
+        && status.status == "remote-changed"
+        && checkpoint.is_some_and(|checkpoint| checkpoint.final_chunk_attempted)
+    {
+        status.last_upload_issue = Some(DraftUploadIssue::TransferFailed);
+    }
 }
 
 pub fn next_auto_candidate<'a>(
@@ -219,5 +233,46 @@ mod tests {
             next_auto_candidate(&[changed, base], None).map(|(_, action)| action),
             Some(AutoDraftAction::Upload)
         );
+    }
+
+    #[test]
+    fn final_chunk_marker_recovers_missing_failure_record() {
+        let draft = draft();
+        let mut remote = item();
+        remote.etag = Some("new".into());
+        let mut status = classify(&draft, Some("drive"), true, Some(&remote));
+        let checkpoint = DraftUploadCheckpoint {
+            identity: draft.clone(),
+            sha256: "a".repeat(64),
+            size: 4,
+            upload_url: "https://upload.example/session".into(),
+            next_offset: 0,
+            final_chunk_attempted: true,
+        };
+        mark_uncertain_existing_upload(&mut status, &draft, Some(&checkpoint));
+        assert_eq!(
+            status.last_upload_issue,
+            Some(DraftUploadIssue::TransferFailed)
+        );
+        assert_eq!(
+            next_auto_candidate(&[status.clone()], None).map(|(_, action)| action),
+            Some(AutoDraftAction::Reconcile)
+        );
+
+        status.last_upload_issue = None;
+        let mut unfinished = checkpoint.clone();
+        unfinished.final_chunk_attempted = false;
+        mark_uncertain_existing_upload(&mut status, &draft, Some(&unfinished));
+        assert!(status.last_upload_issue.is_none());
+
+        let mut local_new = draft;
+        local_new.item_id = "local:new".into();
+        local_new.base_etag = "local-new".into();
+        local_new.new_file = Some(onedrive_mount::draft::NewFileLocation {
+            parent_id: "root".into(),
+            name: "new.txt".into(),
+        });
+        mark_uncertain_existing_upload(&mut status, &local_new, Some(&checkpoint));
+        assert!(status.last_upload_issue.is_none());
     }
 }
