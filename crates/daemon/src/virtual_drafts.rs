@@ -98,7 +98,11 @@ pub fn next_auto_candidate<'a>(
         .iter()
         .filter_map(|draft| {
             let action = match draft.status {
-                "ready" | "ready-new" => AutoDraftAction::Upload,
+                "ready" | "ready-new"
+                    if draft.last_upload_issue != Some(DraftUploadIssue::RemoteChanged) =>
+                {
+                    AutoDraftAction::Upload
+                }
                 "remote-changed" | "uncertain-empty-existing" | "uncertain-existing"
                     if draft.last_upload_issue == Some(DraftUploadIssue::TransferFailed) =>
                 {
@@ -265,6 +269,24 @@ mod tests {
             next_auto_candidate(&[new], None).map(|(_, action)| action),
             Some(AutoDraftAction::Upload)
         );
+    }
+
+    #[test]
+    fn graph_conflict_waits_for_review_even_while_catalog_still_says_ready() {
+        let mut conflicted = classify(&draft(), Some("drive"), true, Some(&item()));
+        conflicted.last_upload_issue = Some(DraftUploadIssue::RemoteChanged);
+        let mut other = conflicted.clone();
+        other.item_id = "other".into();
+        other.last_upload_issue = None;
+
+        assert_eq!(
+            next_auto_candidate(&[conflicted.clone(), other], None)
+                .map(|(draft, _)| draft.item_id.as_str()),
+            Some("other")
+        );
+        assert!(next_auto_candidate(&[conflicted.clone()], None).is_none());
+        conflicted.status = "ready-new";
+        assert!(next_auto_candidate(&[conflicted], None).is_none());
     }
 
     #[test]

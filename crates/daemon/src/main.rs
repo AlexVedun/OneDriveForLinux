@@ -4240,7 +4240,9 @@ fn virtual_upload_issue(error: &zbus::fdo::Error) -> DraftUploadIssue {
     let message = error.to_string();
     if message.contains("login is required") {
         DraftUploadIssue::LoginRequired
-    } else if message.contains("remote file changed") {
+    } else if message.contains("remote file changed")
+        || message.contains("OneDrive reported a conflict")
+    {
         DraftUploadIssue::RemoteChanged
     } else if message.contains("upload failed") {
         DraftUploadIssue::TransferFailed
@@ -4584,6 +4586,12 @@ mod tests {
         );
         assert_eq!(
             virtual_upload_issue(&zbus::fdo::Error::Failed("remote file changed".into())),
+            DraftUploadIssue::RemoteChanged
+        );
+        assert_eq!(
+            virtual_upload_issue(&zbus::fdo::Error::Failed(virtual_upload_error_text(
+                &UploadError::Conflict
+            ))),
             DraftUploadIssue::RemoteChanged
         );
         assert_eq!(
