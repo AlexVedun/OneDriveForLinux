@@ -75,6 +75,21 @@ pub fn snapshot_matches_attempt(
     })
 }
 
+/// Only a unique catalog entry at the original location is safe to inspect.
+pub fn unique_new_candidate<'a>(
+    items: &'a [CatalogItem],
+    parent_id: &str,
+    name: &str,
+) -> Option<&'a CatalogItem> {
+    let mut matches = items.iter().filter(|item| {
+        !item.deleted
+            && item.parent_id.as_deref() == Some(parent_id)
+            && item.name.as_deref() == Some(name)
+    });
+    let candidate = matches.next()?;
+    (matches.next().is_none() && candidate.kind == "file").then_some(candidate)
+}
+
 /// A lost final reply can survive a daemon crash without a failure record.
 pub fn mark_uncertain_upload(
     status: &mut VirtualDraftStatus,
@@ -90,21 +105,27 @@ pub fn mark_uncertain_upload(
         }
     } else if draft.new_file.is_some() && status.status == "name-conflict" {
         status.status = "uncertain-new";
-        status.last_upload_issue = Some(DraftUploadIssue::TransferFailed);
+        if status.last_upload_issue != Some(DraftUploadIssue::RemoteChanged) {
+            status.last_upload_issue = Some(DraftUploadIssue::TransferFailed);
+        }
     } else if checkpoint.size == 0 {
         match (draft.new_file.is_some(), status.status) {
             (false, "ready") => status.status = "uncertain-empty-existing",
             (true, "ready-new") => status.status = "uncertain-empty-new",
             _ => return,
         }
-        status.last_upload_issue = Some(DraftUploadIssue::TransferFailed);
+        if status.last_upload_issue != Some(DraftUploadIssue::RemoteChanged) {
+            status.last_upload_issue = Some(DraftUploadIssue::TransferFailed);
+        }
     } else if checkpoint.next_offset == checkpoint.size {
         match (draft.new_file.is_some(), status.status) {
             (false, "ready") => status.status = "uncertain-existing",
             (true, "ready-new") => status.status = "uncertain-new",
             _ => return,
         }
-        status.last_upload_issue = Some(DraftUploadIssue::TransferFailed);
+        if status.last_upload_issue != Some(DraftUploadIssue::RemoteChanged) {
+            status.last_upload_issue = Some(DraftUploadIssue::TransferFailed);
+        }
     }
 }
 
@@ -121,7 +142,11 @@ pub fn next_auto_candidate<'a>(
                 {
                     AutoDraftAction::Upload
                 }
-                "remote-changed" | "uncertain-empty-existing" | "uncertain-existing"
+                "remote-changed"
+                | "uncertain-empty-existing"
+                | "uncertain-existing"
+                | "uncertain-empty-new"
+                | "uncertain-new"
                     if draft.last_upload_issue == Some(DraftUploadIssue::TransferFailed) =>
                 {
                     AutoDraftAction::Reconcile
@@ -245,6 +270,22 @@ mod tests {
             Some(DraftUploadIssue::RemoteChanged)
         );
         assert!(next_auto_candidate(&[status], None).is_none());
+    }
+
+    #[test]
+    fn new_file_candidate_requires_a_unique_exact_file() {
+        let mut candidate = item();
+        candidate.parent_id = Some("parent".into());
+        assert!(unique_new_candidate(&[candidate.clone()], "parent", "note.txt").is_some());
+        assert!(unique_new_candidate(&[candidate.clone()], "other", "note.txt").is_none());
+        assert!(unique_new_candidate(&[candidate.clone()], "parent", "Note.txt").is_none());
+        let mut duplicate = candidate.clone();
+        duplicate.item_id = "other".into();
+        assert!(
+            unique_new_candidate(&[candidate.clone(), duplicate], "parent", "note.txt").is_none()
+        );
+        candidate.kind = "folder".into();
+        assert!(unique_new_candidate(&[candidate], "parent", "note.txt").is_none());
     }
 
     #[test]
@@ -496,7 +537,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_attempt_uses_reconciliation_for_existing_and_blocks_new_retry() {
+    fn empty_attempt_uses_reconciliation_without_retrying_creation() {
         let draft = draft();
         let checkpoint = DraftUploadCheckpoint {
             identity: draft.clone(),
@@ -534,11 +575,14 @@ mod tests {
         };
         mark_uncertain_upload(&mut new_status, &local_new, Some(&new_checkpoint));
         assert_eq!(new_status.status, "uncertain-empty-new");
-        assert!(next_auto_candidate(&[new_status], None).is_none());
+        assert_eq!(
+            next_auto_candidate(&[new_status], None).map(|(_, action)| action),
+            Some(AutoDraftAction::Reconcile)
+        );
     }
 
     #[test]
-    fn unavailable_final_session_routes_existing_to_reconcile_and_new_to_review() {
+    fn unavailable_final_session_routes_both_kinds_to_reconcile() {
         let existing_identity = draft();
         let mut checkpoint = DraftUploadCheckpoint {
             identity: existing_identity.clone(),
@@ -584,11 +628,14 @@ mod tests {
         };
         mark_uncertain_upload(&mut new_status, &new_identity, Some(&checkpoint));
         assert_eq!(new_status.status, "uncertain-new");
-        assert!(next_auto_candidate(&[new_status], None).is_none());
+        assert_eq!(
+            next_auto_candidate(&[new_status], None).map(|(_, action)| action),
+            Some(AutoDraftAction::Reconcile)
+        );
     }
 
     #[test]
-    fn new_file_name_conflict_with_final_attempt_requires_manual_review() {
+    fn new_file_name_conflict_with_final_attempt_reconciles_before_retry() {
         let identity = DraftIdentity {
             drive_id: "drive".into(),
             item_id: "local:new".into(),
@@ -623,6 +670,43 @@ mod tests {
         assert_eq!(
             status.last_upload_issue,
             Some(DraftUploadIssue::TransferFailed)
+        );
+        assert_eq!(
+            next_auto_candidate(&[status], None).map(|(_, action)| action),
+            Some(AutoDraftAction::Reconcile)
+        );
+    }
+
+    #[test]
+    fn mismatched_new_candidate_is_not_rechecked_automatically() {
+        let mut identity = draft();
+        identity.item_id = "local:new".into();
+        identity.base_etag = "local-new".into();
+        identity.new_file = Some(onedrive_mount::draft::NewFileLocation {
+            parent_id: "root".into(),
+            name: "new.txt".into(),
+        });
+        let checkpoint = DraftUploadCheckpoint {
+            identity: identity.clone(),
+            sha256: "a".repeat(64),
+            size: 1,
+            upload_url: "https://upload.example/session".into(),
+            next_offset: 1,
+            final_chunk_attempted: true,
+        };
+        let mut status = VirtualDraftStatus {
+            drive_id: "drive".into(),
+            item_id: identity.item_id.clone(),
+            name: Some("new.txt".into()),
+            status: "name-conflict",
+            last_upload_issue: Some(DraftUploadIssue::RemoteChanged),
+            last_upload_http_status: None,
+        };
+        mark_uncertain_upload(&mut status, &identity, Some(&checkpoint));
+        assert_eq!(status.status, "uncertain-new");
+        assert_eq!(
+            status.last_upload_issue,
+            Some(DraftUploadIssue::RemoteChanged)
         );
         assert!(next_auto_candidate(&[status], None).is_none());
     }
