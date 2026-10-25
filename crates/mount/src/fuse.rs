@@ -173,8 +173,18 @@ impl PublishedVersionController {
         }
         let files = self.files.lock().unwrap();
         let mut operations = self.operations.lock().unwrap();
-        if files.values().any(|open| open.inode == inode)
-            || operations.opening.contains_key(&inode)
+        if files.values().any(|open| {
+            open.inode == inode
+                || match &open.handle {
+                    OpenHandle::Draft(draft) => {
+                        draft.identity().drive_id == drive_id && draft.identity().item_id == item_id
+                    }
+                    OpenHandle::Pending(identity) => {
+                        identity.drive_id == drive_id && identity.item_id == item_id
+                    }
+                    OpenHandle::Cached(_) => false,
+                }
+        }) || operations.opening.contains_key(&inode)
             || !operations.active.insert(inode)
         {
             return Err(io::ErrorKind::WouldBlock.into());
@@ -4375,7 +4385,18 @@ mod tests {
             fuse.read_file(temporary.inode, handle, 0, 11).unwrap(),
             b"replacement"
         );
-        fuse.files.lock().unwrap().remove(&handle);
+        let controller = fuse.published_version_controller();
+        assert_eq!(
+            controller
+                .try_begin_existing("drive", "file")
+                .err()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        fuse.write_file(temporary.inode, handle, 11, b"!").unwrap();
+        fuse.close_file(temporary.inode, handle);
+        let _lease = controller.try_begin_existing("drive", "file").unwrap();
         assert!(fuse.lookup_node(ROOT_INODE, "swap.tmp").is_none());
         let drafts = DraftStore::open(&draft_root).unwrap().list().unwrap();
         assert_eq!(drafts.len(), 1);
@@ -4388,9 +4409,9 @@ mod tests {
             .recover(&drafts[0])
             .unwrap()
             .unwrap();
-        let mut bytes = [0; 11];
-        assert_eq!(draft.read_at(0, &mut bytes).unwrap(), 11);
-        assert_eq!(&bytes, b"replacement");
+        let mut bytes = [0; 12];
+        assert_eq!(draft.read_at(0, &mut bytes).unwrap(), 12);
+        assert_eq!(&bytes, b"replacement!");
     }
 
     #[test]
