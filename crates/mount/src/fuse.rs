@@ -2143,27 +2143,37 @@ impl VirtualFuse {
             .ok_or(Errno::EBADF)?
             .handle
             .clone();
-        let node = self.node(inode).ok_or(Errno::ENOENT)?;
-        if node.kind != NodeKind::File {
-            return Err(Errno::EISDIR);
-        }
-        if self.detached_files.lock().unwrap().contains_key(&inode)
-            && let OpenHandle::Draft(draft) = &opened
-        {
-            return draft.seek_data_hole(offset, whence).map_err(map_seek_error);
-        }
-        if let Some(draft) = self.draft_for_node(&node)? {
-            return draft.seek_data_hole(offset, whence).map_err(map_seek_error);
-        }
+        let size = if let Some(node) = self.node(inode) {
+            if node.kind != NodeKind::File {
+                return Err(Errno::EISDIR);
+            }
+            if self.detached_files.lock().unwrap().contains_key(&inode)
+                && let OpenHandle::Draft(draft) = &opened
+            {
+                return draft.seek_data_hole(offset, whence).map_err(map_seek_error);
+            }
+            if let Some(draft) = self.draft_for_node(&node)? {
+                return draft.seek_data_hole(offset, whence).map_err(map_seek_error);
+            }
+            node.size
+        } else if let OpenHandle::Cached(cached) = &opened {
+            cached
+                .source_file()
+                .metadata()
+                .map_err(|_| Errno::EIO)?
+                .len()
+        } else {
+            return Err(Errno::ENOENT);
+        };
         // Graph exposes file size, but not physical allocation. A regular file may
         // legally report all bytes as data and one implicit hole at EOF.
-        if offset as u64 >= node.size {
+        if offset as u64 >= size {
             return Err(Errno::ENXIO);
         }
         if whence == libc::SEEK_DATA {
             Ok(offset)
         } else {
-            i64::try_from(node.size).map_err(|_| Errno::EOVERFLOW)
+            i64::try_from(size).map_err(|_| Errno::EOVERFLOW)
         }
     }
 
@@ -3832,6 +3842,47 @@ mod tests {
             fuse.seek_file(local.inode, 999, 0, libc::SEEK_DATA),
             Err(Errno::EBADF)
         );
+    }
+
+    #[test]
+    fn open_cached_remote_file_remains_seekable_after_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_root = dir.path().join("cache");
+        let source = dir.path().join("source");
+        fs::write(&source, b"hello").unwrap();
+        let tree = VirtualTree::from_items("drive", "root", [file_item()]).unwrap();
+        let request = tree.request_for_item("file").unwrap();
+        CacheStore::open(&cache_root, 10)
+            .unwrap()
+            .put(&request.cache_key(), &source, 5)
+            .unwrap();
+        let fuse = VirtualFuse::new_writable(
+            tree,
+            cache_root,
+            dir.path().join("drafts"),
+            10,
+            Arc::new(|_| panic!("file is cached")),
+        );
+        let node = fuse.lookup_node(ROOT_INODE, "текст.txt").unwrap();
+        let handle = fuse
+            .open_file(node.inode, OpenFlags(libc::O_RDONLY))
+            .unwrap();
+        fuse.remove_local_file(ROOT_INODE, "текст.txt").unwrap();
+        assert!(fuse.lookup_node(ROOT_INODE, "текст.txt").is_none());
+        assert_eq!(fuse.read_file(node.inode, handle, 0, 5).unwrap(), b"hello");
+        assert_eq!(
+            fuse.seek_file(node.inode, handle, 2, libc::SEEK_DATA),
+            Ok(2)
+        );
+        assert_eq!(
+            fuse.seek_file(node.inode, handle, 2, libc::SEEK_HOLE),
+            Ok(5)
+        );
+        assert_eq!(
+            fuse.seek_file(node.inode, handle, 5, libc::SEEK_DATA),
+            Err(Errno::ENXIO)
+        );
+        fuse.close_file(node.inode, handle);
     }
 
     #[test]
