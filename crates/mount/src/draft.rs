@@ -905,6 +905,9 @@ impl DraftFile {
     }
 
     pub fn set_len(&self, size: u64) -> io::Result<()> {
+        if size > i64::MAX as u64 {
+            return Err(io::Error::from(io::ErrorKind::InvalidInput));
+        }
         let _lock = lock_exclusive(&self.file)?;
         self.ensure_live_file()?;
         self.file.set_len(size)?;
@@ -940,6 +943,9 @@ impl DraftFile {
     }
 
     pub fn read_at(&self, offset: u64, buffer: &mut [u8]) -> io::Result<usize> {
+        if offset > i64::MAX as u64 {
+            return Ok(0);
+        }
         self.file.read_at(buffer, offset)
     }
 
@@ -999,6 +1005,35 @@ impl DraftFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn set_len_rejects_size_beyond_positioned_io_range_without_changing_draft() {
+        let root = tempfile::tempdir().unwrap();
+        let store = DraftStore::open(root.path()).unwrap();
+        let draft = store.begin_empty(identity()).unwrap();
+        draft.write_at(0, b"keep").unwrap();
+
+        assert_eq!(
+            draft.set_len(i64::MAX as u64 + 1).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(draft.len().unwrap(), 4);
+        let mut bytes = [0; 4];
+        assert_eq!(draft.read_at(0, &mut bytes).unwrap(), 4);
+        assert_eq!(&bytes, b"keep");
+    }
+
+    #[test]
+    fn read_at_beyond_supported_file_range_returns_eof() {
+        let root = tempfile::tempdir().unwrap();
+        let store = DraftStore::open(root.path()).unwrap();
+        let draft = store.begin_empty(identity()).unwrap();
+        draft.write_at(0, b"keep").unwrap();
+
+        let mut bytes = [0; 4];
+        assert_eq!(draft.read_at(u64::MAX, &mut bytes).unwrap(), 0);
+        assert_eq!(draft.len().unwrap(), 4);
+    }
 
     #[test]
     fn append_serializes_offset_selection_across_draft_handles() {

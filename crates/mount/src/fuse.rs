@@ -5924,6 +5924,28 @@ mod tests {
     }
 
     #[test]
+    fn reading_local_draft_past_offset_range_returns_eof() {
+        let dir = tempfile::tempdir().unwrap();
+        let fuse = VirtualFuse::new_writable(
+            VirtualTree::from_items("drive", "root", []).unwrap(),
+            dir.path().join("cache"),
+            dir.path().join("drafts"),
+            10,
+            Arc::new(|_| Err(io::ErrorKind::NotConnected.into())),
+        );
+        let (node, handle) = fuse
+            .create_file(ROOT_INODE, "local.txt", OpenFlags(libc::O_RDWR))
+            .unwrap();
+        fuse.write_file(node.inode, handle, 0, b"content").unwrap();
+
+        assert_eq!(fuse.read_file(node.inode, handle, u64::MAX, 4), Ok(vec![]));
+        assert_eq!(
+            fuse.read_file(node.inode, handle, 0, 7),
+            Ok(b"content".to_vec())
+        );
+    }
+
+    #[test]
     fn append_open_ignores_supplied_offsets_and_preserves_positioned_writes() {
         let dir = tempfile::tempdir().unwrap();
         let fuse = VirtualFuse::new_writable(
