@@ -2197,6 +2197,12 @@ impl VirtualFuse {
                 return Err(Errno::EBADF);
             }
         }
+        if matches!(
+            (self.node(source_inode), self.node(target_inode)),
+            (Some(source), Some(target)) if source.item_id == target.item_id
+        ) {
+            return Err(Errno::EINVAL);
+        }
         let length = length
             .min(u32::MAX as u64)
             .min((i64::MAX as u64).saturating_sub(source_offset))
@@ -4851,6 +4857,48 @@ mod tests {
         );
         fuse.close_file(original_inode, stale);
         fuse.remove_local_file(ROOT_INODE, "текст.txt").unwrap();
+    }
+
+    #[test]
+    fn copy_range_rejects_two_inodes_of_the_same_remote_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let fuse = VirtualFuse::new_writable(
+            VirtualTree::from_items("drive", "root", [file_item()]).unwrap(),
+            dir.path().join("cache"),
+            dir.path().join("drafts"),
+            20,
+            Arc::new(|_| panic!("no download expected")),
+        );
+        let remote_inode = fuse.lookup_node(ROOT_INODE, "текст.txt").unwrap().inode;
+        let (local, handle) = fuse
+            .create_file(ROOT_INODE, "swap.tmp", OpenFlags(libc::O_RDWR))
+            .unwrap();
+        fuse.write_file(local.inode, handle, 0, b"content").unwrap();
+        fuse.close_file(local.inode, handle);
+        fuse.rename_local_file(
+            ROOT_INODE,
+            "swap.tmp",
+            ROOT_INODE,
+            "текст.txt",
+            fuser::RenameFlags::empty(),
+        )
+        .unwrap();
+        let source = fuse
+            .open_file(local.inode, OpenFlags(libc::O_RDONLY))
+            .unwrap();
+        let target = fuse
+            .open_file(remote_inode, OpenFlags(libc::O_RDWR))
+            .unwrap();
+        assert_eq!(
+            fuse.copy_range(local.inode, source, 0, remote_inode, target, 1, 5),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(
+            fuse.read_file(local.inode, source, 0, 7).unwrap(),
+            b"content"
+        );
+        fuse.close_file(local.inode, source);
+        fuse.close_file(remote_inode, target);
     }
 
     #[test]
