@@ -120,6 +120,13 @@ pub struct DraftUploadFailure {
     pub http_status: Option<u16>,
 }
 
+#[derive(Serialize, Deserialize)]
+struct DraftReplacement {
+    source: DraftIdentity,
+    target: DraftIdentity,
+    target_existed: bool,
+}
+
 impl std::fmt::Debug for DraftUploadCheckpoint {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -220,8 +227,123 @@ impl DraftStore {
         fs::set_permissions(root, fs::Permissions::from_mode(0o700))?;
         let _lock = lock_store(root)?;
         let store = Self { root: root.into() };
+        store.recover_replacements()?;
         store.cleanup_removed()?;
         Ok(store)
+    }
+
+    fn replacement_paths(&self, source: &DraftIdentity) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+        let base = self.paths(source).0;
+        (
+            base.with_extension("replace-pending"),
+            base.with_extension("replace-committed"),
+            base.with_extension("replace-held"),
+            base.with_extension("replace-backup"),
+        )
+    }
+
+    fn read_replacement(&self, path: &Path) -> io::Result<DraftReplacement> {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)?;
+        if !file.metadata()?.is_file() || file.metadata()?.len() > 4096 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid replacement marker",
+            ));
+        }
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        let replacement: DraftReplacement = serde_json::from_slice(&bytes)?;
+        replacement.source.validate()?;
+        replacement.target.validate()?;
+        if replacement.source.new_file.is_none()
+            || replacement.target.new_file.is_some()
+            || replacement.source.drive_id != replacement.target.drive_id
+            || replacement.source.item_id == replacement.target.item_id
+            || !self.replacement_paths(&replacement.source).0.eq(path)
+                && !self.replacement_paths(&replacement.source).1.eq(path)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid replacement identity",
+            ));
+        }
+        Ok(replacement)
+    }
+
+    fn remove_if_present(path: &Path) -> io::Result<()> {
+        match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn rollback_replacement(&self, replacement: &DraftReplacement) -> io::Result<()> {
+        let (pending, _, held, backup) = self.replacement_paths(&replacement.source);
+        let (source_meta, _) = self.paths(&replacement.source);
+        let (target_meta, target_data) = self.paths(&replacement.target);
+        if replacement.target_existed {
+            if backup.exists() {
+                fs::rename(&backup, &target_data)?;
+            }
+        } else {
+            Self::remove_if_present(&target_meta)?;
+            Self::remove_if_present(&target_data)?;
+        }
+        if held.exists() {
+            fs::rename(held, source_meta)?;
+        }
+        Self::remove_if_present(&pending)?;
+        File::open(&self.root)?.sync_all()
+    }
+
+    fn finish_replacement(&self, replacement: &DraftReplacement) -> io::Result<()> {
+        let (_, committed, held, backup) = self.replacement_paths(&replacement.source);
+        let (_, source_data) = self.paths(&replacement.source);
+        for path in [
+            source_data,
+            held,
+            self.checkpoint_path(&replacement.source),
+            self.failure_path(&replacement.source),
+            backup,
+        ] {
+            Self::remove_if_present(&path)?;
+        }
+        self.clear_stale_upload_state(&replacement.target)?;
+        Self::remove_if_present(&committed)?;
+        File::open(&self.root)?.sync_all()
+    }
+
+    fn recover_replacements(&self) -> io::Result<()> {
+        for entry in fs::read_dir(&self.root)? {
+            let entry = entry?;
+            match entry.path().extension().and_then(|value| value.to_str()) {
+                Some("replace-pending") => {
+                    let replacement = self.read_replacement(&entry.path())?;
+                    self.rollback_replacement(&replacement)?;
+                }
+                Some("replace-committed") => {
+                    let replacement = self.read_replacement(&entry.path())?;
+                    self.finish_replacement(&replacement)?;
+                }
+                _ => {}
+            }
+        }
+        // A crash before the marker was published can leave only a backup link.
+        for entry in fs::read_dir(&self.root)? {
+            let entry = entry?;
+            if entry
+                .path()
+                .extension()
+                .is_some_and(|ext| ext == "replace-backup")
+            {
+                Self::remove_if_present(&entry.path())?;
+            }
+        }
+        Ok(())
     }
 
     /// Finish cleanup after a confirmed upload or a local-only file removal.
@@ -491,6 +613,136 @@ impl DraftStore {
         File::open(&self.root)?.sync_all()?;
         self.recover(identity)?
             .ok_or_else(|| io::Error::other("draft disappeared"))
+    }
+
+    /// Convert a local editor temporary file into an existing remote file's draft.
+    /// A durable marker makes an interrupted replacement roll back or finish on reopen.
+    pub fn replace_existing_from_new(
+        &self,
+        source: &DraftIdentity,
+        target: &DraftIdentity,
+        input: &File,
+    ) -> io::Result<DraftFile> {
+        source.validate()?;
+        target.validate()?;
+        if source.new_file.is_none()
+            || target.new_file.is_some()
+            || source.drive_id != target.drive_id
+            || source.item_id == target.item_id
+            || !input.metadata()?.is_file()
+        {
+            return Err(io::Error::from(io::ErrorKind::InvalidInput));
+        }
+        let _lock = lock_store(&self.root)?;
+        if self.new_identity_for_removal_locked(&source.drive_id, &source.item_id)? != *source {
+            return Err(io::Error::from(io::ErrorKind::WouldBlock));
+        }
+        let source_draft = self
+            .recover(source)?
+            .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
+        let _source_lock = lock_exclusive(&source_draft.file)?;
+        let target_draft = self.recover(target)?;
+        if target_draft
+            .as_ref()
+            .is_some_and(|draft| draft.identity() != target)
+        {
+            return Err(io::Error::from(io::ErrorKind::WouldBlock));
+        }
+        let _target_lock = target_draft
+            .as_ref()
+            .map(|draft| lock_exclusive(&draft.file))
+            .transpose()?;
+        if self
+            .upload_checkpoint_locked(target)?
+            .is_some_and(|checkpoint| checkpoint.final_chunk_attempted)
+        {
+            return Err(io::Error::from(io::ErrorKind::WouldBlock));
+        }
+        let (target_meta, target_data) = self.paths(target);
+        if target_draft.is_none() && (target_meta.exists() || target_data.exists()) {
+            return Err(io::Error::from(io::ErrorKind::AlreadyExists));
+        }
+        let mut staged_data = tempfile::NamedTempFile::new_in(&self.root)?;
+        let mut offset = 0_u64;
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let count = input.read_at(&mut buffer, offset)?;
+            if count == 0 {
+                break;
+            }
+            staged_data.write_all(&buffer[..count])?;
+            offset += count as u64;
+        }
+        staged_data.as_file().sync_all()?;
+        let mut staged_metadata = tempfile::NamedTempFile::new_in(&self.root)?;
+        serde_json::to_writer(&mut staged_metadata, target)?;
+        staged_metadata.flush()?;
+        staged_metadata.as_file().sync_all()?;
+        let replacement = DraftReplacement {
+            source: source.clone(),
+            target: target.clone(),
+            target_existed: target_draft.is_some(),
+        };
+        let (pending, committed, held, backup) = self.replacement_paths(source);
+        if pending.exists() || committed.exists() || held.exists() || backup.exists() {
+            return Err(io::Error::from(io::ErrorKind::AlreadyExists));
+        }
+        if target_draft.is_some() {
+            fs::hard_link(&target_data, &backup)?;
+            File::open(&self.root)?.sync_all()?;
+        }
+        let marker_result = (|| -> io::Result<()> {
+            let mut staged_marker = tempfile::NamedTempFile::new_in(&self.root)?;
+            serde_json::to_writer(&mut staged_marker, &replacement)?;
+            staged_marker.flush()?;
+            staged_marker.as_file().sync_all()?;
+            staged_marker
+                .persist_noclobber(&pending)
+                .map_err(|error| error.error)?;
+            File::open(&self.root)?.sync_all()
+        })();
+        if let Err(error) = marker_result {
+            if pending.exists() {
+                self.rollback_replacement(&replacement)?;
+            } else {
+                Self::remove_if_present(&backup)?;
+            }
+            return Err(error);
+        }
+        let precommit_result = (|| -> io::Result<()> {
+            if target_draft.is_some() {
+                staged_data
+                    .persist(&target_data)
+                    .map_err(|error| error.error)?;
+            } else {
+                staged_data
+                    .persist_noclobber(&target_data)
+                    .map_err(|error| error.error)?;
+                staged_metadata
+                    .persist_noclobber(&target_meta)
+                    .map_err(|error| error.error)?;
+            }
+            File::open(&self.root)?.sync_all()?;
+            fs::rename(self.paths(source).0, &held)?;
+            File::open(&self.root)?.sync_all()
+        })();
+        if let Err(error) = precommit_result {
+            self.rollback_replacement(&replacement)?;
+            return Err(error);
+        }
+        if let Err(error) = fs::rename(&pending, &committed) {
+            self.rollback_replacement(&replacement)?;
+            return Err(error);
+        }
+        if let Err(error) = File::open(&self.root).and_then(|root| root.sync_all()) {
+            fs::rename(&committed, &pending)?;
+            self.rollback_replacement(&replacement)?;
+            return Err(error);
+        }
+        // Once committed, cleanup failure is recovered on the next store open.
+        let _ = self.finish_replacement(&replacement);
+        self.recover(target)?
+            .ok_or_else(|| io::Error::other("replacement draft disappeared"))
     }
 
     pub fn begin_empty(&self, identity: DraftIdentity) -> io::Result<DraftFile> {
@@ -1169,6 +1421,127 @@ mod tests {
             base_etag: "v1".into(),
             new_file: None,
         }
+    }
+
+    fn editor_draft() -> DraftIdentity {
+        DraftIdentity {
+            drive_id: "drive".into(),
+            item_id: "local:editor".into(),
+            base_etag: "local-new".into(),
+            new_file: Some(NewFileLocation {
+                parent_id: "root".into(),
+                name: "editor.tmp".into(),
+            }),
+        }
+    }
+
+    #[test]
+    fn editor_replacement_leaves_one_draft_after_restart() {
+        for target_existed in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let store = DraftStore::open(root.path()).unwrap();
+            let source = editor_draft();
+            let draft = store.begin_empty(source.clone()).unwrap();
+            draft.write_at(0, b"edited").unwrap();
+            if target_existed {
+                store
+                    .begin_empty(identity())
+                    .unwrap()
+                    .write_at(0, b"old")
+                    .unwrap();
+            }
+            let snapshot = store.snapshot(&source).unwrap().unwrap();
+            store
+                .replace_existing_from_new(&source, &identity(), snapshot.file.as_file())
+                .unwrap();
+            let reopened = DraftStore::open(root.path()).unwrap();
+            assert_eq!(reopened.list().unwrap(), vec![identity()]);
+            assert_eq!(fs::read(reopened.paths(&identity()).1).unwrap(), b"edited");
+            assert!(reopened.recover(&source).unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn interrupted_editor_replacement_rolls_back_before_commit() {
+        for target_existed in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let store = DraftStore::open(root.path()).unwrap();
+            let source = editor_draft();
+            store
+                .begin_empty(source.clone())
+                .unwrap()
+                .write_at(0, b"edited")
+                .unwrap();
+            if target_existed {
+                store
+                    .begin_empty(identity())
+                    .unwrap()
+                    .write_at(0, b"old")
+                    .unwrap();
+            }
+            let marker = DraftReplacement {
+                source: source.clone(),
+                target: identity(),
+                target_existed,
+            };
+            let (pending, _, held, backup) = store.replacement_paths(&source);
+            let (source_meta, _) = store.paths(&source);
+            let (target_meta, target_data) = store.paths(&identity());
+            if target_existed {
+                fs::hard_link(&target_data, &backup).unwrap();
+            } else {
+                fs::write(&target_meta, serde_json::to_vec(&identity()).unwrap()).unwrap();
+            }
+            fs::write(&pending, serde_json::to_vec(&marker).unwrap()).unwrap();
+            let staged = root.path().join("staged");
+            fs::write(&staged, b"edited").unwrap();
+            fs::rename(staged, &target_data).unwrap();
+            fs::rename(source_meta, held).unwrap();
+            let reopened = DraftStore::open(root.path()).unwrap();
+            assert_eq!(fs::read(reopened.paths(&source).1).unwrap(), b"edited");
+            assert!(reopened.recover(&source).unwrap().is_some());
+            if target_existed {
+                assert_eq!(fs::read(target_data).unwrap(), b"old");
+            } else {
+                assert!(!target_data.exists());
+                assert!(!target_meta.exists());
+            }
+            assert!(!pending.exists());
+        }
+    }
+
+    #[test]
+    fn interrupted_committed_editor_replacement_finishes_on_reopen() {
+        let root = tempfile::tempdir().unwrap();
+        let store = DraftStore::open(root.path()).unwrap();
+        let source = editor_draft();
+        store
+            .begin_empty(source.clone())
+            .unwrap()
+            .write_at(0, b"edited")
+            .unwrap();
+        store
+            .begin_empty(identity())
+            .unwrap()
+            .write_at(0, b"old")
+            .unwrap();
+        let marker = DraftReplacement {
+            source: source.clone(),
+            target: identity(),
+            target_existed: true,
+        };
+        let (_, committed, held, backup) = store.replacement_paths(&source);
+        let (source_meta, _) = store.paths(&source);
+        let (_, target_data) = store.paths(&identity());
+        fs::hard_link(&target_data, &backup).unwrap();
+        fs::write(&committed, serde_json::to_vec(&marker).unwrap()).unwrap();
+        fs::rename(source_meta, held).unwrap();
+        fs::rename(store.paths(&source).1, &target_data).unwrap();
+        let reopened = DraftStore::open(root.path()).unwrap();
+        assert_eq!(reopened.list().unwrap(), vec![identity()]);
+        assert_eq!(fs::read(target_data).unwrap(), b"edited");
+        assert!(!committed.exists());
+        assert!(!backup.exists());
     }
 
     #[test]

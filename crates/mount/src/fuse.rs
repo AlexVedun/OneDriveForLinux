@@ -1438,14 +1438,8 @@ impl VirtualFuse {
                 base_etag: request.etag,
                 new_file: None,
             };
-            let replacement_draft = if self.draft_for_node(&target)?.is_some() {
-                store.replace_from_file(&identity, snapshot.file.as_file())
-            } else {
-                store.begin_from_file(identity, snapshot.file.as_file())
-            }
-            .map_err(map_draft_error)?;
-            store
-                .remove_new(self.tree.drive_id(), &node.item_id)
+            let replacement_draft = store
+                .replace_existing_from_new(source.identity(), &identity, snapshot.file.as_file())
                 .map_err(map_draft_error)?;
             if target.inode != node.inode {
                 local.remove(&target.inode);
