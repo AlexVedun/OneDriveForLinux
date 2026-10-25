@@ -4253,7 +4253,14 @@ fn virtual_upload_issue(error: &zbus::fdo::Error) -> DraftUploadIssue {
 
 fn virtual_upload_error_text(error: &UploadError) -> String {
     let reason = match error {
-        UploadError::HttpStatus(status) => format!("HTTP status {status}"),
+        UploadError::HttpStatus {
+            status,
+            code,
+            phase,
+        } => match code {
+            Some(code) => format!("HTTP status {status} during {phase}: Graph code {code}"),
+            None => format!("HTTP status {status} during {phase}"),
+        },
         UploadError::Conflict => "OneDrive reported a conflict".to_owned(),
         UploadError::Expired => "upload session expired".to_owned(),
         UploadError::Transient => "network or server temporarily unavailable".to_owned(),
@@ -4568,7 +4575,17 @@ mod tests {
     #[test]
     fn upload_failure_record_uses_only_known_codes() {
         let rejection =
-            zbus::fdo::Error::Failed(virtual_upload_error_text(&UploadError::HttpStatus(400)));
+            zbus::fdo::Error::Failed(virtual_upload_error_text(&UploadError::HttpStatus {
+                status: 400,
+                code: Some("invalidRequest".into()),
+                phase: "create session",
+            }));
+        assert!(
+            rejection
+                .to_string()
+                .contains("create session: Graph code invalidRequest")
+        );
+        assert!(!rejection.to_string().contains("secret"));
         assert_eq!(
             virtual_upload_issue(&rejection),
             DraftUploadIssue::TransferFailed
