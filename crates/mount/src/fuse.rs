@@ -2887,6 +2887,7 @@ impl Filesystem for VirtualFuse {
 mod tests {
     use super::*;
     use crate::ROOT_INODE;
+    use crate::draft::DraftUploadCheckpoint;
     use onedrive_catalog::CatalogItem;
     use std::fs;
     use std::io::Read;
@@ -4754,6 +4755,58 @@ mod tests {
                 .item_id,
             "file"
         );
+    }
+
+    #[test]
+    fn uncertain_new_file_upload_blocks_virtual_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        let draft_root = dir.path().join("drafts");
+        let fuse = VirtualFuse::new_writable(
+            VirtualTree::from_items("drive", "root", []).unwrap(),
+            dir.path().join("cache"),
+            draft_root.clone(),
+            10,
+            Arc::new(|_| Err(io::ErrorKind::NotConnected.into())),
+        );
+        let (node, handle) = fuse
+            .create_file(ROOT_INODE, "first.txt", OpenFlags(libc::O_RDWR))
+            .unwrap();
+        fuse.write_file(node.inode, handle, 0, b"x").unwrap();
+        fuse.close_file(node.inode, handle);
+        let store = DraftStore::open(&draft_root).unwrap();
+        let identity = store
+            .recover_item("drive", &node.item_id)
+            .unwrap()
+            .unwrap()
+            .identity()
+            .clone();
+        store
+            .save_upload_checkpoint(&DraftUploadCheckpoint {
+                identity: identity.clone(),
+                sha256: "a".repeat(64),
+                size: 1,
+                upload_url: "https://upload.example/uncertain".into(),
+                next_offset: 0,
+                final_chunk_attempted: true,
+            })
+            .unwrap();
+
+        assert_eq!(
+            fuse.rename_local_file(
+                ROOT_INODE,
+                "first.txt",
+                ROOT_INODE,
+                "second.txt",
+                fuser::RenameFlags::empty(),
+            ),
+            Err(Errno::EBUSY)
+        );
+        assert_eq!(
+            fuse.lookup_node(ROOT_INODE, "first.txt").unwrap().inode,
+            node.inode
+        );
+        assert!(fuse.lookup_node(ROOT_INODE, "second.txt").is_none());
+        assert!(store.upload_checkpoint(&identity).unwrap().is_some());
     }
 
     #[test]
