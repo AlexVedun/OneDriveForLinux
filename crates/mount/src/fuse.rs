@@ -662,11 +662,12 @@ impl VirtualFuse {
     }
 
     fn remote_node(&self, node: &Node) -> Option<Node> {
+        let remote_inode = crate::stable_inode(self.tree.drive_id(), &node.item_id);
         let mutation = self
             .remote_changes
             .lock()
             .unwrap()
-            .get(&node.inode)
+            .get(&remote_inode)
             .cloned();
         match mutation.map(|mutation| mutation.kind) {
             Some(MutationKind::Delete) => None,
@@ -1189,15 +1190,16 @@ impl VirtualFuse {
             kind,
             status: MutationStatus::Pending,
         };
+        let remote_inode = crate::stable_inode(self.tree.drive_id(), &node.item_id);
         let mut changes = self.remote_changes.lock().unwrap();
-        if changes.contains_key(&node.inode) {
+        if changes.contains_key(&remote_inode) {
             return Err(Errno::EBUSY);
         }
         DraftStore::open(root).map_err(map_draft_error)?;
         MutationStore::open(root)
             .and_then(|store| store.add(&mutation))
             .map_err(map_draft_error)?;
-        changes.insert(node.inode, mutation);
+        changes.insert(remote_inode, mutation);
         Ok(())
     }
 
@@ -1386,7 +1388,7 @@ impl VirtualFuse {
                 .remote_changes
                 .lock()
                 .unwrap()
-                .contains_key(&target.inode)
+                .contains_key(&crate::stable_inode(self.tree.drive_id(), &target.item_id))
             {
                 return Err(Errno::EEXIST);
             }
@@ -4506,6 +4508,65 @@ mod tests {
         .unwrap();
         let second_draft = store.recover_item("drive", "file").unwrap().unwrap();
         assert_eq!(second_draft.identity().base_etag, "v2");
+    }
+
+    #[test]
+    fn deleting_published_editor_replacement_hides_remote_item() {
+        let dir = tempfile::tempdir().unwrap();
+        let draft_root = dir.path().join("drafts");
+        let fuse = VirtualFuse::new_writable(
+            VirtualTree::from_items("drive", "root", [file_item()]).unwrap(),
+            dir.path().join("cache"),
+            draft_root.clone(),
+            20,
+            Arc::new(|_| panic!("no download expected")),
+        );
+        let (temporary, handle) = fuse
+            .create_file(ROOT_INODE, "swap.tmp", OpenFlags(libc::O_RDWR))
+            .unwrap();
+        fuse.write_file(temporary.inode, handle, 0, b"replacement")
+            .unwrap();
+        fuse.close_file(temporary.inode, handle);
+        fuse.rename_local_file(
+            ROOT_INODE,
+            "swap.tmp",
+            ROOT_INODE,
+            "текст.txt",
+            fuser::RenameFlags::empty(),
+        )
+        .unwrap();
+        let store = DraftStore::open(&draft_root).unwrap();
+        let draft = store.recover_item("drive", "file").unwrap().unwrap();
+        let snapshot = store.snapshot(draft.identity()).unwrap().unwrap();
+        let controller = fuse.published_version_controller();
+        let lease = controller.try_begin_existing("drive", "file").unwrap();
+        controller.publish_existing("file", "v2".into(), snapshot.size);
+        assert!(store.acknowledge(&snapshot).unwrap());
+        drop(lease);
+
+        fuse.remove_local_file(ROOT_INODE, "текст.txt").unwrap();
+        assert!(fuse.lookup_node(ROOT_INODE, "текст.txt").is_none());
+        assert!(
+            !fuse
+                .directory_entries(ROOT_INODE)
+                .unwrap()
+                .iter()
+                .any(|entry| entry.2 == "текст.txt")
+        );
+        let changes = MutationStore::open(&draft_root).unwrap().list().unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].kind, MutationKind::Delete);
+        assert_eq!(changes[0].etag, "v2");
+        drop(fuse);
+        let remounted = VirtualFuse::new_writable(
+            VirtualTree::from_items("drive", "root", [file_item()]).unwrap(),
+            dir.path().join("cache"),
+            draft_root,
+            20,
+            Arc::new(|_| panic!("no download expected")),
+        );
+        remounted.load_local_files().unwrap();
+        assert!(remounted.lookup_node(ROOT_INODE, "текст.txt").is_none());
     }
 
     #[test]
