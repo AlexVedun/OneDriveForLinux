@@ -467,6 +467,12 @@ impl DraftStore {
         if self.recover(identity)?.is_none() || !input.metadata()?.is_file() {
             return Err(io::Error::from(io::ErrorKind::NotFound));
         }
+        if self
+            .upload_checkpoint_locked(identity)?
+            .is_some_and(|checkpoint| checkpoint.final_chunk_attempted)
+        {
+            return Err(io::Error::from(io::ErrorKind::WouldBlock));
+        }
         let mut temporary = tempfile::NamedTempFile::new_in(&self.root)?;
         let mut offset = 0;
         let mut buffer = [0_u8; 64 * 1024];
@@ -528,6 +534,25 @@ impl DraftStore {
     /// Discard a local-only file; a marker completes data cleanup after a crash.
     pub fn remove_new(&self, drive_id: &str, item_id: &str) -> io::Result<()> {
         let _lock = lock_store(&self.root)?;
+        let identity = self.new_identity_for_removal_locked(drive_id, item_id)?;
+        let metadata = self.paths(&identity).0;
+        fs::rename(&metadata, metadata.with_extension("removed"))?;
+        File::open(&self.root)?.sync_all()?;
+        self.cleanup_removed()
+    }
+
+    /// Preflight for a FUSE rename that will consume a local-only source or target.
+    pub fn ensure_new_removable(&self, drive_id: &str, item_id: &str) -> io::Result<()> {
+        let _lock = lock_store(&self.root)?;
+        self.new_identity_for_removal_locked(drive_id, item_id)
+            .map(|_| ())
+    }
+
+    fn new_identity_for_removal_locked(
+        &self,
+        drive_id: &str,
+        item_id: &str,
+    ) -> io::Result<DraftIdentity> {
         let draft = self
             .recover_item(drive_id, item_id)?
             .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
@@ -540,10 +565,7 @@ impl DraftStore {
         {
             return Err(io::Error::from(io::ErrorKind::WouldBlock));
         }
-        let metadata = self.paths(draft.identity()).0;
-        fs::rename(&metadata, metadata.with_extension("removed"))?;
-        File::open(&self.root)?.sync_all()?;
-        self.cleanup_removed()
+        Ok(draft.identity().clone())
     }
 
     fn clear_stale_upload_state(&self, identity: &DraftIdentity) -> io::Result<()> {
@@ -1147,6 +1169,65 @@ mod tests {
             base_etag: "v1".into(),
             new_file: None,
         }
+    }
+
+    #[test]
+    fn uncertain_existing_upload_cannot_be_replaced_by_editor_snapshot() {
+        let root = tempfile::tempdir().unwrap();
+        let store = DraftStore::open(root.path()).unwrap();
+        let draft = store.begin_empty(identity()).unwrap();
+        draft.write_at(0, b"original").unwrap();
+        let replacement = root.path().join("replacement");
+        fs::write(&replacement, b"changed").unwrap();
+        let input = File::open(&replacement).unwrap();
+        let mut checkpoint = DraftUploadCheckpoint {
+            identity: identity(),
+            sha256: "a".repeat(64),
+            size: 8,
+            upload_url: "https://upload.example/uncertain".into(),
+            next_offset: 0,
+            final_chunk_attempted: true,
+        };
+        store.save_upload_checkpoint(&checkpoint).unwrap();
+
+        assert_eq!(
+            store
+                .replace_from_file(&identity(), &input)
+                .err()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        let mut bytes = [0; 8];
+        assert_eq!(
+            store
+                .recover(&identity())
+                .unwrap()
+                .unwrap()
+                .read_at(0, &mut bytes)
+                .unwrap(),
+            8
+        );
+        assert_eq!(&bytes, b"original");
+        assert_eq!(
+            store.upload_checkpoint(&identity()).unwrap(),
+            Some(checkpoint.clone())
+        );
+
+        checkpoint.final_chunk_attempted = false;
+        store.save_upload_checkpoint(&checkpoint).unwrap();
+        store.replace_from_file(&identity(), &input).unwrap();
+        let mut bytes = [0; 7];
+        assert_eq!(
+            store
+                .recover(&identity())
+                .unwrap()
+                .unwrap()
+                .read_at(0, &mut bytes)
+                .unwrap(),
+            7
+        );
+        assert_eq!(&bytes, b"changed");
     }
 
     #[test]
