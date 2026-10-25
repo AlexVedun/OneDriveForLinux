@@ -64,6 +64,9 @@ gdbus introspect --session \
 gdbus introspect --session \
     --dest io.github.onedrive_linux.Daemon \
     --object-path /io/github/onedrive_linux/Daemon | grep -q ReconcileVirtualDraft
+gdbus introspect --session \
+    --dest io.github.onedrive_linux.Daemon \
+    --object-path /io/github/onedrive_linux/Daemon | grep -q DiscardVirtualDraft
 cache_stats=$(gdbus call --session \
     --dest io.github.onedrive_linux.Daemon \
     --object-path /io/github/onedrive_linux/Daemon \

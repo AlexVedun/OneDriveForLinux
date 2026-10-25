@@ -516,6 +516,15 @@ fn export_virtual_draft(drive_id: &str, item_id: &str, destination: &str) -> Res
         .map_err(|error| error.to_string())
 }
 
+fn discard_virtual_draft(drive_id: &str, item_id: &str) -> Result<(), String> {
+    let connection = zbus::blocking::Connection::session().map_err(|error| error.to_string())?;
+    let proxy = zbus::blocking::Proxy::new(&connection, BUS_NAME, OBJECT_PATH, INTERFACE_NAME)
+        .map_err(|error| error.to_string())?;
+    proxy
+        .call("DiscardVirtualDraft", &(drive_id, item_id))
+        .map_err(|error| error.to_string())
+}
+
 fn virtual_draft_status_label(status: &str) -> &'static str {
     match status {
         "ready" => "готов к отправке; версия в каталоге совпадает",
@@ -1526,9 +1535,9 @@ fn present_virtual_drafts_dialog(
     content.set_margin_top(18);
     content.set_margin_bottom(18);
     let hint = gtk::Label::new(Some(if upload_enabled {
-        "Экспорт сохраняет копию без удаления черновика. Демон автоматически отправляет закрытые файлы при подключённом диске, включая новые файлы в созданных в OneDrive папках. Файл в новой локальной папке ждёт отправки папки. Папка синхронизации должна быть отключена; демон повторно проверит данные в OneDrive."
+        "Экспорт сохраняет копию без удаления черновика. Удаление черновика стирает только локальные изменения; облачный файл остаётся. Демон автоматически отправляет закрытые файлы при подключённом диске, включая новые файлы в созданных в OneDrive папках. Файл в новой локальной папке ждёт отправки папки. Папка синхронизации должна быть отключена; демон повторно проверит данные в OneDrive."
     } else {
-        "Экспорт сохраняет копию без удаления черновика. Демон пока не предоставляет отправку файлов."
+        "Экспорт сохраняет копию без удаления черновика. Удаление черновика стирает только локальные изменения; облачный файл остаётся. Демон пока не предоставляет отправку файлов."
     }));
     hint.set_wrap(true);
     hint.set_xalign(0.0);
@@ -1679,6 +1688,62 @@ fn present_virtual_drafts_dialog(
                 });
             });
         }
+        let discard = gtk::Button::with_label("Удалить черновик…");
+        row.append(&discard);
+        let discard_parent = parent.clone();
+        let discard_name = name.to_owned();
+        let discard_drive_id = draft.drive_id.clone();
+        let discard_item_id = draft.item_id.clone();
+        let discard_result = result.clone();
+        let discard_rows = rows.clone();
+        let discard_row = row.clone();
+        let discard_controls = controls.clone();
+        discard.connect_clicked(move |button| {
+            let confirmation = gtk::AlertDialog::builder()
+                .message(format!("Удалить локальный черновик «{discard_name}»?"))
+                .detail("Локальные изменения будут удалены без возможности восстановления. Файл в OneDrive не удаляется. Если результат прежней отправки неизвестен, облачная копия уже может существовать. При необходимости сначала сохраните локальную копию.")
+                .build();
+            confirmation.set_buttons(&["Отмена", "Удалить черновик"]);
+            confirmation.set_cancel_button(0);
+            confirmation.set_default_button(0);
+            let button = button.clone();
+            let result = discard_result.clone();
+            let rows = discard_rows.clone();
+            let row = discard_row.clone();
+            let controls = discard_controls.clone();
+            let drive_id = discard_drive_id.clone();
+            let item_id = discard_item_id.clone();
+            confirmation.choose(Some(&discard_parent), None::<&gio::Cancellable>, move |response| {
+                if !matches!(response, Ok(1)) {
+                    return;
+                }
+                button.set_sensitive(false);
+                result.set_text("Удаление локального черновика…");
+                let (sender, receiver) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    let _ = sender.send(discard_virtual_draft(&drive_id, &item_id));
+                });
+                gtk::glib::timeout_add_local(Duration::from_millis(100), move || {
+                    match receiver.try_recv() {
+                        Ok(Ok(())) => {
+                            rows.remove(&row);
+                            result.set_text("Локальный черновик удалён. Облачный файл не изменён.");
+                            controls.refresh();
+                        }
+                        Ok(Err(error)) => {
+                            result.set_text(&format!("Не удалось удалить черновик: {error}"));
+                            button.set_sensitive(true);
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Empty) => return gtk::glib::ControlFlow::Continue,
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            result.set_text("Не удалось получить результат удаления");
+                            button.set_sensitive(true);
+                        }
+                    }
+                    gtk::glib::ControlFlow::Break
+                });
+            });
+        });
         if upload_enabled && matches!(draft.status.as_str(), "ready" | "ready-new") {
             let send = gtk::Button::with_label("Отправить в OneDrive");
             row.append(&send);

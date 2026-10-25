@@ -111,6 +111,10 @@ impl Drop for OpeningFile {
 }
 
 impl PublishedVersionController {
+    pub fn drive_id(&self) -> &str {
+        &self.drive_id
+    }
+
     /// Reserve an idle existing file until its uploaded draft is acknowledged.
     pub fn try_begin_existing(
         &self,
@@ -288,6 +292,29 @@ impl PublishedVersionController {
         node.item_id = remote_id.to_owned();
         node.etag = Some(etag);
         node.size = size;
+        Ok(())
+    }
+
+    /// Hide an explicitly discarded local-only file from the live mount.
+    pub fn discard_new(&self, lease: &PublicationLease, local_id: &str) -> io::Result<()> {
+        let inode = crate::stable_inode(&self.drive_id, local_id);
+        if !local_id.starts_with("local:")
+            || lease.inode != inode
+            || !Arc::ptr_eq(&lease.operations, &self.operations)
+        {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        let _serialized = self.open_lock.lock().unwrap();
+        let mut local = self.local_files.lock().unwrap();
+        if local
+            .get(&inode)
+            .is_none_or(|node| node.item_id != local_id || node.kind != NodeKind::File)
+            || !self.operations.lock().unwrap().active.contains(&inode)
+        {
+            return Err(io::ErrorKind::WouldBlock.into());
+        }
+        local.remove(&inode);
+        self.versions.lock().unwrap().remove(&inode);
         Ok(())
     }
 
@@ -3372,6 +3399,42 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|mutation| mutation.item_id == "remote-second")
+        );
+    }
+
+    #[test]
+    fn explicitly_discarded_new_draft_disappears_from_live_mount() {
+        let dir = tempfile::tempdir().unwrap();
+        let draft_root = dir.path().join("drafts");
+        let tree = VirtualTree::from_items("drive", "root", []).unwrap();
+        let fuse = VirtualFuse::new_writable(
+            tree,
+            dir.path().join("cache"),
+            draft_root.clone(),
+            20,
+            Arc::new(|_| panic!("discard must not download")),
+        );
+        let (local, handle) = fuse
+            .create_file(ROOT_INODE, "discard.txt", OpenFlags(libc::O_RDWR))
+            .unwrap();
+        let controller = fuse.published_version_controller();
+        assert!(controller.try_begin_new("drive", &local.item_id).is_err());
+        fuse.files.lock().unwrap().remove(&handle);
+        let lease = controller.try_begin_new("drive", &local.item_id).unwrap();
+        let store = DraftStore::open(&draft_root).unwrap();
+        let draft = store
+            .recover_item("drive", &local.item_id)
+            .unwrap()
+            .unwrap();
+        store.discard(draft.identity()).unwrap();
+        controller.discard_new(&lease, &local.item_id).unwrap();
+        assert!(fuse.lookup_node(ROOT_INODE, "discard.txt").is_none());
+        assert!(
+            DraftStore::open(&draft_root)
+                .unwrap()
+                .list()
+                .unwrap()
+                .is_empty()
         );
     }
 

@@ -1014,6 +1014,94 @@ impl Daemon {
         .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))
     }
 
+    /// Explicitly discard local changes; the cloud file is not deleted.
+    async fn discard_virtual_draft(
+        &self,
+        drive_id: String,
+        item_id: String,
+    ) -> zbus::fdo::Result<()> {
+        if drive_id.is_empty()
+            || item_id.is_empty()
+            || self.mount_in_progress.load(Ordering::SeqCst)
+        {
+            return Err(zbus::fdo::Error::Failed(
+                "invalid draft or mount is starting".into(),
+            ));
+        }
+        if self
+            .upload_in_progress
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Err(zbus::fdo::Error::Failed(
+                "wait for the active upload to finish".into(),
+            ));
+        }
+        let _busy = BusyFlagGuard(Arc::clone(&self.upload_in_progress));
+        let root = state_directory()
+            .map_err(|_| zbus::fdo::Error::Failed("cannot access draft directory".into()))?
+            .join("virtual-drafts");
+        let identity = DraftStore::open(&root)
+            .and_then(|store| store.recover_item(&drive_id, &item_id))
+            .map_err(|_| zbus::fdo::Error::Failed("cannot read draft".into()))?
+            .ok_or_else(|| zbus::fdo::Error::Failed("draft is missing".into()))?
+            .identity()
+            .clone();
+        let controller = self
+            .virtual_mount
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|mounted| mounted.published_versions.clone())
+            .filter(|controller| controller.drive_id() == drive_id);
+        let publication = controller
+            .as_ref()
+            .map(|controller| {
+                if identity.new_file.is_some() {
+                    controller.try_begin_new(&drive_id, &item_id)
+                } else {
+                    controller.try_begin_existing(&drive_id, &item_id)
+                }
+            })
+            .transpose()
+            .map_err(|_| {
+                zbus::fdo::Error::Failed(
+                    "close the virtual file before discarding its draft".into(),
+                )
+            })?;
+        let cloud_version = if identity.new_file.is_none() {
+            self.catalog
+                .lock()
+                .unwrap()
+                .item(&drive_id, &item_id)
+                .ok()
+                .flatten()
+                .and_then(|item| {
+                    (!item.deleted && item.kind == "file")
+                        .then(|| Some((item.etag?, u64::try_from(item.size?).ok()?)))
+                        .flatten()
+                })
+        } else {
+            None
+        };
+        tokio::task::spawn_blocking(move || DraftStore::open(&root)?.discard(&identity))
+            .await
+            .map_err(|_| zbus::fdo::Error::Failed("draft discard task failed".into()))?
+            .map_err(|error| zbus::fdo::Error::Failed(format!("cannot discard draft: {error}")))?;
+        if let (Some(controller), Some(lease)) = (&controller, &publication) {
+            if item_id.starts_with("local:") {
+                controller.discard_new(lease, &item_id).map_err(|_| {
+                    zbus::fdo::Error::Failed(
+                        "draft removed; remount the virtual drive to refresh its view".into(),
+                    )
+                })?;
+            } else if let Some((etag, size)) = cloud_version {
+                controller.publish_existing(&item_id, etag, size);
+            }
+        }
+        Ok(())
+    }
+
     /// Explicit transfer of one virtual-drive draft.
     async fn run_virtual_draft_upload(&self, item_id: String) -> zbus::fdo::Result<String> {
         if item_id.is_empty() || self.sync_paused()? {
