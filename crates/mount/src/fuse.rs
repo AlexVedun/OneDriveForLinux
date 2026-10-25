@@ -4717,6 +4717,80 @@ mod tests {
     }
 
     #[test]
+    fn repeated_editor_replace_waits_for_open_local_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        let draft_root = dir.path().join("drafts");
+        let fuse = VirtualFuse::new_writable(
+            VirtualTree::from_items("drive", "root", [file_item()]).unwrap(),
+            dir.path().join("cache"),
+            draft_root.clone(),
+            20,
+            Arc::new(|_| panic!("no download expected")),
+        );
+        let (first, first_handle) = fuse
+            .create_file(ROOT_INODE, "first.tmp", OpenFlags(libc::O_RDWR))
+            .unwrap();
+        fuse.write_file(first.inode, first_handle, 0, b"first")
+            .unwrap();
+        fuse.rename_local_file(
+            ROOT_INODE,
+            "first.tmp",
+            ROOT_INODE,
+            "текст.txt",
+            fuser::RenameFlags::empty(),
+        )
+        .unwrap();
+        let (second, second_handle) = fuse
+            .create_file(ROOT_INODE, "second.tmp", OpenFlags(libc::O_RDWR))
+            .unwrap();
+        fuse.write_file(second.inode, second_handle, 0, b"second")
+            .unwrap();
+        assert_eq!(
+            fuse.rename_local_file(
+                ROOT_INODE,
+                "second.tmp",
+                ROOT_INODE,
+                "текст.txt",
+                fuser::RenameFlags::empty(),
+            ),
+            Err(Errno::EBUSY)
+        );
+        fuse.write_file(first.inode, first_handle, 5, b"!").unwrap();
+        assert_eq!(
+            fuse.read_file(first.inode, first_handle, 0, 6).unwrap(),
+            b"first!"
+        );
+        fuse.close_file(first.inode, first_handle);
+        fuse.rename_local_file(
+            ROOT_INODE,
+            "second.tmp",
+            ROOT_INODE,
+            "текст.txt",
+            fuser::RenameFlags::empty(),
+        )
+        .unwrap();
+        assert!(fuse.lookup_node(ROOT_INODE, "first.tmp").is_none());
+        assert!(fuse.lookup_node(ROOT_INODE, "second.tmp").is_none());
+        assert_eq!(
+            fuse.lookup_node(ROOT_INODE, "текст.txt").unwrap().inode,
+            second.inode
+        );
+        assert_eq!(
+            fuse.read_file(second.inode, second_handle, 0, 6).unwrap(),
+            b"second"
+        );
+        fuse.close_file(second.inode, second_handle);
+        let store = DraftStore::open(&draft_root).unwrap();
+        let drafts = store.list().unwrap();
+        assert_eq!(drafts.len(), 1);
+        assert_eq!(drafts[0].item_id, "file");
+        let draft = store.recover(&drafts[0]).unwrap().unwrap();
+        let mut bytes = [0; 6];
+        assert_eq!(draft.read_at(0, &mut bytes).unwrap(), 6);
+        assert_eq!(&bytes, b"second");
+    }
+
+    #[test]
     fn resized_editor_replacement_survives_remount() {
         let dir = tempfile::tempdir().unwrap();
         let draft_root = dir.path().join("drafts");
