@@ -2068,11 +2068,12 @@ impl VirtualFuse {
         }
     }
 
-    fn sync_directory(&self, inode: u64) -> Result<(), Errno> {
+    fn sync_directory(&self, inode: u64, handle: u64) -> Result<(), Errno> {
         let node = self.node(inode).ok_or(Errno::ENOENT)?;
         if node.kind != NodeKind::Directory {
             return Err(Errno::ENOTDIR);
         }
+        self.directory_entries_for_handle(inode, handle)?;
         if let Some(root) = &self.draft_root {
             File::open(root)
                 .and_then(|directory| directory.sync_all())
@@ -2841,11 +2842,11 @@ impl Filesystem for VirtualFuse {
         &self,
         _request: &Request,
         inode: INodeNo,
-        _handle: FileHandle,
+        handle: FileHandle,
         _datasync: bool,
         reply: ReplyEmpty,
     ) {
-        match self.sync_directory(inode.0) {
+        match self.sync_directory(inode.0, handle.0) {
             Ok(()) => reply.ok(),
             Err(error) => reply.error(error),
         }
@@ -2926,10 +2927,25 @@ mod tests {
         assert!(space.block_size > 0);
         assert!(space.available_blocks <= space.free_blocks);
         assert!(space.free_blocks <= space.blocks);
-        assert_eq!(fuse.sync_directory(ROOT_INODE), Ok(()));
+        let handle = fuse.open_directory(ROOT_INODE).unwrap();
+        assert_eq!(fuse.sync_directory(ROOT_INODE, handle), Ok(()));
+        assert_eq!(
+            fuse.sync_directory(ROOT_INODE, handle + 1),
+            Err(Errno::EBADF)
+        );
+        let subdirectory = fuse.create_directory(ROOT_INODE, "sub").unwrap();
+        let other_handle = fuse.open_directory(subdirectory.inode).unwrap();
+        assert_eq!(
+            fuse.sync_directory(ROOT_INODE, other_handle),
+            Err(Errno::EBADF)
+        );
+        fuse.close_directory(subdirectory.inode, other_handle)
+            .unwrap();
         let file_inode = fuse.lookup_node(ROOT_INODE, "текст.txt").unwrap().inode;
-        assert_eq!(fuse.sync_directory(file_inode), Err(Errno::ENOTDIR));
-        assert_eq!(fuse.sync_directory(u64::MAX), Err(Errno::ENOENT));
+        assert_eq!(fuse.sync_directory(file_inode, handle), Err(Errno::ENOTDIR));
+        assert_eq!(fuse.sync_directory(u64::MAX, handle), Err(Errno::ENOENT));
+        fuse.close_directory(ROOT_INODE, handle).unwrap();
+        assert_eq!(fuse.sync_directory(ROOT_INODE, handle), Err(Errno::EBADF));
     }
 
     #[test]
