@@ -421,7 +421,7 @@ fn virtual_directories_text(directories: &[UiVirtualDirectory]) -> String {
         return String::new();
     }
     let mut text = format!(
-        "Новые папки: {pending} ожидают отправки, {waiting} ждут родителя, {verifying} ждут проверки в OneDrive, {uploaded} созданы в OneDrive, {} требуют сверки.",
+        "Папки: {pending} к отправке · {waiting} ждут родителя · {verifying} проверяются · {uploaded} созданы · {} требуют сверки.",
         issues.len()
     );
     if let Some(issue) = issues.first() {
@@ -430,7 +430,7 @@ fn virtual_directories_text(directories: &[UiVirtualDirectory]) -> String {
         } else {
             "родитель не найден"
         };
-        text.push_str(&format!(" Папка «{}»: {reason}.", issue.name));
+        text.push_str(&format!("\n• Папка «{}»: {reason}.", issue.name));
     }
     text
 }
@@ -473,14 +473,13 @@ fn virtual_mutations_text(mutations: &[UiVirtualMutation]) -> String {
         .iter()
         .filter(|item| item.status == "pending" && item.kind == "delete")
         .count();
-    let mut text = format!(
-        "Операции с облачными объектами: {pending} ожидают, {applied} выполнены, {conflicts} требуют сверки."
-    );
+    let mut text =
+        format!("Операции: {pending} ожидают · {applied} выполнены · {conflicts} требуют сверки.");
     if deletes > 10 {
-        text.push_str(" Массовое удаление приостановлено.");
+        text.push_str("\n• Массовое удаление приостановлено.");
     }
     if let Some(issue) = mutations.iter().find(|item| item.status == "conflict") {
-        text.push_str(&format!(" Конфликт: {}.", issue.name));
+        text.push_str(&format!("\n• Конфликт: {}.", issue.name));
     }
     text
 }
@@ -576,7 +575,7 @@ fn virtual_drafts_text(drafts: &[UiVirtualDraft]) -> String {
         .filter(|draft| draft.last_upload_issue.is_some())
         .count();
     let mut lines = vec![format!(
-        "Локально сохранено: {} · требуют внимания: {attention} · ошибки отправки: {failed}. Откройте полный список для проверки.",
+        "Черновики: {} · требуют внимания: {attention} · ошибки отправки: {failed}.\nОткройте полный список для проверки.",
         drafts.len()
     )];
     for draft in drafts
@@ -587,7 +586,7 @@ fn virtual_drafts_text(drafts: &[UiVirtualDraft]) -> String {
     {
         let name = draft.name.as_deref().unwrap_or(&draft.item_id);
         lines.push(format!(
-            "{name} ({}) — {}",
+            "• {name} ({}) — {}",
             draft.drive_id,
             virtual_draft_status_label(&draft.status)
         ));
@@ -597,7 +596,7 @@ fn virtual_drafts_text(drafts: &[UiVirtualDraft]) -> String {
                 .map(|status| format!(" (HTTP {status})"))
                 .unwrap_or_default();
             lines.push(format!(
-                "Предыдущая фоновая отправка: {}{http_status}",
+                "  Предыдущая фоновая отправка: {}{http_status}",
                 virtual_draft_upload_issue_label(issue),
             ));
         }
@@ -642,12 +641,6 @@ fn unmount_virtual_drive() -> zbus::Result<()> {
     daemon_call("UnmountVirtualDrive")
 }
 
-fn read_virtual_file_cache_status(item_id: &str) -> zbus::Result<String> {
-    let connection = zbus::blocking::Connection::session()?;
-    let proxy = zbus::blocking::Proxy::new(&connection, BUS_NAME, OBJECT_PATH, INTERFACE_NAME)?;
-    proxy.call("VirtualFileCacheStatus", &(item_id))
-}
-
 fn set_virtual_file_pinned(item_id: &str, pinned: bool) -> zbus::Result<String> {
     let connection = zbus::blocking::Connection::session()?;
     let proxy = zbus::blocking::Proxy::new(&connection, BUS_NAME, OBJECT_PATH, INTERFACE_NAME)?;
@@ -662,6 +655,10 @@ fn set_virtual_cache_limit(bytes: u64) -> zbus::Result<(u64, u64)> {
     let connection = zbus::blocking::Connection::session()?;
     let proxy = zbus::blocking::Proxy::new(&connection, BUS_NAME, OBJECT_PATH, INTERFACE_NAME)?;
     proxy.call("SetVirtualCacheLimit", &(bytes))
+}
+
+fn clear_virtual_cache() -> zbus::Result<(u64, u64)> {
+    daemon_call("ClearVirtualCache")
 }
 
 const GIB: u64 = 1024 * 1024 * 1024;
@@ -779,118 +776,19 @@ impl VirtualCacheControls {
             gtk::glib::ControlFlow::Break
         });
     }
-}
 
-#[derive(Clone)]
-struct OfflineControls {
-    label: gtk::Label,
-    button: gtk::Button,
-    selected: Rc<RefCell<Option<String>>>,
-    state: Rc<RefCell<Option<String>>>,
-    generation: Rc<Cell<u64>>,
-    busy: Rc<Cell<bool>>,
-}
-
-impl OfflineControls {
-    fn new(label: &gtk::Label, button: &gtk::Button) -> Self {
-        Self {
-            label: label.clone(),
-            button: button.clone(),
-            selected: Rc::new(RefCell::new(None)),
-            state: Rc::new(RefCell::new(None)),
-            generation: Rc::new(Cell::new(0)),
-            busy: Rc::new(Cell::new(false)),
-        }
-    }
-
-    fn show_state(&self, state: &str) {
-        self.state.replace(Some(state.to_owned()));
-        self.label.set_text(match state {
-            "missing" => "Выбранный файл: ещё не сохранён локально",
-            "cached" => "Выбранный файл: в кэше, может быть удалён при очистке",
-            "pinned" => "Выбранный файл: доступен офлайн",
-            _ => "Не удалось определить состояние файла",
-        });
-        self.button.set_label(if state == "pinned" {
-            "Снять закрепление"
-        } else {
-            "Сохранить выбранный файл офлайн"
-        });
-        self.button
-            .set_sensitive(matches!(state, "missing" | "cached" | "pinned"));
-    }
-
-    fn set_selected(&self, item_id: Option<String>) {
-        self.selected.replace(item_id);
-        self.state.replace(None);
-        self.generation.set(self.generation.get().wrapping_add(1));
-        self.button.set_sensitive(false);
-        self.label.set_text(if self.selected.borrow().is_some() {
-            "Выбранный файл: проверка кэша…"
-        } else {
-            "Выберите файл для доступа офлайн"
-        });
-        self.refresh();
-    }
-
-    fn refresh(&self) {
-        if self.busy.get() {
-            return;
-        }
-        let Some(item_id) = self.selected.borrow().clone() else {
-            return;
-        };
-        let generation = self.generation.get();
-        let (sender, receiver) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = sender.send(read_virtual_file_cache_status(&item_id));
-        });
-        let controls = self.clone();
-        gtk::glib::timeout_add_local(Duration::from_millis(100), move || {
-            let result = match receiver.try_recv() {
-                Ok(result) => result,
-                Err(std::sync::mpsc::TryRecvError::Empty) => {
-                    return gtk::glib::ControlFlow::Continue;
-                }
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    if controls.generation.get() == generation {
-                        controls.label.set_text("Не удалось проверить кэш");
-                    }
-                    return gtk::glib::ControlFlow::Break;
-                }
-            };
-            if controls.generation.get() == generation {
-                match result {
-                    Ok(state) => controls.show_state(&state),
-                    Err(error) => controls.label.set_text(&format!("Кэш недоступен: {error}")),
-                }
-            }
-            gtk::glib::ControlFlow::Break
-        });
-    }
-
-    fn toggle(&self, status: &gtk::Label) {
+    fn clear(&self, button: &gtk::Button, status: &gtk::Label) {
         if self.busy.replace(true) {
             return;
         }
-        let Some(item_id) = self.selected.borrow().clone() else {
-            self.busy.set(false);
-            return;
-        };
-        let pinned = self.state.borrow().as_deref() != Some("pinned");
-        self.generation.set(self.generation.get().wrapping_add(1));
-        self.button.set_sensitive(false);
-        status.set_text(if pinned {
-            "Сохранение файла для доступа офлайн…"
-        } else {
-            "Снятие закрепления файла…"
-        });
-        let selected_id = item_id.clone();
+        button.set_sensitive(false);
+        status.set_text("Очистка кэша…");
         let (sender, receiver) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let _ = sender.send(set_virtual_file_pinned(&item_id, pinned));
+            let _ = sender.send(clear_virtual_cache());
         });
         let controls = self.clone();
+        let button = button.clone();
         let status = status.clone();
         gtk::glib::timeout_add_local(Duration::from_millis(100), move || {
             let result = match receiver.try_recv() {
@@ -899,31 +797,27 @@ impl OfflineControls {
                     return gtk::glib::ControlFlow::Continue;
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    status.set_text("Не удалось очистить кэш");
+                    button.set_sensitive(true);
                     controls.busy.set(false);
-                    controls.refresh();
-                    status.set_text("Не удалось изменить доступность файла офлайн");
                     return gtk::glib::ControlFlow::Break;
                 }
             };
-            controls.busy.set(false);
             match result {
-                Ok(state) => {
-                    if controls.selected.borrow().as_deref() == Some(selected_id.as_str()) {
-                        controls.show_state(&state);
-                    } else {
-                        controls.refresh();
-                    }
-                    status.set_text(if pinned {
-                        "Файл сохранён для доступа офлайн"
-                    } else {
-                        "Закрепление файла снято"
-                    });
+                Ok((cleared, _)) => {
+                    status.set_text(&format!(
+                        "Кэш очищен: освобождено {:.1} МиБ. Офлайн-файлы сохранены.",
+                        cleared as f64 / (1024 * 1024) as f64
+                    ));
+                    controls.busy.set(false);
+                    controls.refresh();
                 }
                 Err(error) => {
-                    controls.refresh();
-                    status.set_text(&format!("Не удалось изменить доступность офлайн: {error}"));
+                    status.set_text(&format!("Не удалось очистить кэш: {error}"));
+                    controls.busy.set(false);
                 }
             }
+            button.set_sensitive(true);
             gtk::glib::ControlFlow::Break
         });
     }
@@ -986,14 +880,14 @@ impl VirtualMountControls {
                 if let Ok(mutations) = mutations {
                     let summary = virtual_mutations_text(&mutations);
                     if !summary.is_empty() {
-                        text.push('\n');
+                        text.push_str("\n\n");
                         text.push_str(&summary);
                     }
                 }
                 if let Ok(directories) = directories {
                     let summary = virtual_directories_text(&directories);
                     if !summary.is_empty() {
-                        text.push('\n');
+                        text.push_str("\n\n");
                         text.push_str(&summary);
                     }
                 }
@@ -1942,6 +1836,208 @@ fn refresh_view(
     }
 }
 
+fn add_button_action(app: &adw::Application, name: &str, button: &gtk::Button) {
+    let action = gio::SimpleAction::new(name, None);
+    action.set_enabled(button.is_sensitive());
+    let target = button.clone();
+    action.connect_activate(move |_, _| {
+        if target.is_sensitive() {
+            target.emit_clicked();
+        }
+    });
+    let action_for_sensitivity = action.clone();
+    button.connect_notify_local(Some("sensitive"), move |button, _| {
+        action_for_sensitivity.set_enabled(button.is_sensitive());
+    });
+    app.add_action(&action);
+}
+
+fn offline_file_ids(items: &[UiItem], selected: &HashSet<String>) -> Vec<String> {
+    let active: HashMap<&str, &UiItem> = items
+        .iter()
+        .filter(|item| !item.deleted)
+        .map(|item| (item.item_id.as_str(), item))
+        .collect();
+    items
+        .iter()
+        .filter(|item| item.kind == "file" && !item.deleted)
+        .filter(|item| {
+            let mut current = Some(item.item_id.as_str());
+            let mut visited = HashSet::new();
+            while let Some(id) = current {
+                if selected.contains(id) {
+                    return true;
+                }
+                if !visited.insert(id) {
+                    break;
+                }
+                current = active.get(id).and_then(|entry| entry.parent_id.as_deref());
+            }
+            false
+        })
+        .map(|item| item.item_id.clone())
+        .collect()
+}
+
+fn run_offline_batch(
+    items: &[UiItem],
+    selected: &Rc<RefCell<HashSet<String>>>,
+    pinned: bool,
+    pin_button: &gtk::Button,
+    unpin_button: &gtk::Button,
+    result: &gtk::Label,
+    cache: &VirtualCacheControls,
+) {
+    let ids = offline_file_ids(items, &selected.borrow());
+    if ids.is_empty() {
+        result.set_text("Выберите хотя бы один файл или папку с файлами");
+        return;
+    }
+    pin_button.set_sensitive(false);
+    unpin_button.set_sensitive(false);
+    result.set_text(&format!("Обработка файлов: {}…", ids.len()));
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut succeeded = 0;
+        let mut failed = 0;
+        let mut first_error = None;
+        for id in ids {
+            match set_virtual_file_pinned(&id, pinned) {
+                Ok(_) => succeeded += 1,
+                Err(error) => {
+                    failed += 1;
+                    if first_error.is_none() {
+                        first_error = Some(error.to_string());
+                    }
+                }
+            }
+        }
+        let _ = sender.send((succeeded, failed, first_error));
+    });
+    let result = result.clone();
+    let pin_button = pin_button.clone();
+    let unpin_button = unpin_button.clone();
+    let cache = cache.clone();
+    gtk::glib::timeout_add_local(Duration::from_millis(100), move || {
+        match receiver.try_recv() {
+            Ok((succeeded, failed, first_error)) => {
+                let action = if pinned {
+                    "Закреплено"
+                } else {
+                    "Откреплено"
+                };
+                let error =
+                    first_error.map_or(String::new(), |error| format!(". Первая ошибка: {error}"));
+                result.set_text(&format!("{action}: {succeeded}; ошибок: {failed}{error}"));
+                pin_button.set_sensitive(true);
+                unpin_button.set_sensitive(true);
+                cache.refresh();
+                gtk::glib::ControlFlow::Break
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                result.set_text("Не удалось завершить обработку файлов");
+                pin_button.set_sensitive(true);
+                unpin_button.set_sensitive(true);
+                gtk::glib::ControlFlow::Break
+            }
+        }
+    });
+}
+
+fn present_offline_dialog(
+    parent: &adw::ApplicationWindow,
+    items: Vec<UiItem>,
+    cache: &VirtualCacheControls,
+) {
+    let selected = Rc::new(RefCell::new(HashSet::<String>::new()));
+    let tree = gtk::Box::new(gtk::Orientation::Vertical, 3);
+    let mut parents = vec![tree.clone()];
+    for (depth, item) in flatten_tree(items.clone()) {
+        if item.kind != "file" && item.kind != "folder" {
+            continue;
+        }
+        parents.truncate(depth + 1);
+        let Some(container) = parents.last() else {
+            continue;
+        };
+        let check = gtk::CheckButton::with_label(&format!(
+            "{} {}",
+            if item.kind == "folder" {
+                "📁"
+            } else {
+                "📄"
+            },
+            item.name.as_deref().unwrap_or(&item.item_id)
+        ));
+        let id = item.item_id.clone();
+        let selected_for_check = Rc::clone(&selected);
+        check.connect_toggled(move |check| {
+            if check.is_active() {
+                selected_for_check.borrow_mut().insert(id.clone());
+            } else {
+                selected_for_check.borrow_mut().remove(&id);
+            }
+        });
+        if item.kind == "folder" {
+            let expander = gtk::Expander::new(None);
+            expander.set_label_widget(Some(&check));
+            expander.set_expanded(false);
+            let children = gtk::Box::new(gtk::Orientation::Vertical, 3);
+            children.set_margin_start(20);
+            expander.set_child(Some(&children));
+            container.append(&expander);
+            parents.push(children);
+        } else {
+            container.append(&check);
+        }
+    }
+    let body = gtk::Box::new(gtk::Orientation::Vertical, 10);
+    body.set_margin_start(16);
+    body.set_margin_end(16);
+    body.set_margin_top(16);
+    body.set_margin_bottom(16);
+    body.append(&gtk::Label::builder().label("Отметьте несколько файлов или папок. Выбранная папка включает все вложенные файлы. Дерево раскрывается стрелкой.").xalign(0.0).wrap(true).build());
+    body.append(
+        &gtk::ScrolledWindow::builder()
+            .child(&tree)
+            .vexpand(true)
+            .build(),
+    );
+    let result = gtk::Label::new(Some(
+        "Выбранные файлы сохраняются в кэше для работы без сети",
+    ));
+    result.set_xalign(0.0);
+    result.set_wrap(true);
+    body.append(&result);
+    let actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    let pin = gtk::Button::with_label("Сохранить офлайн");
+    let unpin = gtk::Button::with_label("Снять закрепление");
+    actions.append(&pin);
+    actions.append(&unpin);
+    body.append(&actions);
+    let dialog = gtk::Window::builder()
+        .transient_for(parent)
+        .modal(true)
+        .title("Офлайн-доступ к файлам")
+        .default_width(620)
+        .default_height(560)
+        .child(&body)
+        .build();
+    for (button, pinned) in [(&pin, true), (&unpin, false)] {
+        let items = items.clone();
+        let selected = Rc::clone(&selected);
+        let pin = pin.clone();
+        let unpin = unpin.clone();
+        let result = result.clone();
+        let cache = cache.clone();
+        button.connect_clicked(move |_| {
+            run_offline_batch(&items, &selected, pinned, &pin, &unpin, &result, &cache);
+        });
+    }
+    dialog.present();
+}
+
 fn main() {
     let app = adw::Application::builder()
         .application_id("io.github.onedrive_linux.Desktop")
@@ -1967,10 +2063,6 @@ fn main() {
         status.set_wrap(true);
         let list = gtk::ListBox::new();
         list.set_selection_mode(gtk::SelectionMode::Single);
-        let scroll = gtk::ScrolledWindow::builder()
-            .child(&list)
-            .vexpand(true)
-            .build();
         let login = gtk::Button::with_label("Войти через Microsoft");
         let status_after_login = status.clone();
         login.connect_clicked(move |_| {
@@ -2050,16 +2142,6 @@ fn main() {
         drafts_label.set_wrap(true);
         let mount_controls =
             VirtualMountControls::new(&mount_label, &fuse_label, &drafts_label, &mount, &unmount);
-        let offline_label = gtk::Label::new(Some("Выберите файл для доступа офлайн"));
-        offline_label.set_xalign(0.0);
-        offline_label.set_wrap(true);
-        let offline_button = gtk::Button::with_label("Сохранить выбранный файл офлайн");
-        offline_button.set_sensitive(false);
-        let offline_controls = OfflineControls::new(&offline_label, &offline_button);
-        let offline_for_selection = offline_controls.clone();
-        list.connect_row_selected(move |_, row| {
-            offline_for_selection.set_selected(row.map(|row| row.widget_name().to_string()));
-        });
         let cache_label = gtk::Label::new(Some("Кэш: проверка состояния…"));
         cache_label.set_xalign(0.0);
         let cache_size = gtk::SpinButton::with_range(0.25, 64.0, 0.25);
@@ -2068,53 +2150,92 @@ fn main() {
         let cache_apply = gtk::Button::with_label("Сохранить лимит кэша");
         cache_apply.set_sensitive(false);
         let cache_controls = VirtualCacheControls::new(&cache_label, &cache_size, &cache_apply);
+        let cache_clear = gtk::Button::with_label("Очистить кэш");
+        cache_clear.set_tooltip_text(Some("Удалить временные копии; офлайн-файлы и локальные черновики сохранятся"));
         let exit = gtk::Button::with_label("Выход");
-        let controls = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-        controls.append(&login);
-        controls.append(&scan);
-        controls.append(&reload);
-        controls.append(&download);
-        let sync_controls = gtk::Box::new(gtk::Orientation::Vertical, 6);
-        let sync_setup = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-        sync_setup.append(&choose_sync);
-        sync_setup.append(&preview_sync);
-        sync_setup.append(&exit);
-        let sync_actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-        sync_actions.append(&review);
-        sync_actions.append(&history);
-        sync_actions.append(&pause);
-        sync_controls.append(&sync_setup);
-        sync_controls.append(&sync_actions);
-        let virtual_controls = gtk::Box::new(gtk::Orientation::Vertical, 6);
-        virtual_controls.append(&mount_label);
-        virtual_controls.append(&fuse_label);
-        virtual_controls.append(&drafts_label);
-        let virtual_actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-        virtual_actions.append(&mount);
-        virtual_actions.append(&unmount);
-        virtual_actions.append(&show_drafts);
-        virtual_controls.append(&virtual_actions);
-        virtual_controls.append(&show_mutation_conflicts);
-        virtual_controls.append(&confirm_deletes);
-        virtual_controls.append(&offline_label);
-        virtual_controls.append(&offline_button);
-        virtual_controls.append(&cache_label);
+        let account_menu = gio::Menu::new();
+        account_menu.append(Some("Войти через Microsoft"), Some("app.login"));
+        account_menu.append(Some("Выход"), Some("app.quit"));
+        let sync_menu = gio::Menu::new();
+        for (label, action) in [
+            ("Проверить OneDrive", "app.refresh"),
+            ("Обновить список", "app.reload"),
+            ("Скачать выбранный файл", "app.download"),
+            ("Папка синхронизации", "app.choose-sync"),
+            ("Открыть папку синхронизации", "app.open-sync-folder"),
+            ("План синхронизации", "app.preview-sync"),
+            ("Рассмотреть изменения", "app.review"),
+            ("Очередь и история", "app.history"),
+            ("Приостановить / возобновить", "app.toggle-pause"),
+        ] {
+            sync_menu.append(Some(label), Some(action));
+        }
+        let virtual_menu = gio::Menu::new();
+        for (label, action) in [
+            ("Подключить диск", "app.mount"),
+            ("Отключить диск", "app.unmount"),
+            ("Локальные изменения", "app.show-drafts"),
+            ("Конфликты", "app.mutation-conflicts"),
+            ("Подтвердить массовое удаление", "app.confirm-deletes"),
+            ("Выбрать файлы для офлайн-доступа", "app.offline-files"),
+            ("Сохранить лимит кэша", "app.cache-limit"),
+        ] {
+            virtual_menu.append(Some(label), Some(action));
+        }
+        let menu = gio::Menu::new();
+        menu.append_submenu(Some("Аккаунт"), &account_menu);
+        menu.append_submenu(Some("Синхронизация"), &sync_menu);
+        menu.append_submenu(Some("Виртуальный диск"), &virtual_menu);
+        let menu_bar = gtk::PopoverMenuBar::from_model(Some(&menu));
+        let account_status = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        account_status.set_margin_start(12);
+        account_status.set_margin_end(12);
+        account_status.set_margin_top(12);
+        account_status.set_margin_bottom(12);
+        account_status.append(&gtk::Label::builder().label("Состояние OneDrive").xalign(0.0).css_classes(["heading"]).build());
+        account_status.append(&engine_status);
+        account_status.append(&gtk::Label::builder().label("Последнее действие").xalign(0.0).css_classes(["heading"]).build());
+        account_status.append(&status);
+        let account_frame = gtk::Frame::new(None);
+        account_frame.set_child(Some(&account_status));
+        let virtual_status = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        virtual_status.set_margin_start(12);
+        virtual_status.set_margin_end(12);
+        virtual_status.set_margin_top(12);
+        virtual_status.set_margin_bottom(12);
+        virtual_status.append(&gtk::Label::builder().label("Виртуальный диск").xalign(0.0).css_classes(["heading"]).build());
+        virtual_status.append(&mount_label);
+        virtual_status.append(&fuse_label);
+        virtual_status.append(&gtk::Label::builder().label("Локальные изменения и операции").xalign(0.0).css_classes(["heading"]).build());
+        virtual_status.append(&drafts_label);
+        let virtual_frame = gtk::Frame::new(None);
+        virtual_frame.set_child(Some(&virtual_status));
+        let cache_controls_box = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        cache_controls_box.set_margin_start(12);
+        cache_controls_box.set_margin_end(12);
+        cache_controls_box.set_margin_top(12);
+        cache_controls_box.set_margin_bottom(12);
+        cache_controls_box.append(&gtk::Label::builder().label("Офлайн-доступ и кэш").xalign(0.0).css_classes(["heading"]).build());
+        cache_controls_box.append(&gtk::Label::builder().label("Закреплённые файлы остаются доступными без сети. Выбор файлов и папок — в меню «Виртуальный диск».").xalign(0.0).wrap(true).build());
+        cache_controls_box.append(&cache_label);
         let cache_actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         cache_actions.append(&gtk::Label::new(Some("Лимит кэша (ГиБ):")));
         cache_actions.append(&cache_size);
-        cache_actions.append(&cache_apply);
-        virtual_controls.append(&cache_actions);
+        cache_actions.append(&cache_clear);
+        cache_controls_box.append(&cache_actions);
+        let cache_frame = gtk::Frame::new(None);
+        cache_frame.set_child(Some(&cache_controls_box));
         let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
         content.set_margin_start(18);
         content.set_margin_end(18);
         content.set_margin_top(18);
         content.set_margin_bottom(18);
-        content.append(&engine_status);
-        content.append(&status);
-        content.append(&controls);
-        content.append(&sync_controls);
-        content.append(&virtual_controls);
-        content.append(&scroll);
+        content.append(&menu_bar);
+        content.append(&account_frame);
+        content.append(&virtual_frame);
+        content.append(&cache_frame);
+        content.append(&gtk::Label::builder().label("Файлы OneDrive").xalign(0.0).css_classes(["heading"]).build());
+        content.append(&list);
         let title = app_title();
         let header = adw::HeaderBar::new();
         let title_label = gtk::Label::new(Some(&title));
@@ -2122,7 +2243,7 @@ fn main() {
         header.set_title_widget(Some(&title_label));
         let layout = gtk::Box::new(gtk::Orientation::Vertical, 0);
         layout.append(&header);
-        layout.append(&content);
+        layout.append(&gtk::ScrolledWindow::builder().child(&content).vexpand(true).build());
         let window = adw::ApplicationWindow::builder()
             .application(app)
             .title(&title)
@@ -2355,14 +2476,15 @@ fn main() {
                 gtk::glib::ControlFlow::Break
             });
         });
-        let status_for_offline = status.clone();
-        offline_button.connect_clicked(move |_| {
-            offline_controls.toggle(&status_for_offline);
-        });
         let status_for_cache = status.clone();
         let cache_for_apply = cache_controls.clone();
         cache_apply.connect_clicked(move |_| {
             cache_for_apply.apply(&status_for_cache);
+        });
+        let status_for_clear = status.clone();
+        let cache_for_clear = cache_controls.clone();
+        cache_clear.connect_clicked(move |button| {
+            cache_for_clear.clear(button, &status_for_clear);
         });
         let window_for_preview = window.clone();
         let status_for_preview = status.clone();
@@ -2528,18 +2650,23 @@ fn main() {
             });
         });
         for (name, button) in [
+            ("login", &login),
+            ("refresh", &scan),
+            ("reload", &reload),
+            ("download", &download),
+            ("choose-sync", &choose_sync),
+            ("preview-sync", &preview_sync),
+            ("review", &review),
             ("history", &history),
             ("toggle-pause", &pause),
-            ("refresh", &scan),
+            ("mount", &mount),
+            ("unmount", &unmount),
+            ("show-drafts", &show_drafts),
+            ("mutation-conflicts", &show_mutation_conflicts),
+            ("confirm-deletes", &confirm_deletes),
+            ("cache-limit", &cache_apply),
         ] {
-            let action = gio::SimpleAction::new(name, None);
-            let button = button.downgrade();
-            action.connect_activate(move |_, _| {
-                if let Some(button) = button.upgrade() {
-                    button.emit_clicked();
-                }
-            });
-            app.add_action(&action);
+            add_button_action(app, name, button);
         }
         let open_folder_action = gio::SimpleAction::new("open-sync-folder", None);
         let window_for_open = window.downgrade();
@@ -2583,6 +2710,46 @@ fn main() {
             });
         });
         app.add_action(&open_folder_action);
+        let offline_action = gio::SimpleAction::new("offline-files", None);
+        let window_for_offline = window.downgrade();
+        let status_for_offline = status.downgrade();
+        let cache_for_offline = cache_controls.clone();
+        offline_action.connect_activate(move |_, _| {
+            if let Some(status) = status_for_offline.upgrade() {
+                status.set_text("Загрузка дерева файлов для офлайн-доступа…");
+            }
+            let (sender, receiver) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = sender.send(read_catalog());
+            });
+            let window = window_for_offline.clone();
+            let status = status_for_offline.clone();
+            let cache = cache_for_offline.clone();
+            gtk::glib::timeout_add_local(Duration::from_millis(100), move || {
+                match receiver.try_recv() {
+                    Ok(Ok(items)) => {
+                        if let Some(window) = window.upgrade() {
+                            present_offline_dialog(&window, items, &cache);
+                        }
+                        gtk::glib::ControlFlow::Break
+                    }
+                    Ok(Err(error)) => {
+                        if let Some(status) = status.upgrade() {
+                            status.set_text(&format!("Не удалось открыть список файлов: {error}"));
+                        }
+                        gtk::glib::ControlFlow::Break
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        if let Some(status) = status.upgrade() {
+                            status.set_text("Не удалось открыть список файлов");
+                        }
+                        gtk::glib::ControlFlow::Break
+                    }
+                }
+            });
+        });
+        app.add_action(&offline_action);
         let quit_action = gio::SimpleAction::new("quit", None);
         let app_for_quit = app.downgrade();
         quit_action.connect_activate(move |_, _| {
@@ -2634,7 +2801,7 @@ mod tests {
         )
         .unwrap();
         let text = virtual_drafts_text(&drafts);
-        assert!(text.contains("Локально сохранено: 2 · требуют внимания: 1"));
+        assert!(text.contains("Черновики: 2 · требуют внимания: 1"));
         assert!(text.contains("ошибки отправки: 1"));
         assert!(text.contains("Предыдущая фоновая отправка: ошибка передачи (HTTP 400)"));
         assert!(text.contains("note.txt (drive) — готов к отправке; версия в каталоге совпадает"));
@@ -2687,8 +2854,8 @@ mod tests {
         ];
         let text = virtual_directories_text(&directories);
         assert!(text.contains("1 ждут родителя"));
-        assert!(text.contains("1 ждут проверки в OneDrive"));
-        assert!(text.contains("1 созданы в OneDrive"));
+        assert!(text.contains("1 проверяются"));
+        assert!(text.contains("1 созданы"));
         assert!(text.contains("Папка «duplicate»: имя занято"));
     }
 
@@ -2723,6 +2890,25 @@ mod tests {
         assert_eq!(tree[0].1.item_id, "folder");
         assert_eq!(tree[1].1.item_id, "child");
         assert_eq!(tree[1].0, 1);
+    }
+
+    #[test]
+    fn offline_selection_expands_nested_folders_and_deduplicates_files() {
+        let items: Vec<UiItem> = serde_json::from_str(
+            r#"[
+              {"item_id":"root","parent_id":null,"name":"Root","kind":"folder","size":null,"modified":null,"deleted":false},
+              {"item_id":"nested","parent_id":"root","name":"Nested","kind":"folder","size":null,"modified":null,"deleted":false},
+              {"item_id":"a","parent_id":"root","name":"a.txt","kind":"file","size":1,"modified":null,"deleted":false},
+              {"item_id":"b","parent_id":"nested","name":"b.txt","kind":"file","size":1,"modified":null,"deleted":false},
+              {"item_id":"gone","parent_id":"nested","name":"gone.txt","kind":"file","size":1,"modified":null,"deleted":true},
+              {"item_id":"other","parent_id":null,"name":"other.txt","kind":"file","size":1,"modified":null,"deleted":false}
+            ]"#,
+        )
+        .unwrap();
+        let selected = HashSet::from(["root".to_owned(), "b".to_owned()]);
+        assert_eq!(offline_file_ids(&items, &selected), vec!["a", "b"]);
+        let selected = HashSet::from(["nested".to_owned(), "other".to_owned()]);
+        assert_eq!(offline_file_ids(&items, &selected), vec!["b", "other"]);
     }
 
     #[test]
