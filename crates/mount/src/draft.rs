@@ -7,6 +7,7 @@ use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,6 +78,7 @@ pub struct DraftStore {
 pub struct DraftFile {
     identity: DraftIdentity,
     file: File,
+    detached: AtomicBool,
 }
 
 pub struct DraftSnapshot {
@@ -619,6 +621,7 @@ impl DraftStore {
         Ok(Some(DraftFile {
             identity: metadata,
             file,
+            detached: AtomicBool::new(false),
         }))
     }
 
@@ -854,6 +857,18 @@ fn read_metadata(path: &Path) -> io::Result<DraftIdentity> {
 }
 
 impl DraftFile {
+    /// An unlinked local file remains usable through its existing FUSE handles.
+    pub(crate) fn mark_detached(&self) {
+        self.detached.store(true, Ordering::Release);
+    }
+
+    fn ensure_live_file(&self) -> io::Result<()> {
+        if self.file.metadata()?.nlink() == 0 && !self.detached.load(Ordering::Acquire) {
+            return Err(io::Error::from(io::ErrorKind::NotFound));
+        }
+        Ok(())
+    }
+
     pub fn identity(&self) -> &DraftIdentity {
         &self.identity
     }
@@ -873,9 +888,7 @@ impl DraftFile {
         mtime: Option<SystemTime>,
     ) -> io::Result<()> {
         let _lock = lock_exclusive(&self.file)?;
-        if self.file.metadata()?.nlink() == 0 {
-            return Err(io::Error::from(io::ErrorKind::NotFound));
-        }
+        self.ensure_live_file()?;
         let mut times = fs::FileTimes::new();
         if let Some(atime) = atime {
             times = times.set_accessed(atime);
@@ -893,9 +906,7 @@ impl DraftFile {
 
     pub fn set_len(&self, size: u64) -> io::Result<()> {
         let _lock = lock_exclusive(&self.file)?;
-        if self.file.metadata()?.nlink() == 0 {
-            return Err(io::Error::from(io::ErrorKind::NotFound));
-        }
+        self.ensure_live_file()?;
         self.file.set_len(size)?;
         self.file.sync_all()
     }
@@ -910,9 +921,7 @@ impl DraftFile {
             return Err(io::Error::from(io::ErrorKind::InvalidInput));
         }
         let _lock = lock_exclusive(&self.file)?;
-        if self.file.metadata()?.nlink() == 0 {
-            return Err(io::Error::from(io::ErrorKind::NotFound));
-        }
+        self.ensure_live_file()?;
         let mode = if keep_size {
             libc::FALLOC_FL_KEEP_SIZE
         } else {
@@ -961,9 +970,7 @@ impl DraftFile {
     }
 
     fn write_at_locked(&self, offset: u64, bytes: &[u8]) -> io::Result<usize> {
-        if self.file.metadata()?.nlink() == 0 {
-            return Err(io::Error::from(io::ErrorKind::NotFound));
-        }
+        self.ensure_live_file()?;
         let length =
             u64::try_from(bytes.len()).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
         if offset
@@ -1119,6 +1126,31 @@ mod tests {
         let reopened = DraftStore::open(root.path()).unwrap();
         assert!(reopened.list().unwrap().is_empty());
         assert!(!store.paths(&new_file).1.exists());
+    }
+
+    #[test]
+    fn removed_draft_requires_explicit_detachment_for_open_handle_writes() {
+        let root = tempfile::tempdir().unwrap();
+        let store = DraftStore::open(root.path()).unwrap();
+        let identity = DraftIdentity {
+            drive_id: "drive".into(),
+            item_id: "local:detached".into(),
+            base_etag: "local-new".into(),
+            new_file: Some(NewFileLocation {
+                parent_id: "root".into(),
+                name: "deleted.txt".into(),
+            }),
+        };
+        let draft = store.begin_empty(identity).unwrap();
+        store.remove_new("drive", "local:detached").unwrap();
+        assert_eq!(
+            draft.write_at(0, b"hidden").unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        draft.mark_detached();
+        draft.write_at(0, b"hidden").unwrap();
+        assert_eq!(draft.len().unwrap(), 6);
+        assert!(store.list().unwrap().is_empty());
     }
 
     #[test]
