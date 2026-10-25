@@ -607,7 +607,14 @@ impl Daemon {
         let root = state_directory().ok()?.join("virtual-drafts");
         let store = DraftStore::open(&root).ok()?;
         statuses.retain(|draft| {
-            if !retry_schedule.allows(draft, now) {
+            let Some(file) = store
+                .recover_item(&draft.drive_id, &draft.item_id)
+                .ok()
+                .flatten()
+            else {
+                return false;
+            };
+            if !retry_schedule.allows(file.identity(), now) {
                 return false;
             }
             if !matches!(
@@ -617,11 +624,8 @@ impl Daemon {
             {
                 return true;
             }
-            store
-                .recover_item(&draft.drive_id, &draft.item_id)
+            file.len()
                 .ok()
-                .flatten()
-                .and_then(|file| file.len().ok())
                 .is_some_and(|size| size <= MAX_AUTO_RECONCILE_BYTES)
         });
         virtual_drafts::next_auto_candidate(&statuses, after).and_then(|(draft, action)| {
