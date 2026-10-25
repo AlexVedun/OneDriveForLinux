@@ -620,7 +620,11 @@ impl Daemon {
             }
             if !matches!(
                 draft.status,
-                "remote-changed" | "uncertain-empty-existing" | "uncertain-existing"
+                "remote-changed"
+                    | "uncertain-empty-existing"
+                    | "uncertain-existing"
+                    | "uncertain-empty-new"
+                    | "uncertain-new"
             ) || draft.last_upload_issue != Some(DraftUploadIssue::TransferFailed)
             {
                 return true;
@@ -637,6 +641,190 @@ impl Daemon {
                 .map(|file| (file.identity().clone(), action))
         })
     }
+}
+
+/// Resolve a lost creation reply only after a unique catalog candidate and
+/// stable Graph metadata and bytes all match the attempted local snapshot.
+async fn reconcile_uncertain_new_draft(
+    daemon: &Daemon,
+    item_id: String,
+    drive_id: String,
+    root: PathBuf,
+    identity: DraftIdentity,
+) -> zbus::fdo::Result<String> {
+    let location = identity
+        .new_file
+        .clone()
+        .ok_or_else(|| zbus::fdo::Error::Failed("new file location is missing".into()))?;
+    let parent_id = resolved_virtual_parent(&root, &location.parent_id)
+        .map_err(|_| zbus::fdo::Error::Failed("parent directory is not available".into()))?;
+    let candidate = {
+        let catalog = daemon.catalog.lock().unwrap();
+        let items = catalog
+            .items(&drive_id)
+            .map_err(|_| zbus::fdo::Error::Failed("cannot inspect catalog".into()))?;
+        virtual_drafts::unique_new_candidate(&items, &parent_id, &location.name)
+            .cloned()
+            .ok_or_else(|| {
+                zbus::fdo::Error::Failed(
+                    "no unique cloud file at the original location; draft retained".into(),
+                )
+            })?
+    };
+    let controller = daemon
+        .virtual_mount
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|mounted| mounted.published_versions.clone());
+    let publication = controller
+        .as_ref()
+        .map(|controller| controller.try_begin_new(&drive_id, &item_id))
+        .transpose()
+        .map_err(|_| zbus::fdo::Error::Failed("close the virtual file before comparing".into()))?;
+    let snapshot_root = root.clone();
+    let snapshot =
+        tokio::task::spawn_blocking(move || DraftStore::open(&snapshot_root)?.snapshot(&identity))
+            .await
+            .map_err(|_| zbus::fdo::Error::Failed("draft snapshot task failed".into()))?
+            .map_err(|_| zbus::fdo::Error::Failed("cannot snapshot draft".into()))?
+            .ok_or_else(|| zbus::fdo::Error::Failed("draft is missing".into()))?;
+    let store = DraftStore::open(&root)
+        .map_err(|_| zbus::fdo::Error::Failed("cannot read upload state".into()))?;
+    let checkpoint = store
+        .upload_checkpoint(&snapshot.identity)
+        .map_err(|_| zbus::fdo::Error::Failed("cannot read upload state".into()))?
+        .filter(|checkpoint| checkpoint.final_chunk_attempted)
+        .ok_or_else(|| zbus::fdo::Error::Failed("no uncertain upload attempt".into()))?;
+    if !virtual_drafts::snapshot_matches_attempt(&snapshot, Some(&checkpoint)) {
+        record_virtual_upload_failure_in_store(
+            &store,
+            &snapshot.identity,
+            DraftUploadIssue::RemoteChanged,
+            None,
+        )
+        .map_err(|_| zbus::fdo::Error::Failed("cannot record upload conflict".into()))?;
+        return Ok("changed-locally".into());
+    }
+    let candidate_etag = candidate
+        .etag
+        .as_deref()
+        .filter(|etag| !etag.is_empty())
+        .ok_or_else(|| {
+            zbus::fdo::Error::Failed("cloud candidate has no version; draft retained".into())
+        })?;
+    let client_id = client_id()
+        .ok_or_else(|| zbus::fdo::Error::Failed("ONEDRIVE_CLIENT_ID is not configured".into()))?;
+    let token = access_token(&client_id)
+        .await
+        .map_err(|_| zbus::fdo::Error::Failed("login is required".into()))?;
+    let graph = GraphClient::new()
+        .map_err(|_| zbus::fdo::Error::Failed("cannot create Graph client".into()))?;
+    let mut transfer_state = TransferStateGuard::start(&daemon.state);
+    let expected = CreatedVirtualExpectation {
+        item_id: &candidate.item_id,
+        parent_id: &parent_id,
+        name: &location.name,
+        etag: candidate_etag,
+        size: snapshot.size,
+    };
+    let metadata_matches = graph
+        .matches_created_virtual_file(&drive_id, &expected, &token)
+        .await
+        .map_err(|_| zbus::fdo::Error::Failed("cannot verify cloud candidate".into()))?;
+    let bytes_match = if metadata_matches {
+        graph
+            .identical_remote_file_version(
+                &drive_id,
+                &candidate.item_id,
+                snapshot.size,
+                &snapshot.sha256,
+                &token,
+            )
+            .await
+            .map_err(|_| zbus::fdo::Error::Failed("cannot compare cloud contents".into()))?
+            .as_deref()
+            == Some(candidate_etag)
+    } else {
+        false
+    };
+    if !bytes_match {
+        record_virtual_upload_failure_in_store(
+            &store,
+            &snapshot.identity,
+            DraftUploadIssue::RemoteChanged,
+            None,
+        )
+        .map_err(|_| zbus::fdo::Error::Failed("cannot record upload conflict".into()))?;
+        transfer_state.finish();
+        return Ok("different".into());
+    }
+    let catalog_matches = {
+        let catalog = daemon.catalog.lock().unwrap();
+        let items = catalog
+            .items(&drive_id)
+            .map_err(|_| zbus::fdo::Error::Failed("cannot recheck catalog".into()))?;
+        virtual_drafts::unique_new_candidate(&items, &parent_id, &location.name).is_some_and(
+            |item| {
+                item.item_id == candidate.item_id
+                    && item.etag.as_deref() == Some(candidate_etag)
+                    && item.size == i64::try_from(snapshot.size).ok()
+            },
+        )
+    };
+    if !catalog_matches {
+        return Err(zbus::fdo::Error::Failed(
+            "catalog changed during comparison; draft retained".into(),
+        ));
+    }
+    if let (Some(controller), Some(lease)) = (&controller, &publication) {
+        controller
+            .validate_new(lease, &item_id, &candidate.item_id, candidate_etag)
+            .map_err(|_| zbus::fdo::Error::Failed("mounted file changed; draft retained".into()))?;
+        let request = DownloadRequest {
+            drive_id: drive_id.clone(),
+            item_id: candidate.item_id.clone(),
+            etag: candidate_etag.to_owned(),
+            size: snapshot.size,
+        };
+        let cache_root = state_directory()
+            .map_err(|_| zbus::fdo::Error::Failed("cannot access cache".into()))?
+            .join("virtual-cache");
+        let path = snapshot.file.path().to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            CacheStore::open_waiting(&cache_root, VIRTUAL_CACHE_BYTES)
+                .and_then(|mut cache| cache.put(&request.cache_key(), &path, request.size))
+        })
+        .await
+        .map_err(|_| zbus::fdo::Error::Failed("cache task failed; draft retained".into()))?
+        .map_err(|_| {
+            zbus::fdo::Error::Failed("cannot cache matching file; draft retained".into())
+        })?;
+    }
+    let size = snapshot.size;
+    let acknowledged =
+        tokio::task::spawn_blocking(move || DraftStore::open(&root)?.acknowledge(&snapshot))
+            .await
+            .map_err(|_| zbus::fdo::Error::Failed("draft acknowledgement task failed".into()))?
+            .map_err(|_| zbus::fdo::Error::Failed("cannot acknowledge draft".into()))?;
+    if acknowledged && let (Some(controller), Some(lease)) = (&controller, &publication) {
+        controller
+            .publish_new(
+                lease,
+                &item_id,
+                &candidate.item_id,
+                candidate_etag.to_owned(),
+                size,
+            )
+            .map_err(|_| zbus::fdo::Error::Failed("mounted file could not be published".into()))?;
+    }
+    transfer_state.finish();
+    Ok(if acknowledged {
+        "identical-acknowledged"
+    } else {
+        "changed-locally"
+    }
+    .into())
 }
 
 fn virtual_auto_upload_state_ready(state: EngineState) -> bool {
@@ -1210,7 +1398,11 @@ impl Daemon {
                 draft.item_id == item_id
                     && matches!(
                         draft.status,
-                        "remote-changed" | "uncertain-empty-existing" | "uncertain-existing"
+                        "remote-changed"
+                            | "uncertain-empty-existing"
+                            | "uncertain-existing"
+                            | "uncertain-empty-new"
+                            | "uncertain-new"
                     )
             })
             .ok_or_else(|| {
@@ -1227,9 +1419,7 @@ impl Daemon {
             .identity()
             .clone();
         if identity.new_file.is_some() {
-            return Err(zbus::fdo::Error::Failed(
-                "cloud comparison requires an existing file".into(),
-            ));
+            return reconcile_uncertain_new_draft(self, item_id, drive_id, root, identity).await;
         }
         let controller = self
             .virtual_mount
