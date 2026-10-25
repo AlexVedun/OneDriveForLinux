@@ -1163,12 +1163,13 @@ impl VirtualFuse {
         let Some(root) = &self.draft_root else {
             return Err(Errno::EROFS);
         };
+        let remote_inode = crate::stable_inode(self.tree.drive_id(), &node.item_id);
         if self
             .files
             .lock()
             .unwrap()
             .values()
-            .any(|open| open.inode == node.inode && open.writable)
+            .any(|open| open.writable && (open.inode == node.inode || open.inode == remote_inode))
         {
             return Err(Errno::EBUSY);
         }
@@ -1190,7 +1191,6 @@ impl VirtualFuse {
             kind,
             status: MutationStatus::Pending,
         };
-        let remote_inode = crate::stable_inode(self.tree.drive_id(), &node.item_id);
         let mut changes = self.remote_changes.lock().unwrap();
         if changes.contains_key(&remote_inode) {
             return Err(Errno::EBUSY);
@@ -4788,6 +4788,69 @@ mod tests {
         let mut bytes = [0; 6];
         assert_eq!(draft.read_at(0, &mut bytes).unwrap(), 6);
         assert_eq!(&bytes, b"second");
+    }
+
+    #[test]
+    fn remote_mutation_waits_for_writable_original_inode_after_editor_replace() {
+        let dir = tempfile::tempdir().unwrap();
+        let draft_root = dir.path().join("drafts");
+        let fuse = VirtualFuse::new_writable(
+            VirtualTree::from_items("drive", "root", [file_item()]).unwrap(),
+            dir.path().join("cache"),
+            draft_root.clone(),
+            20,
+            Arc::new(|_| panic!("no download expected")),
+        );
+        let original_inode = fuse.lookup_node(ROOT_INODE, "текст.txt").unwrap().inode;
+        let (temporary, handle) = fuse
+            .create_file(ROOT_INODE, "swap.tmp", OpenFlags(libc::O_RDWR))
+            .unwrap();
+        fuse.write_file(temporary.inode, handle, 0, b"replacement")
+            .unwrap();
+        fuse.close_file(temporary.inode, handle);
+        fuse.rename_local_file(
+            ROOT_INODE,
+            "swap.tmp",
+            ROOT_INODE,
+            "текст.txt",
+            fuser::RenameFlags::empty(),
+        )
+        .unwrap();
+        let store = DraftStore::open(&draft_root).unwrap();
+        let draft = store.recover_item("drive", "file").unwrap().unwrap();
+        let snapshot = store.snapshot(draft.identity()).unwrap().unwrap();
+        let controller = fuse.published_version_controller();
+        let lease = controller.try_begin_existing("drive", "file").unwrap();
+        controller.publish_existing("file", "v2".into(), snapshot.size);
+        assert!(store.acknowledge(&snapshot).unwrap());
+        drop(lease);
+
+        let stale = fuse
+            .open_file(original_inode, OpenFlags(libc::O_RDWR))
+            .unwrap();
+        assert_eq!(
+            fuse.remove_local_file(ROOT_INODE, "текст.txt"),
+            Err(Errno::EBUSY)
+        );
+        assert_eq!(
+            fuse.rename_local_file(
+                ROOT_INODE,
+                "текст.txt",
+                ROOT_INODE,
+                "renamed.txt",
+                fuser::RenameFlags::empty(),
+            ),
+            Err(Errno::EBUSY)
+        );
+        assert!(
+            MutationStore::open(&draft_root)
+                .unwrap()
+                .list()
+                .unwrap()
+                .is_empty()
+        );
+        fuse.close_file(original_inode, stale);
+        fuse.remove_local_file(ROOT_INODE, "текст.txt").unwrap();
     }
 
     #[test]
