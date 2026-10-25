@@ -80,12 +80,17 @@ struct PublicationOperations {
 
 pub struct PublicationLease {
     inode: u64,
+    additional_inodes: Vec<u64>,
     operations: Arc<Mutex<PublicationOperations>>,
 }
 
 impl Drop for PublicationLease {
     fn drop(&mut self) {
-        self.operations.lock().unwrap().active.remove(&self.inode);
+        let mut operations = self.operations.lock().unwrap();
+        operations.active.remove(&self.inode);
+        for inode in &self.additional_inodes {
+            operations.active.remove(inode);
+        }
     }
 }
 
@@ -143,6 +148,7 @@ impl PublishedVersionController {
         }
         Ok(PublicationLease {
             inode,
+            additional_inodes: Vec::new(),
             operations: Arc::clone(&self.operations),
         })
     }
@@ -161,16 +167,24 @@ impl PublishedVersionController {
         }
         let inode = crate::stable_inode(drive_id, item_id);
         let _serialized = self.open_lock.lock().unwrap();
+        let local = self.local_files.lock().unwrap();
         if new_file
-            && self
-                .local_files
-                .lock()
-                .unwrap()
+            && local
                 .get(&inode)
                 .is_none_or(|node| node.item_id != item_id || node.kind != NodeKind::File)
         {
             return Err(io::ErrorKind::NotFound.into());
         }
+        let additional_inodes: Vec<_> = if new_file {
+            Vec::new()
+        } else {
+            local
+                .values()
+                .filter(|node| node.item_id == item_id && node.inode != inode)
+                .map(|node| node.inode)
+                .collect()
+        };
+        drop(local);
         let files = self.files.lock().unwrap();
         let mut operations = self.operations.lock().unwrap();
         if files.values().any(|open| {
@@ -184,13 +198,19 @@ impl PublishedVersionController {
                     }
                     OpenHandle::Cached(_) => false,
                 }
-        }) || operations.opening.contains_key(&inode)
-            || !operations.active.insert(inode)
+        }) || std::iter::once(&inode)
+            .chain(&additional_inodes)
+            .any(|inode| {
+                operations.opening.contains_key(inode) || operations.active.contains(inode)
+            })
         {
             return Err(io::ErrorKind::WouldBlock.into());
         }
+        operations.active.insert(inode);
+        operations.active.extend(additional_inodes.iter().copied());
         Ok(PublicationLease {
             inode,
+            additional_inodes,
             operations: Arc::clone(&self.operations),
         })
     }
@@ -198,7 +218,13 @@ impl PublishedVersionController {
     /// Make a verified upload visible to an already mounted filesystem.
     pub fn publish_existing(&self, item_id: &str, etag: String, size: u64) {
         let inode = crate::stable_inode(&self.drive_id, item_id);
-        self.versions.lock().unwrap().insert(inode, (etag, size));
+        let _serialized = self.open_lock.lock().unwrap();
+        let local = self.local_files.lock().unwrap();
+        let mut versions = self.versions.lock().unwrap();
+        versions.insert(inode, (etag.clone(), size));
+        for node in local.values().filter(|node| node.item_id == item_id) {
+            versions.insert(node.inode, (etag.clone(), size));
+        }
     }
 
     /// Check publication while the local draft still exists, before acknowledging it.
@@ -4348,13 +4374,14 @@ mod tests {
     #[test]
     fn editor_style_rename_replaces_remote_file_with_durable_draft() {
         let dir = tempfile::tempdir().unwrap();
+        let cache_root = dir.path().join("cache");
         let draft_root = dir.path().join("drafts");
         let tree = VirtualTree::from_items("drive", "root", [file_item()]).unwrap();
         let fuse = VirtualFuse::new_writable(
             tree,
-            dir.path().join("cache"),
+            cache_root.clone(),
             draft_root.clone(),
-            10,
+            100,
             Arc::new(|_| Err(io::ErrorKind::NotConnected.into())),
         );
         let (temporary, handle) = fuse
@@ -4396,7 +4423,15 @@ mod tests {
         );
         fuse.write_file(temporary.inode, handle, 11, b"!").unwrap();
         fuse.close_file(temporary.inode, handle);
-        let _lease = controller.try_begin_existing("drive", "file").unwrap();
+        let lease = controller.try_begin_existing("drive", "file").unwrap();
+        assert_eq!(
+            fuse.open_file(temporary.inode, OpenFlags(libc::O_RDONLY)),
+            Err(Errno::EBUSY)
+        );
+        assert_eq!(
+            fuse.remove_local_file(ROOT_INODE, "текст.txt"),
+            Err(Errno::EBUSY)
+        );
         assert!(fuse.lookup_node(ROOT_INODE, "swap.tmp").is_none());
         let drafts = DraftStore::open(&draft_root).unwrap().list().unwrap();
         assert_eq!(drafts.len(), 1);
@@ -4412,6 +4447,40 @@ mod tests {
         let mut bytes = [0; 12];
         assert_eq!(draft.read_at(0, &mut bytes).unwrap(), 12);
         assert_eq!(&bytes, b"replacement!");
+        let store = DraftStore::open(&draft_root).unwrap();
+        let snapshot = store.snapshot(draft.identity()).unwrap().unwrap();
+        let request = DownloadRequest {
+            drive_id: "drive".into(),
+            item_id: "file".into(),
+            etag: "v2".into(),
+            size: snapshot.size,
+        };
+        CacheStore::open(&cache_root, 100)
+            .unwrap()
+            .put(&request.cache_key(), snapshot.file.path(), snapshot.size)
+            .unwrap();
+        controller.publish_existing("file", "v2".into(), snapshot.size);
+        assert!(store.acknowledge(&snapshot).unwrap());
+        drop(lease);
+        let replacement = fuse.lookup_node(ROOT_INODE, "текст.txt").unwrap();
+        assert_eq!(replacement.inode, temporary.inode);
+        assert_eq!(replacement.etag.as_deref(), Some("v2"));
+        let reopened = fuse
+            .open_file(replacement.inode, OpenFlags(libc::O_RDONLY))
+            .unwrap();
+        assert_eq!(
+            fuse.read_file(replacement.inode, reopened, 0, 12).unwrap(),
+            b"replacement!"
+        );
+        fuse.close_file(replacement.inode, reopened);
+        let writable = fuse
+            .open_file(replacement.inode, OpenFlags(libc::O_RDWR))
+            .unwrap();
+        let files = fuse.files.lock().unwrap();
+        let OpenHandle::Pending(identity) = &files.get(&writable).unwrap().handle else {
+            panic!("expected the published version for a new edit");
+        };
+        assert_eq!(identity.base_etag, "v2");
     }
 
     #[test]
