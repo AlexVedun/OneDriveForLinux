@@ -352,6 +352,13 @@ impl DraftStore {
     ) -> io::Result<Option<DraftUploadCheckpoint>> {
         identity.validate()?;
         let _lock = lock_store(&self.root)?;
+        self.upload_checkpoint_locked(identity)
+    }
+
+    fn upload_checkpoint_locked(
+        &self,
+        identity: &DraftIdentity,
+    ) -> io::Result<Option<DraftUploadCheckpoint>> {
         let path = self.checkpoint_path(identity);
         let mut file = match OpenOptions::new()
             .read(true)
@@ -498,6 +505,12 @@ impl DraftStore {
         let mut identity = draft.identity().clone();
         if identity.new_file.is_none() {
             return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+        }
+        if self
+            .upload_checkpoint_locked(&identity)?
+            .is_some_and(|checkpoint| checkpoint.final_chunk_attempted)
+        {
+            return Err(io::Error::from(io::ErrorKind::WouldBlock));
         }
         identity.new_file = Some(location);
         identity.validate()?;
@@ -1706,6 +1719,73 @@ mod tests {
         assert!(
             reopened
                 .upload_failure(current.identity())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn new_file_with_uncertain_final_upload_cannot_be_moved_or_duplicated() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = DraftStore::open(&temporary.path().join("drafts")).unwrap();
+        let original = DraftIdentity {
+            drive_id: "drive".into(),
+            item_id: "local:new".into(),
+            base_etag: "local-new".into(),
+            new_file: Some(NewFileLocation {
+                parent_id: "root".into(),
+                name: "first.txt".into(),
+            }),
+        };
+        store
+            .begin_empty(original.clone())
+            .unwrap()
+            .write_at(0, b"x")
+            .unwrap();
+        let mut checkpoint = DraftUploadCheckpoint {
+            identity: original.clone(),
+            sha256: "a".repeat(64),
+            size: 1,
+            upload_url: "https://upload.example/uncertain".into(),
+            next_offset: 0,
+            final_chunk_attempted: true,
+        };
+        store.save_upload_checkpoint(&checkpoint).unwrap();
+        let moved = NewFileLocation {
+            parent_id: "other".into(),
+            name: "second.txt".into(),
+        };
+
+        assert_eq!(
+            store
+                .relocate_new("drive", "local:new", moved.clone())
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(
+            store
+                .recover_item("drive", "local:new")
+                .unwrap()
+                .unwrap()
+                .identity(),
+            &original
+        );
+        assert_eq!(
+            store.upload_checkpoint(&original).unwrap(),
+            Some(checkpoint.clone())
+        );
+
+        checkpoint.final_chunk_attempted = false;
+        store.save_upload_checkpoint(&checkpoint).unwrap();
+        store
+            .relocate_new("drive", "local:new", moved.clone())
+            .unwrap();
+        let current = store.recover_item("drive", "local:new").unwrap().unwrap();
+        assert_eq!(current.identity().new_file.as_ref(), Some(&moved));
+        assert!(
+            store
+                .upload_checkpoint(current.identity())
                 .unwrap()
                 .is_none()
         );
