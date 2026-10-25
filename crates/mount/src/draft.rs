@@ -534,6 +534,12 @@ impl DraftStore {
         if draft.identity().new_file.is_none() {
             return Err(io::Error::from(io::ErrorKind::PermissionDenied));
         }
+        if self
+            .upload_checkpoint_locked(draft.identity())?
+            .is_some_and(|checkpoint| checkpoint.final_chunk_attempted)
+        {
+            return Err(io::Error::from(io::ErrorKind::WouldBlock));
+        }
         let metadata = self.paths(draft.identity()).0;
         fs::rename(&metadata, metadata.with_extension("removed"))?;
         File::open(&self.root)?.sync_all()?;
@@ -1774,6 +1780,24 @@ mod tests {
         assert_eq!(
             store.upload_checkpoint(&original).unwrap(),
             Some(checkpoint.clone())
+        );
+        let reopened = DraftStore::open(&temporary.path().join("drafts")).unwrap();
+        assert_eq!(
+            reopened
+                .remove_new("drive", "local:new")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(
+            reopened.upload_checkpoint(&original).unwrap(),
+            Some(checkpoint.clone())
+        );
+        assert!(
+            reopened
+                .recover_item("drive", "local:new")
+                .unwrap()
+                .is_some()
         );
 
         checkpoint.final_chunk_attempted = false;

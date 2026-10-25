@@ -4807,6 +4807,21 @@ mod tests {
         );
         assert!(fuse.lookup_node(ROOT_INODE, "second.txt").is_none());
         assert!(store.upload_checkpoint(&identity).unwrap().is_some());
+        assert_eq!(
+            fuse.remove_local_file(ROOT_INODE, "first.txt"),
+            Err(Errno::EBUSY)
+        );
+        assert_eq!(
+            fuse.lookup_node(ROOT_INODE, "first.txt").unwrap().inode,
+            node.inode
+        );
+        assert!(
+            store
+                .recover_item("drive", &node.item_id)
+                .unwrap()
+                .is_some()
+        );
+        assert!(store.upload_checkpoint(&identity).unwrap().is_some());
     }
 
     #[test]
