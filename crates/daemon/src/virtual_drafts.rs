@@ -1,5 +1,7 @@
 use onedrive_catalog::CatalogItem;
-use onedrive_mount::draft::{DraftIdentity, DraftUploadCheckpoint, DraftUploadIssue};
+use onedrive_mount::draft::{
+    DraftIdentity, DraftSnapshot, DraftUploadCheckpoint, DraftUploadIssue,
+};
 use serde::Serialize;
 use std::{
     collections::HashMap,
@@ -59,6 +61,20 @@ pub enum AutoDraftAction {
     Reconcile,
 }
 
+/// A final upload marker describes the bytes that may already be in OneDrive.
+/// Later edits must never be used to decide whether that attempt succeeded.
+pub fn snapshot_matches_attempt(
+    snapshot: &DraftSnapshot,
+    checkpoint: Option<&DraftUploadCheckpoint>,
+) -> bool {
+    checkpoint.is_none_or(|attempt| {
+        !attempt.final_chunk_attempted
+            || (attempt.identity == snapshot.identity
+                && attempt.size == snapshot.size
+                && attempt.sha256 == snapshot.sha256)
+    })
+}
+
 /// A lost final reply can survive a daemon crash without a failure record.
 pub fn mark_uncertain_upload(
     status: &mut VirtualDraftStatus,
@@ -69,7 +85,9 @@ pub fn mark_uncertain_upload(
         return;
     };
     if draft.new_file.is_none() && status.status == "remote-changed" {
-        status.last_upload_issue = Some(DraftUploadIssue::TransferFailed);
+        if status.last_upload_issue != Some(DraftUploadIssue::RemoteChanged) {
+            status.last_upload_issue = Some(DraftUploadIssue::TransferFailed);
+        }
     } else if draft.new_file.is_some() && status.status == "name-conflict" {
         status.status = "uncertain-new";
         status.last_upload_issue = Some(DraftUploadIssue::TransferFailed);
@@ -153,6 +171,7 @@ pub fn classify(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use onedrive_mount::draft::DraftStore;
 
     fn draft() -> DraftIdentity {
         DraftIdentity {
@@ -176,6 +195,56 @@ mod tests {
             modified: None,
             deleted: false,
         }
+    }
+
+    #[test]
+    fn reconciliation_uses_the_bytes_from_the_uncertain_attempt() {
+        let root = tempfile::tempdir().unwrap();
+        let store = DraftStore::open(root.path()).unwrap();
+        let identity = draft();
+        let file = store.begin_empty(identity.clone()).unwrap();
+        file.write_at(0, b"attempted").unwrap();
+        let attempted = store.snapshot(&identity).unwrap().unwrap();
+        let checkpoint = DraftUploadCheckpoint {
+            identity: identity.clone(),
+            sha256: attempted.sha256.clone(),
+            size: attempted.size,
+            upload_url: "https://upload.example/session".into(),
+            next_offset: attempted.size,
+            final_chunk_attempted: true,
+        };
+        store.save_upload_checkpoint(&checkpoint).unwrap();
+        assert!(snapshot_matches_attempt(&attempted, Some(&checkpoint)));
+        file.write_at(0, b"later edit").unwrap();
+        let changed = store.snapshot(&identity).unwrap().unwrap();
+        assert!(!snapshot_matches_attempt(&changed, Some(&checkpoint)));
+        assert_eq!(
+            store.upload_checkpoint(&identity).unwrap(),
+            Some(checkpoint)
+        );
+    }
+
+    #[test]
+    fn reviewed_mismatch_is_not_rescheduled_as_a_transfer_failure() {
+        let identity = draft();
+        let mut changed = item();
+        changed.etag = Some("new".into());
+        let mut status = classify(&identity, Some("drive"), true, Some(&changed));
+        status.last_upload_issue = Some(DraftUploadIssue::RemoteChanged);
+        let checkpoint = DraftUploadCheckpoint {
+            identity: identity.clone(),
+            sha256: "a".repeat(64),
+            size: 4,
+            upload_url: "https://upload.example/session".into(),
+            next_offset: 4,
+            final_chunk_attempted: true,
+        };
+        mark_uncertain_upload(&mut status, &identity, Some(&checkpoint));
+        assert_eq!(
+            status.last_upload_issue,
+            Some(DraftUploadIssue::RemoteChanged)
+        );
+        assert!(next_auto_candidate(&[status], None).is_none());
     }
 
     #[test]

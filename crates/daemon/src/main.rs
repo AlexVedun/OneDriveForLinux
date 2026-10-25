@@ -1252,6 +1252,21 @@ impl Daemon {
         .map_err(|_| zbus::fdo::Error::Failed("draft snapshot task failed".into()))?
         .map_err(|_| zbus::fdo::Error::Failed("cannot snapshot draft".into()))?
         .ok_or_else(|| zbus::fdo::Error::Failed("draft is missing".into()))?;
+        let checkpoint_store = DraftStore::open(&root)
+            .map_err(|_| zbus::fdo::Error::Failed("cannot read upload state".into()))?;
+        let checkpoint = checkpoint_store
+            .upload_checkpoint(&snapshot.identity)
+            .map_err(|_| zbus::fdo::Error::Failed("cannot read upload state".into()))?;
+        if !virtual_drafts::snapshot_matches_attempt(&snapshot, checkpoint.as_ref()) {
+            record_virtual_upload_failure_in_store(
+                &checkpoint_store,
+                &snapshot.identity,
+                DraftUploadIssue::RemoteChanged,
+                None,
+            )
+            .map_err(|_| zbus::fdo::Error::Failed("cannot record upload conflict".into()))?;
+            return Ok("changed-locally".into());
+        }
         let client_id = client_id().ok_or_else(|| {
             zbus::fdo::Error::Failed("ONEDRIVE_CLIENT_ID is not configured".into())
         })?;
@@ -1272,11 +1287,13 @@ impl Daemon {
             .await
             .map_err(|_| zbus::fdo::Error::Failed("cannot compare cloud contents".into()))?
         else {
-            DraftStore::open(&root)
-                .and_then(|store| store.clear_upload_checkpoint(&snapshot.identity))
-                .map_err(|_| {
-                    zbus::fdo::Error::Failed("cannot clear uncertain upload state".into())
-                })?;
+            record_virtual_upload_failure_in_store(
+                &checkpoint_store,
+                &snapshot.identity,
+                DraftUploadIssue::RemoteChanged,
+                None,
+            )
+            .map_err(|_| zbus::fdo::Error::Failed("cannot record upload conflict".into()))?;
             transfer_state.finish();
             return Ok("different".into());
         };
