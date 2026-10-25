@@ -593,10 +593,8 @@ impl Daemon {
         retry_schedule: &virtual_drafts::RetrySchedule,
         now: Instant,
     ) -> Option<(DraftIdentity, virtual_drafts::AutoDraftAction)> {
-        if !matches!(
-            *self.state.lock().unwrap(),
-            EngineState::Connected | EngineState::Synced
-        ) || self.sync_paused().ok()?
+        if !virtual_auto_upload_state_ready(*self.state.lock().unwrap())
+            || self.sync_paused().ok()?
             || self.sync.lock().unwrap().root().ok()?.is_some()
             || self.mount_in_progress.load(Ordering::SeqCst)
             || self.scan_in_progress.load(Ordering::SeqCst)
@@ -634,6 +632,15 @@ impl Daemon {
                 .map(|file| (file.identity().clone(), action))
         })
     }
+}
+
+fn virtual_auto_upload_state_ready(state: EngineState) -> bool {
+    // A failed draft is tracked separately and must not hold up other files
+    // until the next catalog scan resets the global error state.
+    matches!(
+        state,
+        EngineState::Connected | EngineState::Synced | EngineState::Error
+    )
 }
 
 #[zbus::interface(name = "io.github.onedrive_linux.Daemon")]
@@ -4442,13 +4449,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Baseline, CatalogItem, QueuedOperation, ScanCatalogError, VIRTUAL_CACHE_BYTES,
-        VirtualDownloadContext, catalog_ready_for_drive, client_config_path, client_id_from_dotenv,
-        client_id_from_sources, inspect_virtual_cache, is_network_failure, local_delete_candidate,
-        prepare_virtual_request, publish_virtual_file, record_virtual_upload_failure_in_store,
-        remote_delete_candidate, remote_folder_candidate, remote_rename_candidate,
-        scan_outcome_state, virtual_name_taken, virtual_upload_error_text,
-        virtual_upload_http_status, virtual_upload_issue,
+        Baseline, CatalogItem, QueuedOperation, ScanCatalogError, TransferStateGuard,
+        VIRTUAL_CACHE_BYTES, VirtualDownloadContext, catalog_ready_for_drive, client_config_path,
+        client_id_from_dotenv, client_id_from_sources, inspect_virtual_cache, is_network_failure,
+        local_delete_candidate, prepare_virtual_request, publish_virtual_file,
+        record_virtual_upload_failure_in_store, remote_delete_candidate, remote_folder_candidate,
+        remote_rename_candidate, scan_outcome_state, virtual_auto_upload_state_ready,
+        virtual_name_taken, virtual_upload_error_text, virtual_upload_http_status,
+        virtual_upload_issue,
     };
     use onedrive_cache::{CacheError, CacheStore};
     use onedrive_catalog::{Catalog, DeltaPage};
@@ -4462,6 +4470,34 @@ mod tests {
     use std::io;
     use std::path::Path;
     use std::sync::{Arc, Mutex, atomic::AtomicBool};
+
+    #[test]
+    fn failed_virtual_transfer_does_not_block_other_ready_drafts() {
+        let state = Arc::new(Mutex::new(EngineState::Connected));
+        {
+            let _failed_transfer = TransferStateGuard::start(&state);
+        }
+        assert_eq!(*state.lock().unwrap(), EngineState::Error);
+        assert!(virtual_auto_upload_state_ready(*state.lock().unwrap()));
+
+        for state in [
+            EngineState::Connected,
+            EngineState::Synced,
+            EngineState::Error,
+        ] {
+            assert!(virtual_auto_upload_state_ready(state));
+        }
+        for state in [
+            EngineState::NeedsLogin,
+            EngineState::NeedsReconcile,
+            EngineState::Offline,
+            EngineState::Paused,
+            EngineState::Transferring,
+            EngineState::Checking,
+        ] {
+            assert!(!virtual_auto_upload_state_ready(state));
+        }
+    }
 
     #[test]
     fn virtual_name_conflict_matches_fuse_case_rules() {
