@@ -1475,29 +1475,24 @@ impl VirtualFuse {
             store
                 .ensure_new_removable(self.tree.drive_id(), &target.item_id)
                 .map_err(map_draft_error)?;
-            let old_location = NewFileLocation {
-                parent_id: local
-                    .get(&parent)
-                    .or_else(|| self.tree.getattr(parent))
-                    .ok_or(Errno::ENOENT)?
-                    .item_id
-                    .clone(),
-                name: name.to_owned(),
-            };
+            let source_draft = store
+                .recover_item(self.tree.drive_id(), &node.item_id)
+                .map_err(map_draft_error)?
+                .ok_or(Errno::EIO)?;
+            let target_draft = store
+                .recover_item(self.tree.drive_id(), &target.item_id)
+                .map_err(map_draft_error)?
+                .ok_or(Errno::EIO)?;
             store
-                .relocate_new(
-                    self.tree.drive_id(),
-                    &node.item_id,
+                .replace_new_with_new(
+                    source_draft.identity(),
+                    target_draft.identity(),
                     NewFileLocation {
                         parent_id: parent_node.item_id,
                         name: new_name.to_owned(),
                     },
                 )
                 .map_err(map_draft_error)?;
-            if let Err(error) = store.remove_new(self.tree.drive_id(), &target.item_id) {
-                let _ = store.relocate_new(self.tree.drive_id(), &node.item_id, old_location);
-                return Err(map_draft_error(error));
-            }
             let mut detached = false;
             for open in files.values().filter(|open| open.inode == target.inode) {
                 if let OpenHandle::Draft(draft) = &open.handle {
