@@ -821,7 +821,7 @@ impl VirtualFuse {
     }
 
     fn visible_child(&self, parent: u64, name: &str, local: &HashMap<u64, Node>) -> Option<Node> {
-        local
+        let visible = local
             .values()
             .filter_map(|node| self.remote_node(node))
             .find(|node| node.parent_inode == parent && node.name == name)
@@ -849,7 +849,14 @@ impl VirtualFuse {
                     .lookup(parent, name)
                     .and_then(|node| self.remote_node(node))
                     .filter(|node| node.parent_inode == parent && node.name == name)
-            })
+            });
+        visible.map(|mut node| {
+            if let Some((etag, size)) = self.published_versions.lock().unwrap().get(&node.inode) {
+                node.etag = Some(etag.clone());
+                node.size = *size;
+            }
+            node
+        })
     }
 
     fn load_local_files(&self) -> io::Result<()> {
@@ -4481,6 +4488,24 @@ mod tests {
             panic!("expected the published version for a new edit");
         };
         assert_eq!(identity.base_etag, "v2");
+        drop(files);
+        fuse.close_file(replacement.inode, writable);
+        let (second, second_handle) = fuse
+            .create_file(ROOT_INODE, "second.tmp", OpenFlags(libc::O_RDWR))
+            .unwrap();
+        fuse.write_file(second.inode, second_handle, 0, b"second")
+            .unwrap();
+        fuse.close_file(second.inode, second_handle);
+        fuse.rename_local_file(
+            ROOT_INODE,
+            "second.tmp",
+            ROOT_INODE,
+            "текст.txt",
+            fuser::RenameFlags::empty(),
+        )
+        .unwrap();
+        let second_draft = store.recover_item("drive", "file").unwrap().unwrap();
+        assert_eq!(second_draft.identity().base_etag, "v2");
     }
 
     #[test]
