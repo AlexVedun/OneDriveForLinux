@@ -10,30 +10,36 @@ const RETRY_DELAY: Duration = Duration::from_secs(300);
 
 #[derive(Default)]
 pub struct RetrySchedule {
-    next_attempt: HashMap<(String, String), Instant>,
+    next_attempt: HashMap<(String, String), (DraftIdentity, Instant)>,
 }
 
 impl RetrySchedule {
-    pub fn allows(&self, draft: &VirtualDraftStatus, now: Instant) -> bool {
+    pub fn allows(&self, draft: &DraftIdentity, now: Instant) -> bool {
         self.next_attempt
             .get(&(draft.drive_id.clone(), draft.item_id.clone()))
-            .is_none_or(|deadline| now >= *deadline)
+            .is_none_or(|(failed, deadline)| failed != draft || now >= *deadline)
     }
 
     pub fn defer(&mut self, draft: &DraftIdentity, now: Instant) {
         self.next_attempt.insert(
             (draft.drive_id.clone(), draft.item_id.clone()),
-            now + RETRY_DELAY,
+            (draft.clone(), now + RETRY_DELAY),
         );
     }
 
     pub fn forget(&mut self, draft: &DraftIdentity) {
-        self.next_attempt
-            .remove(&(draft.drive_id.clone(), draft.item_id.clone()));
+        let key = (draft.drive_id.clone(), draft.item_id.clone());
+        if self
+            .next_attempt
+            .get(&key)
+            .is_some_and(|(failed, _)| failed == draft)
+        {
+            self.next_attempt.remove(&key);
+        }
     }
 
     pub fn prune(&mut self, now: Instant) {
-        self.next_attempt.retain(|_, deadline| now < *deadline);
+        self.next_attempt.retain(|_, (_, deadline)| now < *deadline);
     }
 }
 
@@ -309,21 +315,52 @@ mod tests {
         schedule.defer(&failed, now);
         let available: Vec<_> = statuses
             .iter()
-            .filter(|status| schedule.allows(status, now + Duration::from_secs(30)))
+            .filter(|status| {
+                let identity = if status.item_id == failed.item_id {
+                    &failed
+                } else {
+                    &other
+                };
+                schedule.allows(identity, now + Duration::from_secs(30))
+            })
             .cloned()
             .collect();
         assert_eq!(
             next_auto_candidate(&available, None).map(|(draft, _)| draft.item_id.as_str()),
             Some("other")
         );
-        assert!(!schedule.allows(&statuses[0], now + Duration::from_secs(299)));
-        assert!(schedule.allows(&statuses[0], now + RETRY_DELAY));
+        assert!(!schedule.allows(&failed, now + Duration::from_secs(299)));
+        assert!(schedule.allows(&failed, now + RETRY_DELAY));
         schedule.prune(now + RETRY_DELAY);
         assert!(schedule.next_attempt.is_empty());
 
         schedule.defer(&failed, now);
         schedule.forget(&failed);
-        assert!(schedule.allows(&statuses[0], now));
+        assert!(schedule.allows(&failed, now));
+    }
+
+    #[test]
+    fn renamed_new_file_is_not_delayed_by_old_upload_failure() {
+        let now = Instant::now();
+        let mut original = draft();
+        original.item_id = "local:new".into();
+        original.base_etag = "local-new".into();
+        original.new_file = Some(onedrive_mount::draft::NewFileLocation {
+            parent_id: "root".into(),
+            name: "first.txt".into(),
+        });
+        let mut renamed = original.clone();
+        renamed.new_file.as_mut().unwrap().name = "second.txt".into();
+        let mut schedule = RetrySchedule::default();
+        schedule.defer(&original, now);
+
+        assert!(!schedule.allows(&original, now + Duration::from_secs(30)));
+        assert!(schedule.allows(&renamed, now + Duration::from_secs(30)));
+        schedule.forget(&renamed);
+        assert!(!schedule.allows(&original, now + Duration::from_secs(30)));
+        schedule.defer(&renamed, now);
+        assert!(!schedule.allows(&renamed, now + Duration::from_secs(30)));
+        assert!(schedule.allows(&original, now + Duration::from_secs(30)));
     }
 
     #[test]
