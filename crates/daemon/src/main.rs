@@ -278,6 +278,24 @@ fn resolved_virtual_parent(root: &std::path::Path, parent_id: &str) -> io::Resul
         .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))
 }
 
+fn virtual_name_taken(
+    items: &[CatalogItem],
+    parent_id: &str,
+    name: &str,
+    except_item_id: Option<&str>,
+) -> bool {
+    let folded = name.to_lowercase();
+    items.iter().any(|item| {
+        !item.deleted
+            && item.parent_id.as_deref() == Some(parent_id)
+            && item
+                .name
+                .as_ref()
+                .is_some_and(|item_name| item_name.to_lowercase() == folded)
+            && Some(item.item_id.as_str()) != except_item_id
+    })
+}
+
 impl Daemon {
     async fn run_virtual_directory_upload(&self, item_id: String) -> zbus::fdo::Result<String> {
         if self
@@ -379,12 +397,12 @@ impl Daemon {
                 .items(&directory.drive_id)
                 .ok()
                 .is_some_and(|items| {
-                    items.iter().any(|item| {
-                        !item.deleted
-                            && item.parent_id.as_deref() == Some(&parent_id)
-                            && item.name.as_deref() == Some(&directory.name)
-                            && Some(item.item_id.as_str()) != directory.created_remote_id.as_deref()
-                    })
+                    virtual_name_taken(
+                        &items,
+                        &parent_id,
+                        &directory.name,
+                        directory.created_remote_id.as_deref(),
+                    )
                 });
             if !parent_exists || name_taken {
                 return Err(zbus::fdo::Error::Failed(
@@ -515,15 +533,11 @@ impl Daemon {
                                 .item(&draft.drive_id, &parent_id)
                                 .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?
                                 .is_some_and(|parent| parent.kind == "folder" && !parent.deleted);
-                        let name_taken = catalog
+                        let items = catalog
                             .items(&draft.drive_id)
-                            .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?
-                            .iter()
-                            .any(|item| {
-                                !item.deleted
-                                    && item.parent_id.as_deref() == Some(&parent_id)
-                                    && item.name.as_deref() == Some(&location.name)
-                            });
+                            .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
+                        let name_taken =
+                            virtual_name_taken(&items, &parent_id, &location.name, None);
                         if !parent_exists {
                             "remote-missing"
                         } else if name_taken {
@@ -673,13 +687,12 @@ impl Daemon {
                                 .items(&directory.drive_id)
                                 .ok()
                                 .is_some_and(|items| {
-                                    items.iter().any(|item| {
-                                        !item.deleted
-                                            && item.parent_id.as_deref() == Some(parent_id)
-                                            && item.name.as_deref() == Some(&directory.name)
-                                            && Some(item.item_id.as_str())
-                                                != directory.created_remote_id.as_deref()
-                                    })
+                                    virtual_name_taken(
+                                        &items,
+                                        parent_id,
+                                        &directory.name,
+                                        directory.created_remote_id.as_deref(),
+                                    )
                                 });
                         if !parent_exists {
                             "parent-missing"
@@ -881,15 +894,10 @@ impl Daemon {
                         .item(&drive_id, parent_id)
                         .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?
                         .is_some_and(|parent| parent.kind == "folder" && !parent.deleted);
-                let name_taken = catalog
+                let items = catalog
                     .items(&drive_id)
-                    .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?
-                    .iter()
-                    .any(|item| {
-                        !item.deleted
-                            && item.parent_id.as_deref() == Some(parent_id)
-                            && item.name.as_deref() == Some(&location.name)
-                    });
+                    .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
+                let name_taken = virtual_name_taken(&items, parent_id, &location.name, None);
                 parent_exists && !name_taken
             } else {
                 virtual_drafts::classify(draft.identity(), Some(&drive_id), true, remote.as_ref())
@@ -4439,8 +4447,8 @@ mod tests {
         client_id_from_sources, inspect_virtual_cache, is_network_failure, local_delete_candidate,
         prepare_virtual_request, publish_virtual_file, record_virtual_upload_failure_in_store,
         remote_delete_candidate, remote_folder_candidate, remote_rename_candidate,
-        scan_outcome_state, virtual_upload_error_text, virtual_upload_http_status,
-        virtual_upload_issue,
+        scan_outcome_state, virtual_name_taken, virtual_upload_error_text,
+        virtual_upload_http_status, virtual_upload_issue,
     };
     use onedrive_cache::{CacheError, CacheStore};
     use onedrive_catalog::{Catalog, DeltaPage};
@@ -4454,6 +4462,43 @@ mod tests {
     use std::io;
     use std::path::Path;
     use std::sync::{Arc, Mutex, atomic::AtomicBool};
+
+    #[test]
+    fn virtual_name_conflict_matches_fuse_case_rules() {
+        let item = CatalogItem {
+            drive_id: "drive".into(),
+            item_id: "remote".into(),
+            parent_id: Some("root".into()),
+            name: Some("ТЕКСТ.txt".into()),
+            kind: "file".into(),
+            size: Some(1),
+            etag: Some("v1".into()),
+            ctag: None,
+            modified: None,
+            deleted: false,
+        };
+        assert!(virtual_name_taken(
+            std::slice::from_ref(&item),
+            "root",
+            "текст.TXT",
+            None
+        ));
+        assert!(!virtual_name_taken(
+            std::slice::from_ref(&item),
+            "other",
+            "текст.txt",
+            None
+        ));
+        assert!(!virtual_name_taken(
+            std::slice::from_ref(&item),
+            "root",
+            "текст.txt",
+            Some("remote")
+        ));
+        let mut deleted = item;
+        deleted.deleted = true;
+        assert!(!virtual_name_taken(&[deleted], "root", "текст.txt", None));
+    }
 
     #[test]
     fn automatic_mount_waits_for_matching_complete_catalog() {
