@@ -1002,6 +1002,23 @@ impl DraftStore {
         self.cleanup_removed()
     }
 
+    /// Explicit user discard of either kind of draft, including an uncertain upload.
+    /// FUSE unlink intentionally does not use this path.
+    pub fn discard(&self, identity: &DraftIdentity) -> io::Result<()> {
+        identity.validate()?;
+        let _store_lock = lock_store(&self.root)?;
+        self.require_current_identity(identity)?;
+        let draft = self.recover(identity)?.ok_or(io::ErrorKind::NotFound)?;
+        let _file_lock = lock_exclusive(&draft.file)?;
+        if draft.file.metadata()?.nlink() == 0 {
+            return Err(io::ErrorKind::WouldBlock.into());
+        }
+        let metadata = self.paths(identity).0;
+        fs::rename(&metadata, metadata.with_extension("removed"))?;
+        File::open(&self.root)?.sync_all()?;
+        self.cleanup_removed()
+    }
+
     /// Preflight for a FUSE rename that will consume a local-only source or target.
     pub fn ensure_new_removable(&self, drive_id: &str, item_id: &str) -> io::Result<()> {
         let _lock = lock_store(&self.root)?;
@@ -2043,6 +2060,69 @@ mod tests {
         draft.write_at(0, b"hidden").unwrap();
         assert_eq!(draft.len().unwrap(), 6);
         assert!(store.list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn explicit_discard_removes_uncertain_draft_and_upload_state() {
+        for new_file in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let store = DraftStore::open(root.path()).unwrap();
+            let identity = if new_file { editor_draft() } else { identity() };
+            let draft = store.begin_empty(identity.clone()).unwrap();
+            draft.write_at(0, b"local changes").unwrap();
+            store
+                .save_upload_checkpoint(&DraftUploadCheckpoint {
+                    identity: identity.clone(),
+                    sha256: "a".repeat(64),
+                    size: 13,
+                    upload_url: "https://upload.example/session".into(),
+                    next_offset: 13,
+                    final_chunk_attempted: true,
+                })
+                .unwrap();
+            store
+                .save_upload_failure(&DraftUploadFailure {
+                    identity: identity.clone(),
+                    issue: DraftUploadIssue::TransferFailed,
+                    attempted_at_unix: 1,
+                    http_status: None,
+                })
+                .unwrap();
+            store.discard(&identity).unwrap();
+            let reopened = DraftStore::open(root.path()).unwrap();
+            assert!(reopened.list().unwrap().is_empty());
+            assert!(reopened.upload_checkpoint(&identity).unwrap().is_none());
+            assert!(reopened.upload_failure(&identity).unwrap().is_none());
+            assert!(!reopened.paths(&identity).1.exists());
+        }
+    }
+
+    #[test]
+    fn explicit_discard_rejects_stale_identity_without_removing_latest_draft() {
+        let root = tempfile::tempdir().unwrap();
+        let store = DraftStore::open(root.path()).unwrap();
+        let original = editor_draft();
+        store
+            .begin_empty(original.clone())
+            .unwrap()
+            .write_at(0, b"keep")
+            .unwrap();
+        store
+            .relocate_new(
+                &original.drive_id,
+                &original.item_id,
+                NewFileLocation {
+                    parent_id: "root".into(),
+                    name: "moved.txt".into(),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            store.discard(&original).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(store.list().unwrap().len(), 1);
+        assert_eq!(fs::read(store.paths(&original).1).unwrap(), b"keep");
     }
 
     #[test]
