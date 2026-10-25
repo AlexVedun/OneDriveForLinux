@@ -943,10 +943,9 @@ impl DraftFile {
     }
 
     pub fn read_at(&self, offset: u64, buffer: &mut [u8]) -> io::Result<usize> {
-        if offset > i64::MAX as u64 {
-            return Ok(0);
-        }
-        self.file.read_at(buffer, offset)
+        read_at_until_eof(offset, buffer, |buffer, offset| {
+            self.file.read_at(buffer, offset)
+        })
     }
 
     pub fn seek_data_hole(&self, offset: i64, whence: i32) -> io::Result<i64> {
@@ -1002,9 +1001,50 @@ impl DraftFile {
     }
 }
 
+fn read_at_until_eof(
+    offset: u64,
+    buffer: &mut [u8],
+    mut read: impl FnMut(&mut [u8], u64) -> io::Result<usize>,
+) -> io::Result<usize> {
+    let mut filled = 0;
+    while filled < buffer.len() {
+        let Some(position) = offset.checked_add(filled as u64) else {
+            break;
+        };
+        if position > i64::MAX as u64 {
+            break;
+        }
+        let count = read(&mut buffer[filled..], position)?;
+        if count == 0 {
+            break;
+        }
+        filled += count;
+    }
+    Ok(filled)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn positioned_read_continues_after_short_reads_until_eof() {
+        let source = b"abcdef";
+        let mut calls = Vec::new();
+        let mut output = [0; 8];
+        let count = read_at_until_eof(4, &mut output, |buffer, offset| {
+            calls.push(offset);
+            let position = (offset - 4) as usize;
+            let count = buffer.len().min(2).min(source.len() - position);
+            buffer[..count].copy_from_slice(&source[position..position + count]);
+            Ok(count)
+        })
+        .unwrap();
+
+        assert_eq!(count, source.len());
+        assert_eq!(&output[..count], source);
+        assert_eq!(calls, [4, 6, 8, 10]);
+    }
 
     #[test]
     fn set_len_rejects_size_beyond_positioned_io_range_without_changing_draft() {
