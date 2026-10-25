@@ -3,6 +3,7 @@ mod graph;
 mod mount_record;
 mod transfer;
 mod virtual_drafts;
+mod virtual_log;
 mod virtual_upload;
 
 use auth::LoginAttempt;
@@ -991,6 +992,13 @@ impl Daemon {
         let checkpoint_store = DraftStore::open(&checkpoint_root)
             .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))?;
         let mut transfer_state = TransferStateGuard::start(&self.state);
+        record_virtual_upload_event(
+            &snapshot.identity,
+            virtual_log::UploadEvent::Started {
+                size: snapshot.size,
+                new_file: snapshot.identity.new_file.is_some(),
+            },
+        );
         let result = if let Some(parent_id) = resolved_parent.as_deref() {
             virtual_upload::upload_new_snapshot_to_parent(
                 &transport,
@@ -1001,8 +1009,15 @@ impl Daemon {
             .await
         } else {
             virtual_upload::upload_snapshot(&transport, &checkpoint_store, &snapshot).await
+        };
+        if let Err(error) = &result {
+            record_virtual_upload_event(
+                &snapshot.identity,
+                virtual_log::UploadEvent::Failed(error),
+            );
         }
-        .map_err(|error| zbus::fdo::Error::Failed(virtual_upload_error_text(&error)))?;
+        let result =
+            result.map_err(|error| zbus::fdo::Error::Failed(virtual_upload_error_text(&error)))?;
         let UploadStep::Complete {
             remote_id: uploaded_id,
             etag: Some(uploaded_etag),
@@ -1013,6 +1028,7 @@ impl Daemon {
                 "upload result needs review; local draft retained".to_owned(),
             ));
         };
+        record_virtual_upload_event(&snapshot.identity, virtual_log::UploadEvent::GraphConfirmed);
         let catalog_recorded = if let Some(location) = &snapshot.identity.new_file {
             if !graph
                 .matches_created_virtual_file(
@@ -1155,6 +1171,12 @@ impl Daemon {
             eprintln!("cannot clear previous virtual draft upload failure");
         }
         transfer_state.finish();
+        record_virtual_upload_event(
+            &completed_identity,
+            virtual_log::UploadEvent::Completed {
+                local_changes_remain: !acknowledged,
+            },
+        );
         Ok(if acknowledged {
             "uploaded".to_owned()
         } else {
@@ -4272,6 +4294,15 @@ fn virtual_upload_error_text(error: &UploadError) -> String {
         UploadError::Io(_) | UploadError::Store(_) => "local draft or checkpoint error".to_owned(),
     };
     format!("upload failed: {reason}; local draft retained")
+}
+
+fn record_virtual_upload_event(identity: &DraftIdentity, event: virtual_log::UploadEvent<'_>) {
+    let result = state_directory()
+        .map_err(|_| io::Error::other("cannot access state directory"))
+        .and_then(|root| virtual_log::append(&root, identity, event));
+    if result.is_err() {
+        eprintln!("cannot write virtual upload diagnostic log");
+    }
 }
 
 fn virtual_upload_http_status(error: &zbus::fdo::Error) -> Option<u16> {
