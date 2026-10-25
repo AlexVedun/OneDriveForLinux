@@ -4570,6 +4570,87 @@ mod tests {
     }
 
     #[test]
+    fn renaming_published_editor_replacement_tracks_remote_item() {
+        let dir = tempfile::tempdir().unwrap();
+        let draft_root = dir.path().join("drafts");
+        let fuse = VirtualFuse::new_writable(
+            VirtualTree::from_items("drive", "root", [file_item()]).unwrap(),
+            dir.path().join("cache"),
+            draft_root.clone(),
+            20,
+            Arc::new(|_| panic!("no download expected")),
+        );
+        let (temporary, handle) = fuse
+            .create_file(ROOT_INODE, "swap.tmp", OpenFlags(libc::O_RDWR))
+            .unwrap();
+        fuse.write_file(temporary.inode, handle, 0, b"replacement")
+            .unwrap();
+        fuse.close_file(temporary.inode, handle);
+        fuse.rename_local_file(
+            ROOT_INODE,
+            "swap.tmp",
+            ROOT_INODE,
+            "текст.txt",
+            fuser::RenameFlags::empty(),
+        )
+        .unwrap();
+        let store = DraftStore::open(&draft_root).unwrap();
+        let draft = store.recover_item("drive", "file").unwrap().unwrap();
+        let snapshot = store.snapshot(draft.identity()).unwrap().unwrap();
+        let controller = fuse.published_version_controller();
+        let lease = controller.try_begin_existing("drive", "file").unwrap();
+        controller.publish_existing("file", "v2".into(), snapshot.size);
+        assert!(store.acknowledge(&snapshot).unwrap());
+        drop(lease);
+
+        fuse.rename_local_file(
+            ROOT_INODE,
+            "текст.txt",
+            ROOT_INODE,
+            "renamed.txt",
+            fuser::RenameFlags::empty(),
+        )
+        .unwrap();
+        assert!(fuse.lookup_node(ROOT_INODE, "текст.txt").is_none());
+        assert_eq!(
+            fuse.lookup_node(ROOT_INODE, "renamed.txt").unwrap().inode,
+            temporary.inode
+        );
+        let entries = fuse.directory_entries(ROOT_INODE).unwrap();
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| entry.2 == "renamed.txt")
+                .count(),
+            1
+        );
+        let changes = MutationStore::open(&draft_root).unwrap().list().unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].etag, "v2");
+        assert!(matches!(
+            &changes[0].kind,
+            MutationKind::Rename { target_name, .. } if target_name == "renamed.txt"
+        ));
+        drop(fuse);
+        let remounted = VirtualFuse::new_writable(
+            VirtualTree::from_items("drive", "root", [file_item()]).unwrap(),
+            dir.path().join("cache"),
+            draft_root,
+            20,
+            Arc::new(|_| panic!("no download expected")),
+        );
+        remounted.load_local_files().unwrap();
+        assert!(remounted.lookup_node(ROOT_INODE, "текст.txt").is_none());
+        assert_eq!(
+            remounted
+                .lookup_node(ROOT_INODE, "renamed.txt")
+                .unwrap()
+                .item_id,
+            "file"
+        );
+    }
+
+    #[test]
     fn editor_rename_waits_for_open_remote_target_before_replacing_its_draft() {
         let dir = tempfile::tempdir().unwrap();
         let draft_root = dir.path().join("drafts");
