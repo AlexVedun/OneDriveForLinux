@@ -564,7 +564,21 @@ fn confirmed_identical_content(
     .then(|| etag.to_owned())
 }
 
-async fn upload_error(response: reqwest::Response) -> UploadError {
+fn graph_upload_error_code(body: &[u8]) -> Option<String> {
+    if body.len() > 4096 {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let code = value.get("error")?.get("code")?.as_str()?;
+    (code.len() <= 64
+        && !code.is_empty()
+        && code
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')))
+    .then(|| code.to_owned())
+}
+
+async fn upload_error(response: reqwest::Response, phase: &'static str) -> UploadError {
     match response.status() {
         StatusCode::NOT_FOUND => UploadError::Expired,
         StatusCode::CONFLICT | StatusCode::PRECONDITION_FAILED => UploadError::Conflict,
@@ -582,7 +596,24 @@ async fn upload_error(response: reqwest::Response) -> UploadError {
         status if status.is_server_error() || status == StatusCode::RANGE_NOT_SATISFIABLE => {
             UploadError::Transient
         }
-        status => UploadError::HttpStatus(status.as_u16()),
+        status => {
+            let mut response = response;
+            let mut body = Vec::new();
+            let code = loop {
+                match response.chunk().await {
+                    Ok(Some(chunk)) if body.len() + chunk.len() <= 4096 => {
+                        body.extend_from_slice(&chunk);
+                    }
+                    Ok(None) => break graph_upload_error_code(&body),
+                    _ => break None,
+                }
+            };
+            UploadError::HttpStatus {
+                status: status.as_u16(),
+                code,
+                phase,
+            }
+        }
     }
 }
 
@@ -599,7 +630,7 @@ impl UploadTransport for GraphUpload<'_> {
             .await
             .map_err(|_| UploadError::Transient)?;
         if !response.status().is_success() {
-            return Err(upload_error(response).await);
+            return Err(upload_error(response, "create session").await);
         }
         let session: Session = response
             .json()
@@ -618,7 +649,7 @@ impl UploadTransport for GraphUpload<'_> {
             .await
             .map_err(|_| UploadError::Transient)?;
         if !response.status().is_success() {
-            return Err(upload_error(response).await);
+            return Err(upload_error(response, "query session").await);
         }
         let status: SessionStatus = response
             .json()
@@ -661,7 +692,7 @@ impl UploadTransport for GraphUpload<'_> {
                     etag: item.etag,
                 })
             }
-            _ => Err(upload_error(response).await),
+            _ => Err(upload_error(response, "send bytes").await),
         }
     }
 
@@ -678,7 +709,7 @@ impl UploadTransport for GraphUpload<'_> {
                 .await
                 .map_err(|_| UploadError::Transient)?;
             if response.status() != StatusCode::CREATED {
-                return Err(upload_error(response).await);
+                return Err(upload_error(response, "create empty file").await);
             }
             let item: CreatedVirtualFile = response
                 .json()
@@ -714,7 +745,7 @@ impl UploadTransport for GraphUpload<'_> {
             .await
             .map_err(|_| UploadError::Transient)?;
         if !matches!(response.status(), StatusCode::OK | StatusCode::CREATED) {
-            return Err(upload_error(response).await);
+            return Err(upload_error(response, "replace with empty file").await);
         }
         let item: UploadedEmptyItem = response
             .json()
@@ -1416,6 +1447,25 @@ impl GraphClient {
 mod tests {
     use super::*;
     use reqwest::header::AUTHORIZATION;
+
+    #[test]
+    fn graph_upload_error_code_only_accepts_small_safe_codes() {
+        assert_eq!(
+            graph_upload_error_code(
+                br#"{"error":{"code":"invalidRequest","message":"secret upload URL"}}"#
+            ),
+            Some("invalidRequest".into())
+        );
+        assert_eq!(
+            graph_upload_error_code(br#"{"error":{"code":"bad code"}}"#),
+            None
+        );
+        assert_eq!(
+            graph_upload_error_code(br#"{"error":{"code":"https://secret"}}"#),
+            None
+        );
+        assert_eq!(graph_upload_error_code(&vec![b'x'; 4097]), None);
+    }
 
     #[test]
     fn identical_cloud_content_requires_stable_file_version_and_exact_bytes() {

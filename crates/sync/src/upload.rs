@@ -23,7 +23,12 @@ pub enum UploadError {
     Transient,
     Conflict,
     Expired,
-    HttpStatus(u16),
+    HttpStatus {
+        status: u16,
+        /// Validated Graph error code; never a response message or upload URL.
+        code: Option<String>,
+        phase: &'static str,
+    },
 }
 
 impl From<io::Error> for UploadError {
