@@ -355,6 +355,7 @@ pub struct VirtualFuse {
     files: Arc<Mutex<HashMap<u64, OpenFile>>>,
     directories: Mutex<HashMap<u64, OpenDirectory>>,
     local_files: Arc<Mutex<HashMap<u64, Node>>>,
+    detached_files: Mutex<HashMap<u64, Node>>,
     directory_aliases: Arc<Mutex<HashMap<String, u64>>>,
     remote_changes: Mutex<HashMap<u64, Mutation>>,
     published_versions: Arc<Mutex<HashMap<u64, (String, u64)>>>,
@@ -382,6 +383,7 @@ impl VirtualFuse {
             files: Arc::new(Mutex::new(HashMap::new())),
             directories: Mutex::new(HashMap::new()),
             local_files: Arc::new(Mutex::new(HashMap::new())),
+            detached_files: Mutex::new(HashMap::new()),
             directory_aliases: Arc::new(Mutex::new(HashMap::new())),
             remote_changes: Mutex::new(HashMap::new()),
             published_versions: Arc::new(Mutex::new(HashMap::new())),
@@ -469,7 +471,28 @@ impl VirtualFuse {
 
     fn attr_with_store(&self, node: &Node, store: Option<&DraftStore>) -> Result<FileAttr, Errno> {
         let directory = node.kind == NodeKind::Directory;
-        let draft_attributes = if directory {
+        let detached = self
+            .detached_files
+            .lock()
+            .unwrap()
+            .contains_key(&node.inode);
+        let draft_attributes = if detached {
+            let files = self.files.lock().unwrap();
+            let draft = files.values().find_map(|open| {
+                if open.inode == node.inode
+                    && let OpenHandle::Draft(draft) = &open.handle
+                {
+                    return Some(draft);
+                }
+                None
+            });
+            Some(
+                draft
+                    .ok_or(Errno::ENOENT)?
+                    .attributes()
+                    .map_err(|_| Errno::EIO)?,
+            )
+        } else if directory {
             None
         } else {
             store
@@ -508,7 +531,13 @@ impl VirtualFuse {
             } else {
                 0o400
             },
-            nlink: if directory { 2 } else { 1 },
+            nlink: if directory {
+                2
+            } else if detached {
+                0
+            } else {
+                1
+            },
             uid: self.uid,
             gid: self.gid,
             rdev: 0,
@@ -550,7 +579,13 @@ impl VirtualFuse {
     }
 
     fn node(&self, inode: u64) -> Option<Node> {
-        let local = self.local_files.lock().unwrap().get(&inode).cloned();
+        let local = self
+            .local_files
+            .lock()
+            .unwrap()
+            .get(&inode)
+            .cloned()
+            .or_else(|| self.detached_files.lock().unwrap().get(&inode).cloned());
         let mut node = if let Some(local) = local {
             self.remote_node(&local)?
         } else {
@@ -1142,18 +1177,29 @@ impl VirtualFuse {
             drop(local);
             return self.queue_remote_change(&node, MutationKind::Delete);
         }
-        if self
-            .files
-            .lock()
-            .unwrap()
+        let files = self.files.lock().unwrap();
+        if files
             .values()
-            .any(|open| open.inode == node.inode)
+            .any(|open| open.inode == node.inode && !matches!(open.handle, OpenHandle::Draft(_)))
         {
-            return Err(Errno::EBUSY);
+            return Err(Errno::EIO);
         }
         DraftStore::open(root)
             .and_then(|store| store.remove_new(self.tree.drive_id(), &node.item_id))
             .map_err(map_draft_error)?;
+        let mut detached = false;
+        for open in files.values().filter(|open| open.inode == node.inode) {
+            if let OpenHandle::Draft(draft) = &open.handle {
+                draft.mark_detached();
+                detached = true;
+            }
+        }
+        if detached {
+            self.detached_files
+                .lock()
+                .unwrap()
+                .insert(node.inode, node.clone());
+        }
         local.remove(&node.inode);
         Ok(())
     }
@@ -1930,6 +1976,16 @@ impl VirtualFuse {
         Ok(())
     }
 
+    fn close_file(&self, inode: u64, handle: u64) {
+        let mut files = self.files.lock().unwrap();
+        if files.get(&handle).is_some_and(|open| open.inode == inode) {
+            files.remove(&handle);
+        }
+        if !files.values().any(|open| open.inode == inode) {
+            self.detached_files.lock().unwrap().remove(&inode);
+        }
+    }
+
     fn sync_directory(&self, inode: u64) -> Result<(), Errno> {
         let node = self.node(inode).ok_or(Errno::ENOENT)?;
         if node.kind != NodeKind::Directory {
@@ -2023,22 +2079,26 @@ impl VirtualFuse {
         if offset < 0 || !matches!(whence, libc::SEEK_DATA | libc::SEEK_HOLE) {
             return Err(Errno::EINVAL);
         }
-        let files = self.files.lock().unwrap();
-        if files.get(&handle).is_none_or(|open| open.inode != inode) {
-            return Err(Errno::EBADF);
-        }
+        let opened = self
+            .files
+            .lock()
+            .unwrap()
+            .get(&handle)
+            .filter(|open| open.inode == inode)
+            .ok_or(Errno::EBADF)?
+            .handle
+            .clone();
         let node = self.node(inode).ok_or(Errno::ENOENT)?;
         if node.kind != NodeKind::File {
             return Err(Errno::EISDIR);
         }
+        if self.detached_files.lock().unwrap().contains_key(&inode)
+            && let OpenHandle::Draft(draft) = &opened
+        {
+            return draft.seek_data_hole(offset, whence).map_err(map_seek_error);
+        }
         if let Some(draft) = self.draft_for_node(&node)? {
-            return draft.seek_data_hole(offset, whence).map_err(|error| {
-                match error.raw_os_error() {
-                    Some(libc::ENXIO) => Errno::ENXIO,
-                    Some(libc::EINVAL) => Errno::EINVAL,
-                    _ => Errno::EIO,
-                }
-            });
+            return draft.seek_data_hole(offset, whence).map_err(map_seek_error);
         }
         // Graph exposes file size, but not physical allocation. A regular file may
         // legally report all bytes as data and one implicit hole at EOF.
@@ -2143,6 +2203,14 @@ fn map_draft_error(error: io::Error) -> Errno {
     match error.raw_os_error() {
         Some(libc::ENOSPC) => Errno::ENOSPC,
         Some(libc::EDQUOT) => Errno::EDQUOT,
+        _ => Errno::EIO,
+    }
+}
+
+fn map_seek_error(error: io::Error) -> Errno {
+    match error.raw_os_error() {
+        Some(libc::ENXIO) => Errno::ENXIO,
+        Some(libc::EINVAL) => Errno::EINVAL,
         _ => Errno::EIO,
     }
 }
@@ -2278,7 +2346,19 @@ impl Filesystem for VirtualFuse {
                 return Ok(());
             }
             let node = self.node(inode.0).ok_or(Errno::ENOENT)?;
-            let draft = self.draft_for_node(&node)?.ok_or(Errno::EROFS)?;
+            let draft = if self.detached_files.lock().unwrap().contains_key(&inode.0) {
+                let files = self.files.lock().unwrap();
+                let open = files
+                    .get(&handle.ok_or(Errno::EBADF)?.0)
+                    .filter(|open| open.inode == inode.0)
+                    .ok_or(Errno::EBADF)?;
+                match &open.handle {
+                    OpenHandle::Draft(draft) => Arc::clone(draft),
+                    _ => return Err(Errno::EBADF),
+                }
+            } else {
+                Arc::new(self.draft_for_node(&node)?.ok_or(Errno::EROFS)?)
+            };
             let resolve = |time| match time {
                 fuser::TimeOrNow::SpecificTime(time) => time,
                 fuser::TimeOrNow::Now => std::time::SystemTime::now(),
@@ -2695,14 +2775,14 @@ impl Filesystem for VirtualFuse {
     fn release(
         &self,
         _request: &Request,
-        _inode: INodeNo,
+        inode: INodeNo,
         handle: FileHandle,
         _flags: OpenFlags,
         _lock_owner: Option<fuser::LockOwner>,
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        self.files.lock().unwrap().remove(&handle.0);
+        self.close_file(inode.0, handle.0);
         reply.ok();
     }
 }
@@ -4135,11 +4215,7 @@ mod tests {
             fuse.lookup_node(ROOT_INODE, "second.txt").unwrap().inode,
             node.inode
         );
-        assert_eq!(
-            fuse.remove_local_file(ROOT_INODE, "second.txt"),
-            Err(Errno::EBUSY)
-        );
-        fuse.files.lock().unwrap().remove(&handle);
+        fuse.close_file(node.inode, handle);
         drop(fuse);
 
         let tree = VirtualTree::from_items("drive", "root", [file_item()]).unwrap();
@@ -4179,6 +4255,72 @@ mod tests {
                 .list()
                 .unwrap()
                 .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn unlinked_open_local_file_stays_usable_until_last_close() {
+        let dir = tempfile::tempdir().unwrap();
+        let draft_root = dir.path().join("drafts");
+        let make_fuse = || {
+            VirtualFuse::new_writable(
+                VirtualTree::from_items("drive", "root", []).unwrap(),
+                dir.path().join("cache"),
+                draft_root.clone(),
+                10,
+                Arc::new(|_| Err(io::ErrorKind::NotConnected.into())),
+            )
+        };
+        let fuse = make_fuse();
+        let (old, writer) = fuse
+            .create_file(ROOT_INODE, "note.txt", OpenFlags(libc::O_RDWR))
+            .unwrap();
+        fuse.write_file(old.inode, writer, 0, b"old").unwrap();
+        let reader = fuse
+            .open_file(old.inode, OpenFlags(libc::O_RDONLY))
+            .unwrap();
+
+        fuse.remove_local_file(ROOT_INODE, "note.txt").unwrap();
+        assert!(fuse.lookup_node(ROOT_INODE, "note.txt").is_none());
+        assert_eq!(fuse.directory_entries(ROOT_INODE).unwrap().len(), 2);
+        assert!(
+            DraftStore::open(&draft_root)
+                .unwrap()
+                .list()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(fuse.attr(&fuse.node(old.inode).unwrap()).unwrap().nlink, 0);
+        fuse.write_file(old.inode, writer, 3, b"!").unwrap();
+        fuse.truncate_file(old.inode, Some(writer), 3).unwrap();
+        fuse.sync_file(old.inode, writer).unwrap();
+        assert_eq!(fuse.attr(&fuse.node(old.inode).unwrap()).unwrap().size, 3);
+        assert_eq!(fuse.seek_file(old.inode, writer, 0, libc::SEEK_HOLE), Ok(3));
+        assert_eq!(fuse.read_file(old.inode, reader, 0, 4).unwrap(), b"old");
+
+        let (replacement, replacement_handle) = fuse
+            .create_file(ROOT_INODE, "note.txt", OpenFlags(libc::O_RDWR))
+            .unwrap();
+        fuse.write_file(replacement.inode, replacement_handle, 0, b"new")
+            .unwrap();
+        assert_ne!(old.inode, replacement.inode);
+        fuse.close_file(old.inode, writer);
+        assert_eq!(fuse.read_file(old.inode, reader, 0, 4).unwrap(), b"old");
+        fuse.close_file(old.inode, reader);
+        assert!(fuse.node(old.inode).is_none());
+        assert!(fuse.detached_files.lock().unwrap().is_empty());
+        fuse.close_file(replacement.inode, replacement_handle);
+        drop(fuse);
+
+        let fuse = make_fuse();
+        fuse.load_local_files().unwrap();
+        assert_eq!(
+            fuse.lookup_node(ROOT_INODE, "note.txt").unwrap().inode,
+            replacement.inode
+        );
+        assert_eq!(
+            DraftStore::open(&draft_root).unwrap().list().unwrap().len(),
             1
         );
     }
@@ -5301,6 +5443,59 @@ mod tests {
         session.umount_and_join().unwrap();
         let session = mount();
         assert_eq!(fs::read(&path).unwrap(), b"first second");
+        session.umount_and_join().unwrap();
+    }
+
+    #[test]
+    fn mounted_unlinked_file_keeps_open_descriptor_and_name_can_be_reused() {
+        if std::env::var_os("ONEDRIVE_FUSE_SMOKE").is_none() {
+            return;
+        }
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mountpoint = dir.path().join("mount");
+        let draft_root = dir.path().join("drafts");
+        fs::create_dir(&mountpoint).unwrap();
+        let mount = || {
+            VirtualFuse::new_writable(
+                VirtualTree::from_items("drive", "root", []).unwrap(),
+                dir.path().join("cache"),
+                draft_root.clone(),
+                10,
+                Arc::new(|_| Err(io::ErrorKind::NotConnected.into())),
+            )
+            .mount(&mountpoint)
+            .unwrap()
+        };
+        let path = mountpoint.join("note.txt");
+        let session = mount();
+        let mut old = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        old.write_all(b"old").unwrap();
+        fs::remove_file(&path).unwrap();
+        assert!(!path.exists());
+        old.write_all(b"!").unwrap();
+        old.set_len(3).unwrap();
+        assert_eq!(old.metadata().unwrap().len(), 3);
+        fs::write(&path, b"new").unwrap();
+        let mut bytes = [0; 3];
+        assert_eq!(old.read_at(&mut bytes, 0).unwrap(), 3);
+        assert_eq!(&bytes, b"old");
+        drop(old);
+        session.umount_and_join().unwrap();
+
+        let session = mount();
+        assert_eq!(fs::read(&path).unwrap(), b"new");
+        assert_eq!(
+            DraftStore::open(&draft_root).unwrap().list().unwrap().len(),
+            1
+        );
         session.umount_and_join().unwrap();
     }
 
