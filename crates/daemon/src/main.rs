@@ -1882,6 +1882,21 @@ impl Daemon {
         .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))
     }
 
+    /// Discard expendable downloads while retaining pinned offline files and drafts.
+    async fn clear_virtual_cache(&self) -> zbus::fdo::Result<(u64, u64)> {
+        let root = state_directory()
+            .map_err(|_| zbus::fdo::Error::Failed("cannot access state directory".to_owned()))?
+            .join("virtual-cache");
+        tokio::task::spawn_blocking(move || {
+            let mut cache = CacheStore::open_waiting(&root, VIRTUAL_CACHE_BYTES)?;
+            let cleared = cache.clear_unpinned()?;
+            Ok::<_, CacheError>((cleared, cache.usage_bytes()?))
+        })
+        .await
+        .map_err(|_| zbus::fdo::Error::Failed("cache clear task failed".to_owned()))?
+        .map_err(|error| zbus::fdo::Error::Failed(error.to_string()))
+    }
+
     /// Apply a new limit immediately; pinned files can never be evicted to satisfy it.
     async fn set_virtual_cache_limit(&self, bytes: u64) -> zbus::fdo::Result<(u64, u64)> {
         if !(MIN_VIRTUAL_CACHE_BYTES..=MAX_VIRTUAL_CACHE_BYTES).contains(&bytes) {
