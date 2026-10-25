@@ -505,6 +505,33 @@ impl VirtualFuse {
         self.attr_with_store(node, store.as_ref())
     }
 
+    fn attr_for_handle(&self, inode: u64, handle: Option<u64>) -> Result<FileAttr, Errno> {
+        if let Some(node) = self.node(inode) {
+            return self.attr(&node);
+        }
+        let cached = {
+            let files = self.files.lock().unwrap();
+            let open = files
+                .get(&handle.ok_or(Errno::ENOENT)?)
+                .filter(|open| open.inode == inode)
+                .ok_or(Errno::ENOENT)?;
+            let OpenHandle::Cached(cached) = &open.handle else {
+                return Err(Errno::ENOENT);
+            };
+            Arc::clone(cached)
+        };
+        let node = self.tree.getattr(inode).ok_or(Errno::ENOENT)?;
+        let mut attr = self.attr_with_store(node, None)?;
+        attr.size = cached
+            .source_file()
+            .metadata()
+            .map_err(|_| Errno::EIO)?
+            .len();
+        attr.blocks = attr.size.saturating_add(511) / 512;
+        attr.nlink = 0;
+        Ok(attr)
+    }
+
     fn attr_with_store(&self, node: &Node, store: Option<&DraftStore>) -> Result<FileAttr, Errno> {
         let directory = node.kind == NodeKind::Directory;
         let detached = self
@@ -2318,15 +2345,12 @@ impl Filesystem for VirtualFuse {
         &self,
         _request: &Request,
         inode: INodeNo,
-        _handle: Option<FileHandle>,
+        handle: Option<FileHandle>,
         reply: ReplyAttr,
     ) {
-        match self.node(inode.0) {
-            Some(node) => match self.attr(&node) {
-                Ok(attr) => reply.attr(&TTL, &attr),
-                Err(error) => reply.error(error),
-            },
-            None => reply.error(Errno::ENOENT),
+        match self.attr_for_handle(inode.0, handle.map(|handle| handle.0)) {
+            Ok(attr) => reply.attr(&TTL, &attr),
+            Err(error) => reply.error(error),
         }
     }
 
@@ -3882,7 +3906,16 @@ mod tests {
             fuse.seek_file(node.inode, handle, 5, libc::SEEK_DATA),
             Err(Errno::ENXIO)
         );
+        assert_eq!(fuse.attr_for_handle(node.inode, None), Err(Errno::ENOENT));
+        let attr = fuse.attr_for_handle(node.inode, Some(handle)).unwrap();
+        assert_eq!(attr.ino.0, node.inode);
+        assert_eq!(attr.size, 5);
+        assert_eq!(attr.nlink, 0);
         fuse.close_file(node.inode, handle);
+        assert_eq!(
+            fuse.attr_for_handle(node.inode, Some(handle)),
+            Err(Errno::ENOENT)
+        );
     }
 
     #[test]
