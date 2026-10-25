@@ -1420,6 +1420,9 @@ impl VirtualFuse {
                 return Err(Errno::EEXIST);
             }
             let store = DraftStore::open(root).map_err(map_draft_error)?;
+            store
+                .ensure_new_removable(self.tree.drive_id(), &node.item_id)
+                .map_err(map_draft_error)?;
             let source = store
                 .recover_item(self.tree.drive_id(), &node.item_id)
                 .map_err(map_draft_error)?
@@ -1475,6 +1478,9 @@ impl VirtualFuse {
                 return Err(Errno::EIO);
             }
             let store = DraftStore::open(root).map_err(map_draft_error)?;
+            store
+                .ensure_new_removable(self.tree.drive_id(), &target.item_id)
+                .map_err(map_draft_error)?;
             let old_location = NewFileLocation {
                 parent_id: local
                     .get(&parent)
@@ -4822,6 +4828,215 @@ mod tests {
                 .is_some()
         );
         assert!(store.upload_checkpoint(&identity).unwrap().is_some());
+    }
+
+    #[test]
+    fn uncertain_source_or_remote_target_blocks_editor_replacement_before_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let draft_root = dir.path().join("drafts");
+        let fuse = VirtualFuse::new_writable(
+            VirtualTree::from_items("drive", "root", [file_item()]).unwrap(),
+            dir.path().join("cache"),
+            draft_root.clone(),
+            20,
+            Arc::new(|_| panic!("no download expected")),
+        );
+        let target = fuse.lookup_node(ROOT_INODE, "текст.txt").unwrap();
+        let target_handle = fuse
+            .open_file(target.inode, OpenFlags(libc::O_RDWR | libc::O_TRUNC))
+            .unwrap();
+        fuse.write_file(target.inode, target_handle, 0, b"old")
+            .unwrap();
+        fuse.close_file(target.inode, target_handle);
+        let (source, source_handle) = fuse
+            .create_file(ROOT_INODE, "swap.tmp", OpenFlags(libc::O_RDWR))
+            .unwrap();
+        fuse.write_file(source.inode, source_handle, 0, b"new")
+            .unwrap();
+        fuse.close_file(source.inode, source_handle);
+        let store = DraftStore::open(&draft_root).unwrap();
+        let source_identity = store
+            .recover_item("drive", &source.item_id)
+            .unwrap()
+            .unwrap()
+            .identity()
+            .clone();
+        let target_identity = store
+            .recover_item("drive", "file")
+            .unwrap()
+            .unwrap()
+            .identity()
+            .clone();
+        let mut source_checkpoint = DraftUploadCheckpoint {
+            identity: source_identity.clone(),
+            sha256: "a".repeat(64),
+            size: 3,
+            upload_url: "https://upload.example/source".into(),
+            next_offset: 0,
+            final_chunk_attempted: true,
+        };
+        store.save_upload_checkpoint(&source_checkpoint).unwrap();
+
+        assert_eq!(
+            fuse.rename_local_file(
+                ROOT_INODE,
+                "swap.tmp",
+                ROOT_INODE,
+                "текст.txt",
+                fuser::RenameFlags::empty()
+            ),
+            Err(Errno::EBUSY)
+        );
+        assert_eq!(
+            fuse.lookup_node(ROOT_INODE, "swap.tmp").unwrap().inode,
+            source.inode
+        );
+        let mut bytes = [0; 3];
+        assert_eq!(
+            store
+                .recover_item("drive", "file")
+                .unwrap()
+                .unwrap()
+                .read_at(0, &mut bytes)
+                .unwrap(),
+            3
+        );
+        assert_eq!(&bytes, b"old");
+        assert_eq!(
+            store.upload_checkpoint(&source_identity).unwrap(),
+            Some(source_checkpoint.clone())
+        );
+
+        source_checkpoint.final_chunk_attempted = false;
+        store.save_upload_checkpoint(&source_checkpoint).unwrap();
+        let target_checkpoint = DraftUploadCheckpoint {
+            identity: target_identity.clone(),
+            final_chunk_attempted: true,
+            ..source_checkpoint.clone()
+        };
+        store.save_upload_checkpoint(&target_checkpoint).unwrap();
+        assert_eq!(
+            fuse.rename_local_file(
+                ROOT_INODE,
+                "swap.tmp",
+                ROOT_INODE,
+                "текст.txt",
+                fuser::RenameFlags::empty()
+            ),
+            Err(Errno::EBUSY)
+        );
+        assert_eq!(
+            fuse.lookup_node(ROOT_INODE, "swap.tmp").unwrap().inode,
+            source.inode
+        );
+        let mut bytes = [0; 3];
+        assert_eq!(
+            store
+                .recover_item("drive", "file")
+                .unwrap()
+                .unwrap()
+                .read_at(0, &mut bytes)
+                .unwrap(),
+            3
+        );
+        assert_eq!(&bytes, b"old");
+        assert_eq!(
+            store.upload_checkpoint(&source_identity).unwrap(),
+            Some(source_checkpoint)
+        );
+        assert_eq!(
+            store.upload_checkpoint(&target_identity).unwrap(),
+            Some(target_checkpoint)
+        );
+    }
+
+    #[test]
+    fn uncertain_local_target_blocks_replacement_without_moving_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let draft_root = dir.path().join("drafts");
+        let fuse = VirtualFuse::new_writable(
+            VirtualTree::from_items("drive", "root", []).unwrap(),
+            dir.path().join("cache"),
+            draft_root.clone(),
+            20,
+            Arc::new(|_| panic!("no download expected")),
+        );
+        let (source, source_handle) = fuse
+            .create_file(ROOT_INODE, "swap.tmp", OpenFlags(libc::O_RDWR))
+            .unwrap();
+        fuse.write_file(source.inode, source_handle, 0, b"new")
+            .unwrap();
+        fuse.close_file(source.inode, source_handle);
+        let (target, target_handle) = fuse
+            .create_file(ROOT_INODE, "target.txt", OpenFlags(libc::O_RDWR))
+            .unwrap();
+        fuse.write_file(target.inode, target_handle, 0, b"old")
+            .unwrap();
+        fuse.close_file(target.inode, target_handle);
+        let store = DraftStore::open(&draft_root).unwrap();
+        let source_identity = store
+            .recover_item("drive", &source.item_id)
+            .unwrap()
+            .unwrap()
+            .identity()
+            .clone();
+        let target_identity = store
+            .recover_item("drive", &target.item_id)
+            .unwrap()
+            .unwrap()
+            .identity()
+            .clone();
+        let source_checkpoint = DraftUploadCheckpoint {
+            identity: source_identity.clone(),
+            sha256: "a".repeat(64),
+            size: 3,
+            upload_url: "https://upload.example/source".into(),
+            next_offset: 0,
+            final_chunk_attempted: false,
+        };
+        store.save_upload_checkpoint(&source_checkpoint).unwrap();
+        let target_checkpoint = DraftUploadCheckpoint {
+            identity: target_identity.clone(),
+            final_chunk_attempted: true,
+            upload_url: "https://upload.example/target".into(),
+            ..source_checkpoint.clone()
+        };
+        store.save_upload_checkpoint(&target_checkpoint).unwrap();
+
+        assert_eq!(
+            fuse.rename_local_file(
+                ROOT_INODE,
+                "swap.tmp",
+                ROOT_INODE,
+                "target.txt",
+                fuser::RenameFlags::empty()
+            ),
+            Err(Errno::EBUSY)
+        );
+        assert_eq!(
+            fuse.lookup_node(ROOT_INODE, "swap.tmp").unwrap().inode,
+            source.inode
+        );
+        assert_eq!(
+            fuse.lookup_node(ROOT_INODE, "target.txt").unwrap().inode,
+            target.inode
+        );
+        assert_eq!(
+            store
+                .recover_item("drive", &source.item_id)
+                .unwrap()
+                .unwrap()
+                .identity(),
+            &source_identity
+        );
+        assert_eq!(
+            store.upload_checkpoint(&source_identity).unwrap(),
+            Some(source_checkpoint)
+        );
+        assert_eq!(
+            store.upload_checkpoint(&target_identity).unwrap(),
+            Some(target_checkpoint)
+        );
     }
 
     #[test]
