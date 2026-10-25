@@ -331,11 +331,11 @@ impl<'a> GraphUpload<'a> {
                     .http
                     .post(url)
                     .bearer_auth(self.access_token)
+                    // Graph can reject the optional fileSize hint for new uploads.
                     .json(&serde_json::json!({
                         "item": {
                             "@microsoft.graph.conflictBehavior": "fail",
                             "name": name,
-                            "fileSize": size,
                         }
                     }))
                     .build()
@@ -366,10 +366,10 @@ impl<'a> GraphUpload<'a> {
                     .http
                     .post(url)
                     .bearer_auth(self.access_token)
+                    // Keep the parent-ID form equivalent to the path form.
                     .json(&serde_json::json!({"item": {
                         "@microsoft.graph.conflictBehavior": "fail",
                         "name": name,
-                        "fileSize": size,
                     }}))
                     .build()
                     .map_err(|_| UploadError::InvalidResponse)
@@ -1874,7 +1874,7 @@ mod tests {
             serde_json::from_slice(request.body().unwrap().as_bytes().unwrap()).unwrap();
         assert_eq!(body["item"]["@microsoft.graph.conflictBehavior"], "fail");
         assert_eq!(body["item"]["name"], "new file.txt");
-        assert_eq!(body["item"]["fileSize"], 42);
+        assert!(body["item"].get("fileSize").is_none());
         operation.path = "Docs/Work/new file.txt".into();
         let nested = upload.create_session_request(&operation, 42).unwrap();
         assert_eq!(
@@ -1912,6 +1912,8 @@ mod tests {
         let body: serde_json::Value =
             serde_json::from_slice(request.body().unwrap().as_bytes().unwrap()).unwrap();
         assert_eq!(body["item"]["@microsoft.graph.conflictBehavior"], "fail");
+        assert_eq!(body["item"]["name"], "new file.txt");
+        assert!(body["item"].get("fileSize").is_none());
         operation.path = "invalid:name".into();
         assert!(upload.create_session_request(&operation, 42).is_err());
     }
