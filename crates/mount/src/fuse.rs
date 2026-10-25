@@ -1396,14 +1396,11 @@ impl VirtualFuse {
             && node.kind == NodeKind::File
             && target.kind == NodeKind::File
         {
-            if self
-                .files
-                .lock()
-                .unwrap()
-                .values()
-                .any(|open| open.inode == target.inode)
-            {
-                return Err(Errno::EBUSY);
+            let files = self.files.lock().unwrap();
+            if files.values().any(|open| {
+                open.inode == target.inode && !matches!(open.handle, OpenHandle::Draft(_))
+            }) {
+                return Err(Errno::EIO);
             }
             let store = DraftStore::open(root).map_err(map_draft_error)?;
             let old_location = NewFileLocation {
@@ -1428,6 +1425,19 @@ impl VirtualFuse {
             if let Err(error) = store.remove_new(self.tree.drive_id(), &target.item_id) {
                 let _ = store.relocate_new(self.tree.drive_id(), &node.item_id, old_location);
                 return Err(map_draft_error(error));
+            }
+            let mut detached = false;
+            for open in files.values().filter(|open| open.inode == target.inode) {
+                if let OpenHandle::Draft(draft) = &open.handle {
+                    draft.mark_detached();
+                    detached = true;
+                }
+            }
+            if detached {
+                self.detached_files
+                    .lock()
+                    .unwrap()
+                    .insert(target.inode, target.clone());
             }
             local.remove(&target.inode);
             let moved = local.get_mut(&node.inode).ok_or(Errno::EIO)?;
@@ -4529,17 +4539,6 @@ mod tests {
                 "source.txt",
                 ROOT_INODE,
                 "target.txt",
-                fuser::RenameFlags::empty(),
-            ),
-            Err(Errno::EBUSY)
-        );
-        fuse.files.lock().unwrap().remove(&target_handle);
-        assert_eq!(
-            fuse.rename_local_file(
-                ROOT_INODE,
-                "source.txt",
-                ROOT_INODE,
-                "target.txt",
                 fuser::RenameFlags::from_bits_truncate(libc::RENAME_NOREPLACE),
             ),
             Err(Errno::EEXIST)
@@ -4557,13 +4556,28 @@ mod tests {
             fuse.lookup_node(ROOT_INODE, "target.txt").unwrap().inode,
             source.inode
         );
+        assert_eq!(
+            fuse.attr(&fuse.node(target.inode).unwrap()).unwrap().nlink,
+            0
+        );
+        assert_eq!(
+            fuse.read_file(target.inode, target_handle, 0, 3).unwrap(),
+            b"old"
+        );
+        fuse.write_file(target.inode, target_handle, 3, b"!")
+            .unwrap();
+        assert_eq!(
+            fuse.read_file(target.inode, target_handle, 0, 4).unwrap(),
+            b"old!"
+        );
         fuse.write_file(source.inode, source_handle, 3, b"!")
             .unwrap();
         assert_eq!(
             fuse.read_file(source.inode, source_handle, 0, 4).unwrap(),
             b"new!"
         );
-        fuse.files.lock().unwrap().remove(&source_handle);
+        fuse.close_file(source.inode, source_handle);
+        fuse.close_file(target.inode, target_handle);
         drop(fuse);
         let fuse = make_fuse();
         fuse.load_local_files().unwrap();
@@ -5847,8 +5861,20 @@ mod tests {
         let session = mount();
         fs::write(mountpoint.join("source.txt"), b"new").unwrap();
         fs::write(mountpoint.join("target.txt"), b"old").unwrap();
+        let old_target = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(mountpoint.join("target.txt"))
+            .unwrap();
         fs::rename(mountpoint.join("source.txt"), mountpoint.join("target.txt")).unwrap();
         assert_eq!(fs::read(mountpoint.join("target.txt")).unwrap(), b"new");
+        let mut old_bytes = [0; 4];
+        assert_eq!(old_target.read_at(&mut old_bytes, 0).unwrap(), 3);
+        assert_eq!(&old_bytes[..3], b"old");
+        old_target.write_at(b"!", 3).unwrap();
+        assert_eq!(old_target.read_at(&mut old_bytes, 0).unwrap(), 4);
+        assert_eq!(&old_bytes, b"old!");
+        drop(old_target);
         session.umount_and_join().unwrap();
         let session = mount();
         assert!(!mountpoint.join("source.txt").exists());
