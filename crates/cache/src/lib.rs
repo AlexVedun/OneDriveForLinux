@@ -385,6 +385,36 @@ impl CacheStore {
         Ok(())
     }
 
+    /// Remove complete, unpinned downloads. Pinned offline files stay available.
+    /// The caller holds the cache lock, so downloads cannot be published mid-clear.
+    pub fn clear_unpinned(&mut self) -> Result<u64, CacheError> {
+        let before = self.usage_bytes()?;
+        loop {
+            let victim: Option<(String, String, String, String)> = self.connection.query_row(
+                "SELECT drive_id, item_id, version, filename FROM entry WHERE pinned = 0 LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            ).optional()?;
+            let Some((drive_id, item_id, version, filename)) = victim else {
+                break;
+            };
+            let key = CacheKey::new(&drive_id, &item_id, &version)?;
+            if filename != key.filename() {
+                return Err(CacheError::InvalidKey);
+            }
+            match fs::remove_file(self.objects.join(filename)) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+            self.connection.execute(
+                "DELETE FROM entry WHERE drive_id = ?1 AND item_id = ?2 AND pinned = 0",
+                params![drive_id, item_id],
+            )?;
+        }
+        Ok(before.saturating_sub(self.usage_bytes()?))
+    }
+
     fn evict_to_limit(&mut self) -> Result<(), CacheError> {
         while self.usage_bytes()? > self.max_bytes {
             let victim: Option<(String, String, String, String)> = self
@@ -526,6 +556,31 @@ mod tests {
             Err(CacheError::LimitExceeded)
         ));
         assert_eq!(reopened.limit_bytes(), 4);
+    }
+
+    #[test]
+    fn clear_removes_only_unpinned_downloads_and_keeps_offline_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("cache");
+        let source = directory.path().join("source");
+        let draft = directory.path().join("draft");
+        fs::write(&draft, b"local changes").unwrap();
+        let mut cache = CacheStore::open(&root, 20).unwrap();
+        fs::write(&source, b"offline").unwrap();
+        cache.put(&key("pinned", "v1"), &source, 7).unwrap();
+        cache.set_pinned(&key("pinned", "v1"), true).unwrap();
+        fs::write(&source, b"temporary").unwrap();
+        cache.put(&key("ordinary", "v1"), &source, 9).unwrap();
+
+        assert_eq!(cache.clear_unpinned().unwrap(), 9);
+        assert_eq!(cache.clear_unpinned().unwrap(), 0);
+        assert_eq!(cache.usage_bytes().unwrap(), 7);
+        assert!(cache.get(&key("ordinary", "v1")).unwrap().is_none());
+        assert_eq!(
+            content(cache.get(&key("pinned", "v1")).unwrap().unwrap()),
+            "offline"
+        );
+        assert_eq!(fs::read(&draft).unwrap(), b"local changes");
     }
 
     #[test]
