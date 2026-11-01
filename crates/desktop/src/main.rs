@@ -430,7 +430,11 @@ fn validated_sync_root(root: &str) -> Result<Option<PathBuf>, String> {
     }
     let path = PathBuf::from(root);
     if !path.is_absolute() || !path.is_dir() || path.canonicalize().ok().as_ref() != Some(&path) {
-        return Err("Папка синхронизации недоступна или изменила путь".to_owned());
+        return Err(t(
+            "Sync folder is unavailable or moved",
+            "Тека синхронізації недоступна або її шлях змінився",
+        )
+        .to_owned());
     }
     Ok(Some(path))
 }
@@ -496,16 +500,26 @@ fn virtual_directories_text(directories: &[UiVirtualDirectory]) -> String {
         return String::new();
     }
     let mut text = format!(
-        "Папки: {pending} к отправке · {waiting} ждут родителя · {verifying} проверяются · {uploaded} созданы · {} требуют сверки.",
-        issues.len()
+        "{}: {pending} {} · {waiting} {} · {verifying} {} · {uploaded} {} · {} {}.",
+        t("Folders", "Теки"),
+        t("to upload", "до надсилання"),
+        t("awaiting parent", "очікують батьківську теку"),
+        t("being checked", "перевіряються"),
+        t("created", "створено"),
+        issues.len(),
+        t("need review", "потребують звірки"),
     );
     if let Some(issue) = issues.first() {
         let reason = if issue.status == "name-conflict" {
-            "имя занято"
+            t("name already in use", "назву вже зайнято")
         } else {
-            "родитель не найден"
+            t("parent not found", "батьківську теку не знайдено")
         };
-        text.push_str(&format!("\n• Папка «{}»: {reason}.", issue.name));
+        text.push_str(&format!(
+            "\n• {} «{}»: {reason}.",
+            t("Folder", "Тека"),
+            issue.name
+        ));
     }
     text
 }
@@ -548,13 +562,25 @@ fn virtual_mutations_text(mutations: &[UiVirtualMutation]) -> String {
         .iter()
         .filter(|item| item.status == "pending" && item.kind == "delete")
         .count();
-    let mut text =
-        format!("Операции: {pending} ожидают · {applied} выполнены · {conflicts} требуют сверки.");
+    let mut text = format!(
+        "{}: {pending} {} · {applied} {} · {conflicts} {}.",
+        t("Operations", "Операції"),
+        t("pending", "очікують"),
+        t("completed", "виконано"),
+        t("need review", "потребують звірки")
+    );
     if deletes > 10 {
-        text.push_str("\n• Массовое удаление приостановлено.");
+        text.push_str(t(
+            "\n• Bulk deletion is paused.",
+            "\n• Масове видалення призупинено.",
+        ));
     }
     if let Some(issue) = mutations.iter().find(|item| item.status == "conflict") {
-        text.push_str(&format!("\n• Конфликт: {}.", issue.name));
+        text.push_str(&format!(
+            "\n• {}: {}.",
+            t("Conflict", "Конфлікт"),
+            issue.name
+        ));
     }
     text
 }
@@ -601,45 +627,66 @@ fn discard_virtual_draft(drive_id: &str, item_id: &str) -> Result<(), String> {
 
 fn virtual_draft_status_label(status: &str) -> &'static str {
     match status {
-        "ready" => "готов к отправке; версия в каталоге совпадает",
-        "ready-new" => "новый файл сохранён локально; ожидает отправки",
-        "new-empty" => {
-            "пустой новый файл сохранён локально; для отправки нужен экспериментальный режим"
-        }
-        "other-drive" => "другая учётная запись или диск",
-        "catalog-incomplete" => "каталог ещё не сверён",
-        "remote-missing" => "файл отсутствует в каталоге",
-        "remote-not-file" => "объект больше не является файлом",
-        "remote-changed" => "версия в каталоге изменилась",
-        "name-conflict" => "в OneDrive уже есть объект с таким именем",
-        "uncertain-new" => {
-            "результат создания файла неизвестен; проверяется единственный объект с тем же именем"
-        }
-        "uncertain-empty-existing" => {
-            "результат отправки пустого файла неизвестен; требуется проверка в OneDrive"
-        }
-        "uncertain-existing" => {
-            "результат отправки файла неизвестен; требуется проверка содержимого в OneDrive"
-        }
-        "uncertain-empty-new" => {
-            "результат создания пустого файла неизвестен; требуется сравнение с OneDrive"
-        }
-        _ => "неизвестное состояние",
+        "ready" => t(
+            "ready to upload; catalog version matches",
+            "готовий до надсилання; версія в каталозі збігається",
+        ),
+        "ready-new" => t(
+            "new file saved locally; awaiting upload",
+            "новий файл збережено локально; очікує надсилання",
+        ),
+        "new-empty" => t(
+            "empty new file saved locally; experimental upload mode required",
+            "новий порожній файл збережено локально; потрібен експериментальний режим надсилання",
+        ),
+        "other-drive" => t(
+            "different account or drive",
+            "інший обліковий запис або диск",
+        ),
+        "catalog-incomplete" => t("catalog not yet reconciled", "каталог ще не звірено"),
+        "remote-missing" => t("file missing from catalog", "файлу немає в каталозі"),
+        "remote-not-file" => t("item is no longer a file", "об’єкт більше не є файлом"),
+        "remote-changed" => t("catalog version changed", "версія в каталозі змінилася"),
+        "name-conflict" => t(
+            "an item with this name already exists in OneDrive",
+            "об’єкт із такою назвою вже існує в OneDrive",
+        ),
+        "uncertain-new" => t(
+            "file creation outcome unknown; checking the only item with the same name",
+            "результат створення файлу невідомий; перевіряється єдиний об’єкт із такою назвою",
+        ),
+        "uncertain-empty-existing" => t(
+            "empty-file upload outcome unknown; check OneDrive",
+            "результат надсилання порожнього файлу невідомий; перевірте OneDrive",
+        ),
+        "uncertain-existing" => t(
+            "upload outcome unknown; compare content in OneDrive",
+            "результат надсилання файлу невідомий; порівняйте вміст у OneDrive",
+        ),
+        "uncertain-empty-new" => t(
+            "empty-file creation outcome unknown; compare with OneDrive",
+            "результат створення порожнього файлу невідомий; порівняйте з OneDrive",
+        ),
+        _ => t("unknown state", "невідомий стан"),
     }
 }
 
 fn virtual_draft_upload_issue_label(issue: &str) -> &'static str {
     match issue {
-        "login-required" => "нужен повторный вход",
-        "remote-changed" => "облачный файл изменился",
-        "transfer-failed" => "ошибка передачи",
-        _ => "ошибка отправки",
+        "login-required" => t("sign-in required again", "потрібен повторний вхід"),
+        "remote-changed" => t("cloud file changed", "хмарний файл змінився"),
+        "transfer-failed" => t("transfer failed", "помилка передавання"),
+        _ => t("upload failed", "помилка надсилання"),
     }
 }
 
 fn virtual_drafts_text(drafts: &[UiVirtualDraft]) -> String {
     if drafts.is_empty() {
-        return "Локальных изменений для отправки нет".to_owned();
+        return t(
+            "No local changes to upload",
+            "Немає локальних змін для надсилання",
+        )
+        .to_owned();
     }
     let attention = drafts
         .iter()
@@ -650,8 +697,15 @@ fn virtual_drafts_text(drafts: &[UiVirtualDraft]) -> String {
         .filter(|draft| draft.last_upload_issue.is_some())
         .count();
     let mut lines = vec![format!(
-        "Черновики: {} · требуют внимания: {attention} · ошибки отправки: {failed}.\nОткройте полный список для проверки.",
-        drafts.len()
+        "{}: {} · {}: {attention} · {}: {failed}.\n{}",
+        t("Drafts", "Чернетки"),
+        drafts.len(),
+        t("need attention", "потребують уваги"),
+        t("upload errors", "помилки надсилання"),
+        t(
+            "Open the full list to review.",
+            "Відкрийте повний список для перевірки."
+        ),
     )];
     for draft in drafts
         .iter()
@@ -671,31 +725,49 @@ fn virtual_drafts_text(drafts: &[UiVirtualDraft]) -> String {
                 .map(|status| format!(" (HTTP {status})"))
                 .unwrap_or_default();
             lines.push(format!(
-                "  Предыдущая фоновая отправка: {}{http_status}",
+                "  {}: {}{http_status}",
+                t("Previous background upload", "Попереднє фонове надсилання"),
                 virtual_draft_upload_issue_label(issue),
             ));
         }
     }
     if drafts.len() > 3 {
-        lines.push(format!("И ещё {} локальных изменений", drafts.len() - 3));
+        lines.push(format!(
+            "{} {} {}",
+            t("And", "І ще"),
+            drafts.len() - 3,
+            t("more local changes", "локальних змін")
+        ));
     }
     lines.join("\n")
 }
 
 fn fuse_diagnostics_label(device: &str, helper: bool) -> &'static str {
     match (device, helper) {
-        ("device-missing", _) => {
-            "FUSE: отсутствует /dev/fuse. Проверьте модуль ядра и доступность устройства."
-        }
-        ("device-permission", _) => {
-            "FUSE: нет доступа к /dev/fuse. Проверьте разрешения устройства."
-        }
-        ("device-error", _) => "FUSE: не удалось проверить /dev/fuse.",
-        ("ready", false) => {
-            "FUSE: устройство доступно. Помощник fusermount3 не найден; он может потребоваться для подключения."
-        }
-        ("ready", true) => "FUSE: устройство и помощник монтирования доступны.",
-        _ => "FUSE: неизвестное состояние устройства.",
+        ("device-missing", _) => t(
+            "FUSE: /dev/fuse is missing. Check the kernel module and device.",
+            "FUSE: немає /dev/fuse. Перевірте модуль ядра та пристрій.",
+        ),
+        ("device-permission", _) => t(
+            "FUSE: no access to /dev/fuse. Check device permissions.",
+            "FUSE: немає доступу до /dev/fuse. Перевірте права пристрою.",
+        ),
+        ("device-error", _) => t(
+            "FUSE: could not check /dev/fuse.",
+            "FUSE: не вдалося перевірити /dev/fuse.",
+        ),
+        ("ready", false) => t(
+            "FUSE: device available. fusermount3 was not found; mounting may need it.",
+            "FUSE: пристрій доступний. fusermount3 не знайдено; він може знадобитися для підключення.",
+        ),
+        ("ready", true) => t(
+            "FUSE: device and mount helper available.",
+            "FUSE: пристрій і помічник монтування доступні.",
+        ),
+        _ => t(
+            "FUSE: unknown device state.",
+            "FUSE: невідомий стан пристрою.",
+        ),
     }
 }
 
@@ -953,7 +1025,7 @@ impl VirtualMountControls {
         match result {
             Ok((device, helper)) => {
                 self.diagnostics
-                    .set_text(&locale::summary(fuse_diagnostics_label(&device, helper)));
+                    .set_text(fuse_diagnostics_label(&device, helper));
                 if device != "ready" {
                     self.mount.set_sensitive(false);
                 }
@@ -991,7 +1063,7 @@ impl VirtualMountControls {
                         text.push_str(&summary);
                     }
                 }
-                self.drafts.set_text(&locale::summary(&text));
+                self.drafts.set_text(&text);
             }
             Err(_) => self.drafts.set_text(t(
                 "Could not check local changes",
@@ -1208,11 +1280,11 @@ fn decide_review_operation(id: i64, approve: bool) -> zbus::Result<()> {
 
 fn review_title(operation: &UiReviewOperation) -> String {
     let action = match operation.kind.as_str() {
-        "DeleteRemote" => "Удалить в OneDrive",
-        "DeleteLocal" => "Убрать локальный файл",
-        "RenameRemote" => "Переименовать в OneDrive",
-        "Conflict" => "Конфликт",
-        _ => "Требует рассмотрения",
+        "DeleteRemote" => t("Delete in OneDrive", "Видалити в OneDrive"),
+        "DeleteLocal" => t("Remove local file", "Прибрати локальний файл"),
+        "RenameRemote" => t("Rename in OneDrive", "Перейменувати в OneDrive"),
+        "Conflict" => t("Conflict", "Конфлікт"),
+        _ => t("Needs review", "Потребує розгляду"),
     };
     let path = operation.from_path.as_ref().map_or_else(
         || operation.path.clone(),
@@ -1240,31 +1312,33 @@ fn review_approvable(operation: &UiReviewOperation) -> bool {
 
 fn history_text(history: UiOperationHistory) -> String {
     let mut lines = vec![format!(
-        "Операций всего: {} · показано: {}",
+        "{}: {} · {}: {}",
+        t("Total operations", "Усього операцій"),
         history.total,
+        t("shown", "показано"),
         history.operations.len()
     )];
     for operation in history.operations {
         let state = match (operation.status.as_str(), operation.approved) {
-            ("pending", false) => "ожидает подтверждения",
-            ("pending", true) => "ожидает выполнения",
-            ("running", _) => "выполняется",
-            ("blocked", _) => "заблокирована",
-            ("done", _) => "завершена",
-            ("dismissed", _) => "отклонена",
+            ("pending", false) => t("awaiting approval", "очікує підтвердження"),
+            ("pending", true) => t("awaiting execution", "очікує виконання"),
+            ("running", _) => t("running", "виконується"),
+            ("blocked", _) => t("blocked", "заблоковано"),
+            ("done", _) => t("completed", "завершено"),
+            ("dismissed", _) => t("dismissed", "відхилено"),
             _ => operation.status.as_str(),
         };
         let action = match operation.kind.as_str() {
-            "UploadNew" => "Загрузка нового файла",
-            "UploadChanged" => "Загрузка изменений",
-            "DownloadNew" => "Скачивание нового файла",
-            "DownloadChanged" => "Скачивание изменений",
-            "CreateRemoteFolder" => "Создание папки в OneDrive",
-            "RenameRemote" => "Переименование в OneDrive",
-            "RenameLocal" => "Локальное переименование",
-            "DeleteRemote" => "Удаление в OneDrive",
-            "DeleteLocal" => "Локальное удаление",
-            "Conflict" => "Конфликт",
+            "UploadNew" => t("Upload new file", "Надсилання нового файлу"),
+            "UploadChanged" => t("Upload changes", "Надсилання змін"),
+            "DownloadNew" => t("Download new file", "Завантаження нового файлу"),
+            "DownloadChanged" => t("Download changes", "Завантаження змін"),
+            "CreateRemoteFolder" => t("Create folder in OneDrive", "Створення теки в OneDrive"),
+            "RenameRemote" => t("Rename in OneDrive", "Перейменування в OneDrive"),
+            "RenameLocal" => t("Local rename", "Локальне перейменування"),
+            "DeleteRemote" => t("Delete in OneDrive", "Видалення в OneDrive"),
+            "DeleteLocal" => t("Local deletion", "Локальне видалення"),
+            "Conflict" => t("Conflict", "Конфлікт"),
             _ => operation.kind.as_str(),
         };
         let path = operation.from_path.as_ref().map_or_else(
@@ -1272,11 +1346,13 @@ fn history_text(history: UiOperationHistory) -> String {
             |source| format!("{source} → {}", operation.path),
         );
         lines.push(format!(
-            "[{state}] №{} · {action}: {path} · попыток: {}",
-            operation.id, operation.attempts
+            "[{state}] #{} · {action}: {path} · {}: {}",
+            operation.id,
+            t("attempts", "спроб"),
+            operation.attempts
         ));
         if let Some(error) = operation.last_error {
-            lines.push(format!("    Причина: {error}"));
+            lines.push(format!("    {}: {error}", t("Reason", "Причина")));
         }
     }
     lines.join("\n")
@@ -1284,8 +1360,10 @@ fn history_text(history: UiOperationHistory) -> String {
 
 fn preview_text(preview: UiPreview) -> String {
     let mut lines = vec![format!(
-        "Операций: {} · пропущено: {}",
+        "{}: {} · {}: {}",
+        t("Operations", "Операції"),
         preview.operations.len(),
+        t("skipped", "пропущено"),
         preview.skipped.len()
     )];
     for operation in preview.operations {
@@ -1304,7 +1382,7 @@ fn preview_text(preview: UiPreview) -> String {
         ));
     }
     for path in preview.skipped {
-        lines.push(format!("Пропущено: {path}"));
+        lines.push(format!("{}: {path}", t("Skipped", "Пропущено")));
     }
     lines.join("\n")
 }
@@ -1404,12 +1482,12 @@ fn present_review_dialog(
     for operation in operations {
         let approvable = review_approvable(&operation);
         let row = gtk::Box::new(gtk::Orientation::Vertical, 6);
-        let title = gtk::Label::new(Some(&locale::summary(&review_title(&operation))));
+        let title = gtk::Label::new(Some(&review_title(&operation)));
         title.set_xalign(0.0);
         title.set_wrap(true);
         title.set_selectable(true);
         row.append(&title);
-        let details = gtk::Label::new(Some(&locale::summary(&review_details(&operation))));
+        let details = gtk::Label::new(Some(&review_details(&operation)));
         details.set_xalign(0.0);
         details.set_wrap(true);
         details.set_selectable(true);
@@ -1617,9 +1695,7 @@ fn present_virtual_drafts_dialog(
         title.set_wrap(true);
         title.set_selectable(true);
         row.append(&title);
-        let state = gtk::Label::new(Some(&locale::summary(virtual_draft_status_label(
-            &draft.status,
-        ))));
+        let state = gtk::Label::new(Some(virtual_draft_status_label(&draft.status)));
         state.set_xalign(0.0);
         row.append(&state);
         if let Some(issue) = &draft.last_upload_issue {
@@ -1627,10 +1703,12 @@ fn present_virtual_drafts_dialog(
                 .last_upload_http_status
                 .map(|status| format!(" (HTTP {status})"))
                 .unwrap_or_default();
-            let warning = gtk::Label::new(Some(&locale::summary(&format!(
-                "Предыдущая фоновая отправка: {}{http_status}. Черновик сохранён локально.",
+            let warning = gtk::Label::new(Some(&format!(
+                "{}: {}{http_status}. {}",
+                t("Previous background upload", "Попереднє фонове надсилання"),
                 virtual_draft_upload_issue_label(issue),
-            ))));
+                t("Draft retained locally.", "Чернетку збережено локально."),
+            )));
             warning.set_xalign(0.0);
             warning.set_wrap(true);
             row.append(&warning);
@@ -1978,14 +2056,16 @@ fn populate_list(list: &gtk::ListBox, items: Vec<UiItem>) {
             } else {
                 "📄"
             },
-            item.name.as_deref().unwrap_or("(без имени)")
+            item.name
+                .as_deref()
+                .unwrap_or(t("(unnamed)", "(без назви)"))
         )));
         name.set_xalign(0.0);
         name.set_hexpand(true);
         line.append(&name);
         let details = match (item.size, item.modified.as_deref()) {
-            (Some(size), Some(modified)) => format!("{size} Б · {modified}"),
-            (Some(size), None) => format!("{size} Б"),
+            (Some(size), Some(modified)) => format!("{size} {} · {modified}", t("B", "Б")),
+            (Some(size), None) => format!("{size} {}", t("B", "Б")),
             (None, Some(modified)) => modified.to_owned(),
             (None, None) => String::new(),
         };
@@ -2011,7 +2091,7 @@ fn refresh_view(
             monitor.update_paused(Some(paused));
         }
         Err(_) => {
-            pause.set_label("Пауза недоступна");
+            pause.set_label(t("Pause unavailable", "Пауза недоступна"));
             pause.set_sensitive(false);
             monitor.update_paused(None);
         }
@@ -2020,7 +2100,7 @@ fn refresh_view(
     monitor.update_outstanding(read_outstanding_count().ok());
     match read_catalog() {
         Ok(items) => populate_list(list, items),
-        Err(_) => status.set_text("Не удалось прочитать каталог"),
+        Err(_) => status.set_text(t("Could not read catalog", "Не вдалося прочитати каталог")),
     }
 }
 
@@ -2121,8 +2201,9 @@ fn run_offline_batch(
                 } else {
                     t("Unpinned", "Відкріплено")
                 };
-                let error =
-                    first_error.map_or(String::new(), |error| format!(". Первая ошибка: {error}"));
+                let error = first_error.map_or(String::new(), |error| {
+                    format!(". {}: {error}", t("First error", "Перша помилка"))
+                });
                 result.set_text(&format!(
                     "{action}: {succeeded}; {}: {failed}{error}",
                     t("errors", "помилок")
@@ -2710,7 +2791,7 @@ fn main() {
                 let result = match receiver.try_recv() {
                     Ok(result) => result,
                     Err(std::sync::mpsc::TryRecvError::Empty) => return gtk::glib::ControlFlow::Continue,
-                    Err(std::sync::mpsc::TryRecvError::Disconnected) => Err("Демон недоступен".to_owned()),
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => Err(t("Daemon unavailable", "Фоновий процес недоступний").to_owned()),
                 };
                 button.set_sensitive(true);
                 match result {
@@ -2777,7 +2858,7 @@ fn main() {
                         let text = gtk::TextView::new();
                         text.set_editable(false);
                         text.set_monospace(true);
-                        text.buffer().set_text(&locale::summary(&preview_text(preview)));
+                        text.buffer().set_text(&preview_text(preview));
                         let scroll = gtk::ScrolledWindow::builder()
                             .child(&text)
                             .vexpand(true)
@@ -2849,7 +2930,7 @@ fn main() {
                         let text = gtk::TextView::new();
                         text.set_editable(false);
                         text.set_monospace(true);
-                        text.buffer().set_text(&locale::summary(&history_text(history)));
+                        text.buffer().set_text(&history_text(history));
                         let scroll = gtk::ScrolledWindow::builder()
                             .child(&text)
                             .vexpand(true)
@@ -3077,12 +3158,41 @@ mod tests {
         )
         .unwrap();
         let text = virtual_drafts_text(&drafts);
-        assert!(text.contains("Черновики: 2 · требуют внимания: 1"));
-        assert!(text.contains("ошибки отправки: 1"));
-        assert!(text.contains("Предыдущая фоновая отправка: ошибка передачи (HTTP 400)"));
-        assert!(text.contains("note.txt (drive) — готов к отправке; версия в каталоге совпадает"));
-        assert!(text.contains("2 (drive) — версия в каталоге изменилась"));
-        assert!(text.contains("Откройте полный список для проверки"));
+        assert!(text.contains(t(
+            "Drafts: 2 · need attention: 1",
+            "Чернетки: 2 · потребують уваги: 1"
+        )));
+        assert!(text.contains(t("upload errors: 1", "помилки надсилання: 1")));
+        assert!(text.contains(&format!(
+            "{}: {} (HTTP 400)",
+            t("Previous background upload", "Попереднє фонове надсилання"),
+            t("transfer failed", "помилка передавання")
+        )));
+        assert!(text.contains(&format!(
+            "note.txt (drive) — {}",
+            virtual_draft_status_label("ready")
+        )));
+        assert!(text.contains(&format!(
+            "2 (drive) — {}",
+            virtual_draft_status_label("remote-changed")
+        )));
+        assert!(text.contains(t(
+            "Open the full list to review",
+            "Відкрийте повний список для перевірки"
+        )));
+    }
+
+    #[test]
+    fn translation_does_not_change_cloud_file_names() {
+        let drafts = vec![UiVirtualDraft {
+            drive_id: "drive".into(),
+            item_id: "item".into(),
+            name: Some("Конфликт: ошибка отправки.txt".into()),
+            status: "remote-changed".into(),
+            last_upload_issue: None,
+            last_upload_http_status: None,
+        }];
+        assert!(virtual_drafts_text(&drafts).contains("Конфликт: ошибка отправки.txt"));
     }
 
     #[test]
@@ -3104,8 +3214,8 @@ mod tests {
             kind: serde_json::json!({"rename": {"target_parent_id":"root", "target_name":"new.txt"}}),
         });
         let text = virtual_mutations_text(&mutations);
-        assert!(text.contains("Массовое удаление приостановлено"));
-        assert!(text.contains("Конфликт: changed.txt"));
+        assert!(text.contains(t("Bulk deletion is paused", "Масове видалення призупинено")));
+        assert!(text.contains(&format!("{}: changed.txt", t("Conflict", "Конфлікт"))));
     }
 
     #[test]
@@ -3129,10 +3239,17 @@ mod tests {
             },
         ];
         let text = virtual_directories_text(&directories);
-        assert!(text.contains("1 ждут родителя"));
-        assert!(text.contains("1 проверяются"));
-        assert!(text.contains("1 созданы"));
-        assert!(text.contains("Папка «duplicate»: имя занято"));
+        assert!(text.contains(&format!(
+            "1 {}",
+            t("awaiting parent", "очікують батьківську теку")
+        )));
+        assert!(text.contains(&format!("1 {}", t("being checked", "перевіряються"))));
+        assert!(text.contains(&format!("1 {}", t("created", "створено"))));
+        assert!(text.contains(&format!(
+            "{} «duplicate»: {}",
+            t("Folder", "Тека"),
+            t("name already in use", "назву вже зайнято")
+        )));
     }
 
     #[test]
@@ -3199,7 +3316,10 @@ mod tests {
         .unwrap();
         assert_eq!(
             review_title(&operations[0]),
-            "Переименовать в OneDrive: old.txt → new.txt"
+            format!(
+                "{}: old.txt → new.txt",
+                t("Rename in OneDrive", "Перейменувати в OneDrive")
+            )
         );
         assert_eq!(
             review_details(&operations[0]),
@@ -3220,12 +3340,23 @@ mod tests {
         )
         .unwrap();
         let text = history_text(history);
-        assert!(text.contains("Операций всего: 3 · показано: 2"));
-        assert!(text.contains("[заблокирована] №8 · Скачивание изменений: new.txt · попыток: 2"));
-        assert!(text.contains("Причина: remote file changed"));
-        assert!(text.contains(
-            "[ожидает подтверждения] №7 · Переименование в OneDrive: old-name.txt → new-name.txt"
-        ));
+        assert!(text.contains(&format!(
+            "{}: 3 · {}: 2",
+            t("Total operations", "Усього операцій"),
+            t("shown", "показано")
+        )));
+        assert!(text.contains(&format!(
+            "[{}] #8 · {}: new.txt · {}: 2",
+            t("blocked", "заблоковано"),
+            t("Download changes", "Завантаження змін"),
+            t("attempts", "спроб")
+        )));
+        assert!(text.contains(&format!("{}: remote file changed", t("Reason", "Причина"))));
+        assert!(text.contains(&format!(
+            "[{}] #7 · {}: old-name.txt → new-name.txt",
+            t("awaiting approval", "очікує підтвердження"),
+            t("Rename in OneDrive", "Перейменування в OneDrive")
+        )));
     }
 
     #[test]
@@ -3238,7 +3369,10 @@ mod tests {
         assert!(attention_notification(Some("paused"), "reconciliation-needed").is_some());
         assert_eq!(
             state_label("daemon-unavailable"),
-            "Background daemon unavailable"
+            t(
+                "Background daemon unavailable",
+                "Фоновий процес недоступний"
+            )
         );
     }
 
@@ -3257,13 +3391,15 @@ mod tests {
             "daemon-outdated"
         );
         assert_eq!(classify_daemon_status(None, None), "daemon-unavailable");
-        assert!(state_label("daemon-outdated").contains("older daemon"));
+        assert!(
+            state_label("daemon-outdated").contains(t("older daemon", "старий фоновий процес"))
+        );
     }
 
     #[test]
     fn fuse_diagnostics_identifies_missing_device_and_helper() {
         assert!(fuse_diagnostics_label("device-missing", true).contains("/dev/fuse"));
-        assert!(fuse_diagnostics_label("device-permission", true).contains("нет доступа"));
+        assert!(fuse_diagnostics_label("device-permission", true).contains("/dev/fuse"));
         assert!(fuse_diagnostics_label("ready", false).contains("fusermount3"));
     }
 }
