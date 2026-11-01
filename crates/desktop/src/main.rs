@@ -292,8 +292,11 @@ impl StateMonitor {
             }
         }
         drop(previous);
-        self.label
-            .set_text(&format!("Состояние: {}", state_label(&current)));
+        self.label.set_text(&format!(
+            "{}: {}",
+            t("Status", "Стан"),
+            state_label(&current)
+        ));
         self.last.replace(current);
     }
 
@@ -302,7 +305,8 @@ impl StateMonitor {
             match paused {
                 Some(paused) => update_pause_button(&self.pause, paused),
                 None => {
-                    self.pause.set_label("Пауза недоступна");
+                    self.pause
+                        .set_label(t("Pause unavailable", "Пауза недоступна"));
                     self.pause.set_sensitive(false);
                 }
             }
@@ -385,9 +389,9 @@ fn toggle_sync_paused() -> zbus::Result<bool> {
 
 fn update_pause_button(button: &gtk::Button, paused: bool) {
     button.set_label(if paused {
-        "Возобновить синхронизацию"
+        t("Resume sync", "Відновити синхронізацію")
     } else {
-        "Приостановить синхронизацию"
+        t("Pause sync", "Призупинити синхронізацію")
     });
     button.set_sensitive(true);
 }
@@ -748,9 +752,13 @@ impl VirtualCacheControls {
 
     fn show_stats(&self, usage: u64, limit: u64) {
         self.label.set_text(&format!(
-            "Кэш: {:.1} МиБ из {:.2} ГиБ",
+            "{}: {:.1} {} {} {:.2} {}",
+            t("Cache", "Кеш"),
             usage as f64 / (1024 * 1024) as f64,
-            limit as f64 / GIB as f64
+            t("MiB", "МіБ"),
+            t("of", "з"),
+            limit as f64 / GIB as f64,
+            t("GiB", "ГіБ"),
         ));
         if !self.dirty.get() {
             self.size.set_value(limit as f64 / GIB as f64);
@@ -775,9 +783,10 @@ impl VirtualCacheControls {
                     return gtk::glib::ControlFlow::Continue;
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    controls
-                        .label
-                        .set_text("Не удалось прочитать состояние кэша");
+                    controls.label.set_text(t(
+                        "Could not read cache status",
+                        "Не вдалося прочитати стан кешу",
+                    ));
                     controls.apply.set_sensitive(false);
                     controls.busy.set(false);
                     return gtk::glib::ControlFlow::Break;
@@ -786,7 +795,10 @@ impl VirtualCacheControls {
             match result {
                 Ok((usage, limit)) => controls.show_stats(usage, limit),
                 Err(error) => {
-                    controls.label.set_text(&format!("Кэш недоступен: {error}"));
+                    controls.label.set_text(&format!(
+                        "{}: {error}",
+                        t("Cache unavailable", "Кеш недоступний")
+                    ));
                     controls.apply.set_sensitive(false);
                 }
             }
@@ -801,7 +813,7 @@ impl VirtualCacheControls {
         }
         let bytes = (self.size.value() * GIB as f64).round() as u64;
         self.apply.set_sensitive(false);
-        status.set_text("Изменение лимита кэша…");
+        status.set_text(t("Changing cache limit…", "Зміна обмеження кешу…"));
         let (sender, receiver) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let _ = sender.send(set_virtual_cache_limit(bytes));
@@ -817,7 +829,10 @@ impl VirtualCacheControls {
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     controls.apply.set_sensitive(true);
                     controls.busy.set(false);
-                    status.set_text("Не удалось изменить лимит кэша");
+                    status.set_text(t(
+                        "Could not change cache limit",
+                        "Не вдалося змінити обмеження кешу",
+                    ));
                     return gtk::glib::ControlFlow::Break;
                 }
             };
@@ -825,11 +840,17 @@ impl VirtualCacheControls {
                 Ok((usage, limit)) => {
                     controls.dirty.set(false);
                     controls.show_stats(usage, limit);
-                    status.set_text("Лимит кэша сохранён");
+                    status.set_text(t("Cache limit saved", "Обмеження кешу збережено"));
                 }
                 Err(error) => {
                     controls.apply.set_sensitive(true);
-                    status.set_text(&format!("Не удалось изменить лимит кэша: {error}"));
+                    status.set_text(&format!(
+                        "{}: {error}",
+                        t(
+                            "Could not change cache limit",
+                            "Не вдалося змінити обмеження кешу"
+                        )
+                    ));
                 }
             }
             controls.busy.set(false);
@@ -842,7 +863,7 @@ impl VirtualCacheControls {
             return;
         }
         button.set_sensitive(false);
-        status.set_text("Очистка кэша…");
+        status.set_text(t("Clearing cache…", "Очищення кешу…"));
         let (sender, receiver) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let _ = sender.send(clear_virtual_cache());
@@ -857,7 +878,7 @@ impl VirtualCacheControls {
                     return gtk::glib::ControlFlow::Continue;
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    status.set_text("Не удалось очистить кэш");
+                    status.set_text(t("Could not clear cache", "Не вдалося очистити кеш"));
                     button.set_sensitive(true);
                     controls.busy.set(false);
                     return gtk::glib::ControlFlow::Break;
@@ -866,14 +887,20 @@ impl VirtualCacheControls {
             match result {
                 Ok((cleared, _)) => {
                     status.set_text(&format!(
-                        "Кэш очищен: освобождено {:.1} МиБ. Офлайн-файлы сохранены.",
-                        cleared as f64 / (1024 * 1024) as f64
+                        "{}: {:.1} {}. {}",
+                        t("Cache cleared; freed", "Кеш очищено; звільнено"),
+                        cleared as f64 / (1024 * 1024) as f64,
+                        t("MiB", "МіБ"),
+                        t("Offline files are kept.", "Офлайн-файли збережено.")
                     ));
                     controls.busy.set(false);
                     controls.refresh();
                 }
                 Err(error) => {
-                    status.set_text(&format!("Не удалось очистить кэш: {error}"));
+                    status.set_text(&format!(
+                        "{}: {error}",
+                        t("Could not clear cache", "Не вдалося очистити кеш")
+                    ));
                     controls.busy.set(false);
                 }
             }
@@ -915,14 +942,16 @@ impl VirtualMountControls {
         match result {
             Ok((device, helper)) => {
                 self.diagnostics
-                    .set_text(fuse_diagnostics_label(&device, helper));
+                    .set_text(&locale::summary(fuse_diagnostics_label(&device, helper)));
                 if device != "ready" {
                     self.mount.set_sensitive(false);
                 }
             }
             Err(_) => {
-                self.diagnostics
-                    .set_text("FUSE: диагностика демона недоступна");
+                self.diagnostics.set_text(t(
+                    "FUSE: daemon diagnostics unavailable",
+                    "FUSE: діагностика фонового процесу недоступна",
+                ));
                 self.mount.set_sensitive(false);
             }
         }
@@ -951,40 +980,64 @@ impl VirtualMountControls {
                         text.push_str(&summary);
                     }
                 }
-                self.drafts.set_text(&text);
+                self.drafts.set_text(&locale::summary(&text));
             }
-            Err(_) => self
-                .drafts
-                .set_text("Не удалось проверить локальные изменения"),
+            Err(_) => self.drafts.set_text(t(
+                "Could not check local changes",
+                "Не вдалося перевірити локальні зміни",
+            )),
         }
     }
 
     fn show_path(&self, paths: Option<(&str, &str, &str)>) {
         match paths {
             Some(("", "", "")) => {
-                self.label.set_text("Виртуальный диск не подключён");
+                self.label.set_text(t(
+                    "Virtual drive is not mounted",
+                    "Віртуальний диск не підключено",
+                ));
                 self.mount.set_sensitive(true);
                 self.unmount.set_sensitive(false);
             }
             Some(("", recovery, _)) if !recovery.is_empty() => {
-                self.label.set_text(&format!("Прежняя точка монтирования занята: {recovery}. Проверьте её и отключите через fusermount3 -u"));
+                self.label.set_text(&format!(
+                    "{}: {recovery}. {}",
+                    t(
+                        "Previous mount point is busy",
+                        "Попередня точка монтування зайнята"
+                    ),
+                    t(
+                        "Inspect it and unmount with fusermount3 -u",
+                        "Перевірте її та відключіть через fusermount3 -u"
+                    )
+                ));
                 self.mount.set_sensitive(false);
                 self.unmount.set_sensitive(false);
             }
             Some(("", "", configured)) => {
                 self.label.set_text(&format!(
-                    "Виртуальный диск не подключён. Настроена папка: {configured}"
+                    "{}: {configured}",
+                    t(
+                        "Virtual drive is not mounted. Configured folder",
+                        "Віртуальний диск не підключено. Налаштована тека"
+                    )
                 ));
                 self.mount.set_sensitive(true);
                 self.unmount.set_sensitive(false);
             }
             Some((path, _, _)) => {
-                self.label.set_text(&format!("Виртуальный диск: {path}"));
+                self.label.set_text(&format!(
+                    "{}: {path}",
+                    t("Virtual drive", "Віртуальний диск")
+                ));
                 self.mount.set_sensitive(false);
                 self.unmount.set_sensitive(true);
             }
             None => {
-                self.label.set_text("Виртуальный диск: демон недоступен");
+                self.label.set_text(t(
+                    "Virtual drive: daemon unavailable",
+                    "Віртуальний диск: фоновий процес недоступний",
+                ));
                 self.mount.set_sensitive(false);
                 self.unmount.set_sensitive(false);
             }
@@ -1041,9 +1094,12 @@ impl VirtualMountControls {
         self.mount.set_sensitive(false);
         self.unmount.set_sensitive(false);
         status.set_text(if mount_path.is_some() {
-            "Подключение виртуального диска…"
+            t("Mounting virtual drive…", "Підключення віртуального диска…")
         } else {
-            "Отключение виртуального диска…"
+            t(
+                "Unmounting virtual drive…",
+                "Відключення віртуального диска…",
+            )
         });
         let (sender, receiver) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
