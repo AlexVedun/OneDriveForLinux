@@ -9,6 +9,9 @@ test -n "${DBUS_SESSION_BUS_ADDRESS:-}"
 command -v gtk4-broadwayd >/dev/null
 
 image=$(realpath -- "$1")
+repo=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+expected_revision=$(sed -n 's/^pub const DAEMON_API_REVISION: u32 = \([0-9][0-9]*\);/\1/p' "$repo/crates/core/src/lib.rs")
+test -n "$expected_revision"
 test_state=$(mktemp -d)
 display_number=$((300 + $$ % 1000))
 export XDG_CONFIG_HOME="$test_state/config"
@@ -47,7 +50,7 @@ while [ "$attempt" -lt 25 ]; do
         --method io.github.onedrive_linux.Daemon.VirtualConfiguredMountPath >/dev/null 2>&1 && \
        gdbus call --session --dest io.github.onedrive_linux.Daemon \
         --object-path /io/github/onedrive_linux/Daemon \
-        --method io.github.onedrive_linux.Daemon.ApiRevision | grep -q '(uint32 2,)'; then
+        --method io.github.onedrive_linux.Daemon.ApiRevision | grep -Fq "(uint32 $expected_revision,)"; then
         daemon_ready=true
     fi
     names=$(gdbus call --session --dest org.freedesktop.DBus \
@@ -65,7 +68,7 @@ while [ "$attempt" -lt 25 ]; do
     attempt=$((attempt + 1))
     sleep 1
 done
-echo "AppImage did not start both the daemon and tray" >&2
+echo "AppImage readiness failed: daemon=$daemon_ready (expected API revision $expected_revision), tray=$tray_ready" >&2
 cat "$test_state/appimage.log" >&2
 cat "$test_state/broadway.log" >&2
 exit 1
