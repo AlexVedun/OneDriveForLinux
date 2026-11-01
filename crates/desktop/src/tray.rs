@@ -273,7 +273,7 @@ fn presentation(state: &str) -> Presentation {
 }
 
 fn icon_pixmap(kind: IconKind) -> Vec<(i32, i32, Vec<u8>)> {
-    [22, 32]
+    [16, 22, 32, 48, 64]
         .into_iter()
         .map(|size| (size, size, render_icon(kind, size)))
         .collect()
@@ -357,24 +357,32 @@ fn badge_symbol(kind: IconKind, x: f32, y: f32) -> bool {
 }
 
 fn icon_sample(kind: IconKind, x: f32, y: f32) -> Option<[u8; 3]> {
-    // Rounded blue tile and white cloud follow the packaged application icon.
-    let bx = x.clamp(6.0, 26.0);
-    let by = y.clamp(6.0, 26.0);
-    let mut color = circle(x, y, bx, by, 5.0).then_some([0x17, 0x64, 0xc2]);
-    let cloud = (circle(x, y, 11.0, 18.2, 5.0)
-        || circle(x, y, 18.0, 14.3, 6.5)
-        || circle(x, y, 24.0, 17.8, 4.7)
-        || (8.0..27.8).contains(&x) && (17.7..23.0).contains(&y))
-        && (8.0..27.8).contains(&x)
-        && y < 23.0;
-    if cloud {
-        color = Some([255, 255, 255]);
+    // A transparent, two-layer cloud stays recognizable on light and dark panels.
+    let back = circle(x, y, 16.0, 13.3, 8.2)
+        || circle(x, y, 9.0, 18.5, 5.4)
+        || circle(x, y, 24.0, 18.6, 5.8)
+        || (8.0..25.0).contains(&x) && (17.0..24.5).contains(&y);
+    let mut color = back.then_some(if y < 15.0 {
+        [0x2f, 0x89, 0xe8]
+    } else {
+        [0x1c, 0x66, 0xc8]
+    });
+    let front = circle(x, y, 13.2, 20.0, 7.0)
+        || circle(x, y, 7.8, 21.5, 4.8)
+        || circle(x, y, 23.0, 21.7, 4.7)
+        || (7.0..24.0).contains(&x) && (21.0..26.5).contains(&y);
+    if front {
+        color = Some(if y < 18.0 {
+            [0x5a, 0xca, 0xf7]
+        } else {
+            [0x25, 0xa3, 0xe9]
+        });
     }
     if kind != IconKind::Idle {
-        if circle(x, y, 24.0, 24.0, 8.5) {
+        if circle(x, y, 24.0, 24.0, 7.2) {
             color = Some([255, 255, 255]);
         }
-        if circle(x, y, 24.0, 24.0, 7.0) {
+        if circle(x, y, 24.0, 24.0, 5.9) {
             color = Some(match kind {
                 IconKind::Attention => [0xcc, 0x35, 0x35],
                 IconKind::Offline => [0x67, 0x6f, 0x78],
@@ -674,8 +682,8 @@ mod tests {
             IconKind::Idle,
         ] {
             let pixmaps = icon_pixmap(kind);
-            assert_eq!(pixmaps.len(), 2);
-            for (size, (width, height, pixels)) in [22, 32].into_iter().zip(&pixmaps) {
+            assert_eq!(pixmaps.len(), 5);
+            for (size, (width, height, pixels)) in [16, 22, 32, 48, 64].into_iter().zip(&pixmaps) {
                 assert_eq!((*width, *height), (size, size));
                 assert_eq!(pixels.len(), (size * size * 4) as usize);
                 assert_eq!(&pixels[..4], &[0, 0, 0, 0]);
@@ -708,11 +716,12 @@ mod tests {
     fn cloud_and_status_symbols_have_expected_colors() {
         assert_eq!(
             icon_sample(IconKind::Idle, 16.0, 13.0),
-            Some([255, 255, 255])
+            Some([0x2f, 0x89, 0xe8])
         );
+        assert_eq!(icon_sample(IconKind::Idle, 4.0, 4.0), None);
         assert_eq!(
-            icon_sample(IconKind::Idle, 4.0, 4.0),
-            Some([0x17, 0x64, 0xc2])
+            icon_sample(IconKind::Idle, 14.0, 23.0),
+            Some([0x25, 0xa3, 0xe9])
         );
         assert_eq!(icon_sample(IconKind::Idle, 0.0, 0.0), None);
         for kind in [

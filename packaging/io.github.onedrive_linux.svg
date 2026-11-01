@@ -1,5 +1,16 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
-  <rect width="128" height="128" rx="27" fill="#1764c2"/>
-  <path d="M35 85h61a19 19 0 0 0 0-38 33 33 0 0 0-61-4 21 21 0 0 0 0 42Z" fill="#fff"/>
-  <path d="M48 61h32M64 51v28" fill="none" stroke="#1764c2" stroke-width="7" stroke-linecap="round"/>
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <title>OneDriveForLinux</title>
+  <defs>
+    <linearGradient id="back" x1="48" y1="55" x2="218" y2="177" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#328af0"/>
+      <stop offset="1" stop-color="#1554ae"/>
+    </linearGradient>
+    <linearGradient id="front" x1="40" y1="108" x2="192" y2="204" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#58c8f6"/>
+      <stop offset="1" stop-color="#168fdf"/>
+    </linearGradient>
+  </defs>
+  <path d="M69 179c-26 0-45-19-45-44 0-22 15-40 36-44 13-35 44-58 81-58 42 0 76 29 84 69 19 8 31 26 31 47 0 26-20 46-47 46H69Z" fill="url(#back)"/>
+  <path d="M64 209c-26 0-45-18-45-43 0-22 16-40 38-43 14-28 40-45 71-45 37 0 68 24 75 59 22 2 39 19 39 40 0 18-12 32-30 32H64Z" fill="url(#front)"/>
+  <path d="M57 123c14-28 40-45 71-45 27 0 51 13 65 35-20-13-45-16-67-8-24 8-39 25-48 47-8-14-17-24-33-26 4-1 8-2 12-3Z" fill="#8cdefb" opacity=".42"/>
 </svg>
