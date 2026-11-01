@@ -18,11 +18,11 @@ mkdir -p "$(dirname -- "$output")"
 staging=$(mktemp -d "$(dirname -- "$output")/.onedrive-tools.XXXXXX")
 trap 'rm -rf "$staging"' EXIT HUP INT TERM
 
-# The linuxdeploy continuous asset is mutable. Its checksum pins the build
-# tested here; update it deliberately when moving to another upstream build.
+# Use a tagged linuxdeploy release so a new continuous build cannot silently
+# invalidate the pinned checksum and break CI or release builds.
 curl --fail --location --retry 3 --silent --show-error \
     --output "$staging/linuxdeploy-x86_64.AppImage" \
-    https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+    https://github.com/linuxdeploy/linuxdeploy/releases/download/1-alpha-20251107-1/linuxdeploy-x86_64.AppImage
 curl --fail --location --retry 3 --silent --show-error \
     --output "$staging/appimagetool-x86_64.AppImage" \
     https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage
@@ -32,7 +32,7 @@ curl --fail --location --retry 3 --silent --show-error \
 (
     cd "$staging"
     printf '%s\n' \
-        '8aea8da0f7f7039d2a2cecb14657d752a222a5e1d3825caeef186c82f751cdd1  linuxdeploy-x86_64.AppImage' \
+        'c20cd71e3a4e3b80c3483cef793cda3f4e990aca14014d23c544ca3ce1270b4d  linuxdeploy-x86_64.AppImage' \
         'ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0  appimagetool-x86_64.AppImage' \
         '2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d  runtime-x86_64' \
         | sha256sum -c -
