@@ -12,6 +12,12 @@ test -x "$appdir/usr/bin/onedrive-daemon"
 test -x "$appdir/usr/bin/onedrive-desktop"
 test -x "$appdir/usr/bin/onedrive-linux"
 test -r "$appdir/.DirIcon"
+test -s "$appdir/usr/share/icons/hicolor/scalable/apps/io.github.onedrive_linux.svg"
+for size in 16 24 32 48 64 128 256 512; do
+    cmp "$repo/packaging/icons/hicolor/${size}x${size}/apps/io.github.onedrive_linux.png" \
+        "$appdir/usr/share/icons/hicolor/${size}x${size}/apps/io.github.onedrive_linux.png"
+done
+cmp "$appdir/.DirIcon" "$appdir/usr/share/icons/hicolor/256x256/apps/io.github.onedrive_linux.png"
 cmp "$repo/LICENSE" "$appdir/usr/share/licenses/onedrive-linux/LICENSE"
 test "$(find "$appdir" -maxdepth 1 -name '*.desktop' | wc -l)" -eq 1
 desktop-file-validate "$appdir/io.github.onedrive_linux.desktop"

@@ -36,11 +36,17 @@ install -m 755 "$target_dir/$binary_profile/onedrive-desktop" "$staging/usr/bin/
 install -m 644 "$repo/packaging/io.github.onedrive_linux.desktop" "$staging/usr/share/applications/io.github.onedrive_linux.desktop"
 install -m 644 "$repo/packaging/io.github.onedrive_linux.appdata.xml" "$staging/usr/share/metainfo/io.github.onedrive_linux.appdata.xml"
 install -m 644 "$repo/packaging/io.github.onedrive_linux.svg" "$staging/usr/share/icons/hicolor/scalable/apps/io.github.onedrive_linux.svg"
+install -m 644 "$repo/packaging/icons/hicolor/index.theme" "$staging/usr/share/icons/hicolor/index.theme"
+for icon in "$repo"/packaging/icons/hicolor/*/apps/io.github.onedrive_linux.png; do
+    size=$(basename "$(dirname "$(dirname "$icon")")")
+    install -D -m 644 "$icon" "$staging/usr/share/icons/hicolor/$size/apps/io.github.onedrive_linux.png"
+done
 install -m 644 "$repo/LICENSE" "$staging/usr/share/licenses/onedrive-linux/LICENSE"
 ln -s ../../AppRun "$staging/usr/bin/onedrive-linux"
 ln -s usr/share/applications/io.github.onedrive_linux.desktop "$staging/io.github.onedrive_linux.desktop"
 ln -s usr/share/icons/hicolor/scalable/apps/io.github.onedrive_linux.svg "$staging/io.github.onedrive_linux.svg"
-ln -s io.github.onedrive_linux.svg "$staging/.DirIcon"
+ln -s usr/share/icons/hicolor/256x256/apps/io.github.onedrive_linux.png "$staging/io.github.onedrive_linux.png"
+ln -s io.github.onedrive_linux.png "$staging/.DirIcon"
 mv -T --no-clobber "$staging" "$output"
 if [ -e "$staging" ]; then
     echo "AppDir appeared during build: $output" >&2

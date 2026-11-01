@@ -9,6 +9,8 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Duration;
 
+const APP_ID: &str = "io.github.onedrive_linux";
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 struct UiItem {
     item_id: String,
@@ -184,13 +186,20 @@ fn attention_notification(
 struct StateMonitor {
     app: adw::Application,
     label: gtk::Label,
+    pause: gtk::Button,
+    pause_busy: Rc<Cell<bool>>,
     last: Rc<RefCell<String>>,
     pending: Rc<Cell<bool>>,
     tray: Option<Rc<tray::TrayIndicator>>,
 }
 
 impl StateMonitor {
-    fn new(app: &adw::Application, label: &gtk::Label, initial: String) -> Self {
+    fn new(
+        app: &adw::Application,
+        label: &gtk::Label,
+        pause: &gtk::Button,
+        initial: String,
+    ) -> Self {
         label.set_text(&format!("Состояние: {}", state_label(&initial)));
         let app_for_menu = app.downgrade();
         let menu_action = Rc::new(move |action: tray::MenuAction| {
@@ -212,6 +221,8 @@ impl StateMonitor {
         Self {
             app: app.clone(),
             label: label.clone(),
+            pause: pause.clone(),
+            pause_busy: Rc::new(Cell::new(false)),
             tray: match tray::TrayIndicator::start(app, &initial, menu_action) {
                 Ok(indicator) => Some(Rc::new(indicator)),
                 Err(error) => {
@@ -247,6 +258,15 @@ impl StateMonitor {
     }
 
     fn update_paused(&self, paused: Option<bool>) {
+        if !self.pause_busy.get() {
+            match paused {
+                Some(paused) => update_pause_button(&self.pause, paused),
+                None => {
+                    self.pause.set_label("Пауза недоступна");
+                    self.pause.set_sensitive(false);
+                }
+            }
+        }
         if let Some(tray) = &self.tray {
             tray.update_paused(paused);
         }
@@ -2039,9 +2059,7 @@ fn present_offline_dialog(
 }
 
 fn main() {
-    let app = adw::Application::builder()
-        .application_id("io.github.onedrive_linux.Desktop")
-        .build();
+    let app = adw::Application::builder().application_id(APP_ID).build();
     let show_action = gio::SimpleAction::new("show", None);
     let app_for_show = app.downgrade();
     show_action.connect_activate(move |_, _| {
@@ -2051,6 +2069,14 @@ fn main() {
     });
     app.add_action(&show_action);
     app.connect_activate(|app| {
+        gtk::Window::set_default_icon_name(APP_ID);
+        let development_icons = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../packaging/icons");
+        if development_icons.join("hicolor/index.theme").is_file()
+            && let Some(display) = gtk::gdk::Display::default()
+        {
+            gtk::IconTheme::for_display(&display).add_search_path(&development_icons);
+        }
         if let Some(window) = app
             .windows()
             .into_iter()
@@ -2061,7 +2087,9 @@ fn main() {
         }
         let engine_status = gtk::Label::new(None);
         engine_status.set_xalign(0.0);
-        let monitor = StateMonitor::new(app, &engine_status, read_status());
+        let pause = gtk::Button::with_label("Пауза недоступна");
+        pause.set_sensitive(false);
+        let monitor = StateMonitor::new(app, &engine_status, &pause, read_status());
         let status = gtk::Label::new(None);
         status.set_xalign(0.0);
         status.set_wrap(true);
@@ -2108,8 +2136,6 @@ fn main() {
             });
         });
         let reload = gtk::Button::with_label("Обновить список");
-        let pause = gtk::Button::with_label("Пауза недоступна");
-        pause.set_sensitive(false);
         let status_for_reload = status.clone();
         let list_for_reload = list.clone();
         let pause_for_reload = pause.clone();
@@ -2242,9 +2268,14 @@ fn main() {
         content.append(&cache_frame);
         let title = app_title();
         let header = adw::HeaderBar::new();
+        let title_box = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        let title_icon = gtk::Image::from_icon_name(APP_ID);
+        title_icon.set_pixel_size(24);
+        title_box.append(&title_icon);
         let title_label = gtk::Label::new(Some(&title));
         title_label.add_css_class("title");
-        header.set_title_widget(Some(&title_label));
+        title_box.append(&title_label);
+        header.set_title_widget(Some(&title_box));
         let layout = gtk::Box::new(gtk::Orientation::Vertical, 0);
         layout.append(&header);
         layout.append(&menu_bar);
@@ -2654,6 +2685,7 @@ fn main() {
         let status_for_pause = status.clone();
         let monitor_for_pause = monitor.clone();
         pause.connect_clicked(move |button| {
+            monitor_for_pause.pause_busy.set(true);
             button.set_sensitive(false);
             let (sender, receiver) = std::sync::mpsc::channel();
             std::thread::spawn(move || {
@@ -2666,6 +2698,7 @@ fn main() {
                 match receiver.try_recv() {
                     Ok(Ok(paused)) => {
                         update_pause_button(&button, paused);
+                        monitor.pause_busy.set(false);
                         monitor.update_paused(Some(paused));
                         status.set_text(if paused {
                             "Синхронизация приостановлена; текущая операция может завершиться"
@@ -2674,6 +2707,7 @@ fn main() {
                         });
                     }
                     Ok(Err(error)) => {
+                        monitor.pause_busy.set(false);
                         button.set_sensitive(true);
                         status.set_text(&format!("Не удалось изменить паузу: {error}"));
                     }
@@ -2681,6 +2715,7 @@ fn main() {
                         return gtk::glib::ControlFlow::Continue;
                     }
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        monitor.pause_busy.set(false);
                         button.set_sensitive(true);
                         status.set_text("Не удалось изменить паузу");
                     }
