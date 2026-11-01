@@ -28,13 +28,25 @@ pub enum MenuAction {
 }
 
 const MENU_ITEMS: [(i32, &str, MenuAction); 6] = [
-    (1, "Открыть окно", MenuAction::Show),
-    (6, "Открыть папку синхронизации", MenuAction::OpenFolder),
-    (2, "Очередь и история", MenuAction::History),
-    (3, "Приостановить синхронизацию", MenuAction::TogglePause),
-    (4, "Проверить OneDrive", MenuAction::Refresh),
-    (5, "Выход", MenuAction::Quit),
+    (1, "Open window", MenuAction::Show),
+    (6, "Open sync folder", MenuAction::OpenFolder),
+    (2, "Queue and history", MenuAction::History),
+    (3, "Pause sync", MenuAction::TogglePause),
+    (4, "Refresh OneDrive", MenuAction::Refresh),
+    (5, "Quit", MenuAction::Quit),
 ];
+
+fn menu_label(id: i32, english: &'static str) -> &'static str {
+    match id {
+        1 => crate::t(english, "Відкрити вікно"),
+        6 => crate::t(english, "Відкрити теку синхронізації"),
+        2 => crate::t(english, "Черга та історія"),
+        3 => crate::t(english, "Призупинити синхронізацію"),
+        4 => crate::t(english, "Оновити OneDrive"),
+        5 => crate::t(english, "Вийти"),
+        _ => english,
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct MenuState {
@@ -81,7 +93,7 @@ fn menu_properties(id: i32, names: &[String], state: MenuState) -> HashMap<Strin
         MENU_ITEMS
             .iter()
             .find(|item| item.0 == id)
-            .map(|item| item.1)
+            .map(|item| menu_label(item.0, item.1))
     };
     if id == 0 && (names.is_empty() || names.iter().any(|name| name == "children-display")) {
         properties.insert("children-display".to_owned(), "submenu".to_variant());
@@ -90,7 +102,7 @@ fn menu_properties(id: i32, names: &[String], state: MenuState) -> HashMap<Strin
         && (names.is_empty() || names.iter().any(|name| name == "label"))
     {
         let label = if id == 3 && state.paused == Some(true) {
-            "Возобновить синхронизацию"
+            crate::t("Resume sync", "Відновити синхронізацію")
         } else {
             label
         };
@@ -430,7 +442,7 @@ fn property_value(name: &str, state: &str, label: &str) -> glib::Variant {
     match name {
         "Category" => "ApplicationStatus".to_variant(),
         "Id" => "onedrive-linux".to_variant(),
-        "Title" => "OneDrive для Linux".to_variant(),
+        "Title" => crate::t("OneDrive for Linux", "OneDrive для Linux").to_variant(),
         "Status" => presentation(state).status.to_variant(),
         "WindowId" => 0_u32.to_variant(),
         "IconName" | "AttentionIconName" => "".to_variant(),
@@ -439,7 +451,7 @@ fn property_value(name: &str, state: &str, label: &str) -> glib::Variant {
         "ToolTip" => (
             "",
             icon_pixmap(presentation(state).icon),
-            "OneDrive для Linux",
+            crate::t("OneDrive for Linux", "OneDrive для Linux"),
             label,
         )
             .to_variant(),
@@ -771,7 +783,10 @@ mod tests {
                 ..state
             },
         );
-        assert_eq!(paused["label"].str(), Some("Возобновить синхронизацию"));
+        assert_eq!(
+            paused["label"].str(),
+            Some(crate::t("Resume sync", "Відновити синхронізацію"))
+        );
         let unavailable = menu_properties(
             3,
             &[],
@@ -800,7 +815,10 @@ mod tests {
                 ..state
             },
         );
-        assert_eq!(counted["label"].str(), Some("Очередь и история (42)"));
+        assert_eq!(
+            counted["label"].str(),
+            Some(&format!("{} (42)", crate::t("Queue and history", "Черга та історія"))[..])
+        );
         let empty = menu_properties(
             2,
             &[],
@@ -809,6 +827,9 @@ mod tests {
                 ..state
             },
         );
-        assert_eq!(empty["label"].str(), Some("Очередь и история"));
+        assert_eq!(
+            empty["label"].str(),
+            Some(crate::t("Queue and history", "Черга та історія"))
+        );
     }
 }
