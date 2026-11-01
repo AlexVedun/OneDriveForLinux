@@ -110,11 +110,22 @@ fn app_title() -> String {
 
 fn login_error_text(error: &str) -> String {
     if error.contains("ONEDRIVE_CLIENT_ID is not configured") {
-        "Не задан ONEDRIVE_CLIENT_ID. Добавьте его в ~/.config/onedrive-linux/config.env".to_owned()
+        t(
+            "ONEDRIVE_CLIENT_ID is missing. Add it to ~/.config/onedrive-linux/config.env",
+            "Не задано ONEDRIVE_CLIENT_ID. Додайте його до ~/.config/onedrive-linux/config.env",
+        )
+        .to_owned()
     } else if error.contains("login is already in progress") {
-        "Вход уже выполняется. Завершите его в браузере или подождите пять минут".to_owned()
+        t(
+            "Sign-in is already in progress. Finish it in the browser or wait five minutes.",
+            "Вхід уже триває. Завершіть його у браузері або зачекайте п’ять хвилин.",
+        )
+        .to_owned()
     } else {
-        format!("Не удалось начать вход: {error}")
+        format!(
+            "{}: {error}",
+            t("Could not start sign-in", "Не вдалося розпочати вхід")
+        )
     }
 }
 
@@ -1104,8 +1115,10 @@ impl VirtualMountControls {
         let (sender, receiver) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let result = match mount_path {
-                Some(path) => mount_virtual_drive(&path).map(|_| "Виртуальный диск подключён"),
-                None => unmount_virtual_drive().map(|()| "Виртуальный диск отключён"),
+                Some(path) => mount_virtual_drive(&path)
+                    .map(|_| t("Virtual drive mounted", "Віртуальний диск підключено")),
+                None => unmount_virtual_drive()
+                    .map(|()| t("Virtual drive unmounted", "Віртуальний диск відключено")),
             };
             let path = virtual_mount_paths();
             let diagnostics = read_virtual_fuse_diagnostics();
@@ -1124,7 +1137,10 @@ impl VirtualMountControls {
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     controls.show_path(None);
-                    status.set_text("Не удалось выполнить операцию с виртуальным диском");
+                    status.set_text(t(
+                        "Could not complete virtual-drive operation",
+                        "Не вдалося виконати операцію з віртуальним диском",
+                    ));
                     controls.busy.set(false);
                     return gtk::glib::ControlFlow::Break;
                 }
@@ -1142,7 +1158,10 @@ impl VirtualMountControls {
             controls.show_drafts(result.3, result.4, result.5);
             match result.0 {
                 Ok(message) => status.set_text(message),
-                Err(error) => status.set_text(&format!("Виртуальный диск: {error}")),
+                Err(error) => status.set_text(&format!(
+                    "{}: {error}",
+                    t("Virtual drive", "Віртуальний диск")
+                )),
             }
             controls.busy.set(false);
             gtk::glib::ControlFlow::Break
@@ -1320,17 +1339,26 @@ fn connect_review_decision(
                 Ok(Ok(())) => {
                     rows.remove(&row);
                     status.set_text(if approve {
-                        "Операция подтверждена и остаётся в очереди"
+                        t(
+                            "Operation approved and remains queued",
+                            "Операцію підтверджено й залишено в черзі",
+                        )
                     } else {
-                        "Операция отклонена"
+                        t("Operation dismissed", "Операцію відхилено")
                     });
                     if rows.first_child().is_none() {
-                        rows.append(&gtk::Label::new(Some("Нет операций на рассмотрении")));
+                        rows.append(&gtk::Label::new(Some(t(
+                            "No operations to review",
+                            "Немає операцій для розгляду",
+                        ))));
                     }
                     gtk::glib::ControlFlow::Break
                 }
                 Ok(Err(error)) => {
-                    status.set_text(&format!("Не удалось сохранить решение: {error}"));
+                    status.set_text(&format!(
+                        "{}: {error}",
+                        t("Could not save decision", "Не вдалося зберегти рішення")
+                    ));
                     for control in &controls {
                         control.set_sensitive(true);
                     }
@@ -1338,7 +1366,7 @@ fn connect_review_decision(
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    status.set_text("Не удалось сохранить решение");
+                    status.set_text(t("Could not save decision", "Не вдалося зберегти рішення"));
                     for control in &controls {
                         control.set_sensitive(true);
                     }
@@ -1359,25 +1387,29 @@ fn present_review_dialog(
     content.set_margin_end(18);
     content.set_margin_top(18);
     content.set_margin_bottom(18);
-    let hint = gtk::Label::new(Some(
-        "Подтверждение сохраняет решение. Выполнение операции запускается отдельно.",
-    ));
+    let hint = gtk::Label::new(Some(t(
+        "Approval saves the decision. Execution starts separately.",
+        "Підтвердження зберігає рішення. Виконання запускається окремо.",
+    )));
     hint.set_wrap(true);
     hint.set_xalign(0.0);
     content.append(&hint);
     let rows = gtk::Box::new(gtk::Orientation::Vertical, 12);
     if operations.is_empty() {
-        rows.append(&gtk::Label::new(Some("Нет операций на рассмотрении")));
+        rows.append(&gtk::Label::new(Some(t(
+            "No operations to review",
+            "Немає операцій для розгляду",
+        ))));
     }
     for operation in operations {
         let approvable = review_approvable(&operation);
         let row = gtk::Box::new(gtk::Orientation::Vertical, 6);
-        let title = gtk::Label::new(Some(&review_title(&operation)));
+        let title = gtk::Label::new(Some(&locale::summary(&review_title(&operation))));
         title.set_xalign(0.0);
         title.set_wrap(true);
         title.set_selectable(true);
         row.append(&title);
-        let details = gtk::Label::new(Some(&review_details(&operation)));
+        let details = gtk::Label::new(Some(&locale::summary(&review_details(&operation))));
         details.set_xalign(0.0);
         details.set_wrap(true);
         details.set_selectable(true);
@@ -1385,18 +1417,21 @@ fn present_review_dialog(
         let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         let mut controls = Vec::new();
         if approvable {
-            let approve = gtk::Button::with_label("Подтвердить");
+            let approve = gtk::Button::with_label(t("Approve", "Підтвердити"));
             buttons.append(&approve);
             controls.push(approve);
         } else {
-            let conflict = gtk::Label::new(Some("Нужно отдельное разрешение конфликта"));
+            let conflict = gtk::Label::new(Some(t(
+                "Conflict requires a separate resolution",
+                "Конфлікт потребує окремого вирішення",
+            )));
             conflict.set_xalign(0.0);
             buttons.append(&conflict);
         }
         let dismiss = gtk::Button::with_label(if approvable {
-            "Отклонить"
+            t("Dismiss", "Відхилити")
         } else {
-            "Скрыть"
+            t("Hide", "Приховати")
         });
         buttons.append(&dismiss);
         controls.push(dismiss);
@@ -1422,7 +1457,7 @@ fn present_review_dialog(
     content.append(&scroll);
     let dialog = gtk::Window::builder()
         .transient_for(parent)
-        .title("Операции на рассмотрении")
+        .title(t("Operations to review", "Операції для розгляду"))
         .default_width(700)
         .default_height(460)
         .child(&content)
@@ -1440,9 +1475,10 @@ fn present_virtual_mutation_conflicts_dialog(
     content.set_margin_end(18);
     content.set_margin_top(18);
     content.set_margin_bottom(18);
-    let hint = gtk::Label::new(Some(
-        "Отключите виртуальный диск перед отменой. После отмены обновите каталог и подключите диск снова: будет показано текущее состояние OneDrive.",
-    ));
+    let hint = gtk::Label::new(Some(t(
+        "Unmount the virtual drive before cancelling. Then refresh the catalog and remount to see the current OneDrive state.",
+        "Відключіть віртуальний диск перед скасуванням. Потім оновіть каталог і підключіть диск знову, щоб побачити поточний стан OneDrive.",
+    )));
     hint.set_wrap(true);
     hint.set_xalign(0.0);
     content.append(&hint);
@@ -1459,19 +1495,19 @@ fn present_virtual_mutation_conflicts_dialog(
         count += 1;
         let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         let action = if mutation.kind == "delete" {
-            "удаление".to_owned()
+            t("deletion", "видалення").to_owned()
         } else {
             let target = mutation.kind["rename"]["target_name"]
                 .as_str()
                 .unwrap_or("?");
-            format!("переименование в {target}")
+            format!("{} {target}", t("rename to", "перейменування на"))
         };
         let title = gtk::Label::new(Some(&format!("{} — {}", mutation.name, action)));
         title.set_xalign(0.0);
         title.set_hexpand(true);
         title.set_wrap(true);
         row.append(&title);
-        let cancel = gtk::Button::with_label("Отменить операцию");
+        let cancel = gtk::Button::with_label(t("Cancel operation", "Скасувати операцію"));
         row.append(&cancel);
         rows.append(&row);
         let drive_id = mutation.drive_id;
@@ -1497,16 +1533,16 @@ fn present_virtual_mutation_conflicts_dialog(
                 match receiver.try_recv() {
                     Ok(Ok(())) => {
                         rows.remove(&row);
-                        result.set_text("Конфликтная операция отменена. Обновите каталог перед повторным подключением.");
+                        result.set_text(t("Conflicting operation cancelled. Refresh the catalog before remounting.", "Конфліктну операцію скасовано. Оновіть каталог перед повторним підключенням."));
                         controls.refresh();
                     }
                     Ok(Err(error)) => {
-                        result.set_text(&format!("Не удалось отменить операцию: {error}"));
+                        result.set_text(&format!("{}: {error}", t("Could not cancel operation", "Не вдалося скасувати операцію")));
                         button.set_sensitive(true);
                     }
                     Err(std::sync::mpsc::TryRecvError::Empty) => return gtk::glib::ControlFlow::Continue,
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        result.set_text("Демон недоступен");
+                        result.set_text(t("Daemon unavailable", "Фоновий процес недоступний"));
                         button.set_sensitive(true);
                     }
                 }
@@ -1515,7 +1551,10 @@ fn present_virtual_mutation_conflicts_dialog(
         });
     }
     if count == 0 {
-        rows.append(&gtk::Label::new(Some("Конфликтных операций нет")));
+        rows.append(&gtk::Label::new(Some(t(
+            "No conflicting operations",
+            "Немає конфліктних операцій",
+        ))));
     }
     let scroll = gtk::ScrolledWindow::builder()
         .child(&rows)
@@ -1525,7 +1564,7 @@ fn present_virtual_mutation_conflicts_dialog(
     content.append(&scroll);
     let dialog = gtk::Window::builder()
         .transient_for(parent)
-        .title("Конфликты виртуального диска")
+        .title(t("Virtual-drive conflicts", "Конфлікти віртуального диска"))
         .default_width(700)
         .default_height(400)
         .child(&content)
@@ -1545,9 +1584,15 @@ fn present_virtual_drafts_dialog(
     content.set_margin_top(18);
     content.set_margin_bottom(18);
     let hint = gtk::Label::new(Some(if upload_enabled {
-        "Экспорт сохраняет копию без удаления черновика. Удаление черновика стирает только локальные изменения; облачный файл остаётся. Демон автоматически отправляет закрытые файлы при подключённом диске, включая новые файлы в созданных в OneDrive папках. Файл в новой локальной папке ждёт отправки папки. Папка синхронизации должна быть отключена; демон повторно проверит данные в OneDrive."
+        t(
+            "Export saves a copy without removing the draft. Discard removes only local edits; the cloud file remains. Closed files upload automatically while the drive is mounted. Files in new local folders wait for their folder to upload. The sync folder must be disabled; the daemon checks OneDrive again before upload.",
+            "Експорт зберігає копію без видалення чернетки. Видалення чернетки стирає лише локальні зміни; хмарний файл залишається. Закриті файли надсилаються автоматично, коли диск підключено. Файли в нових локальних теках чекають на надсилання теки. Теку синхронізації потрібно вимкнути; перед надсиланням фоновий процес знову перевіряє OneDrive.",
+        )
     } else {
-        "Экспорт сохраняет копию без удаления черновика. Удаление черновика стирает только локальные изменения; облачный файл остаётся. Демон пока не предоставляет отправку файлов."
+        t(
+            "Export saves a copy without removing the draft. Discard removes only local edits; the cloud file remains. Upload is currently unavailable.",
+            "Експорт зберігає копію без видалення чернетки. Видалення чернетки стирає лише локальні зміни; хмарний файл залишається. Надсилання зараз недоступне.",
+        )
     }));
     hint.set_wrap(true);
     hint.set_xalign(0.0);
@@ -1559,7 +1604,10 @@ fn present_virtual_drafts_dialog(
     content.append(&result);
     let rows = gtk::Box::new(gtk::Orientation::Vertical, 12);
     if drafts.is_empty() {
-        rows.append(&gtk::Label::new(Some("Локальных изменений нет")));
+        rows.append(&gtk::Label::new(Some(t(
+            "No local changes",
+            "Немає локальних змін",
+        ))));
     }
     for draft in drafts {
         let row = gtk::Box::new(gtk::Orientation::Vertical, 6);
@@ -1569,7 +1617,9 @@ fn present_virtual_drafts_dialog(
         title.set_wrap(true);
         title.set_selectable(true);
         row.append(&title);
-        let state = gtk::Label::new(Some(virtual_draft_status_label(&draft.status)));
+        let state = gtk::Label::new(Some(&locale::summary(virtual_draft_status_label(
+            &draft.status,
+        ))));
         state.set_xalign(0.0);
         row.append(&state);
         if let Some(issue) = &draft.last_upload_issue {
@@ -1577,15 +1627,15 @@ fn present_virtual_drafts_dialog(
                 .last_upload_http_status
                 .map(|status| format!(" (HTTP {status})"))
                 .unwrap_or_default();
-            let warning = gtk::Label::new(Some(&format!(
+            let warning = gtk::Label::new(Some(&locale::summary(&format!(
                 "Предыдущая фоновая отправка: {}{http_status}. Черновик сохранён локально.",
                 virtual_draft_upload_issue_label(issue),
-            )));
+            ))));
             warning.set_xalign(0.0);
             warning.set_wrap(true);
             row.append(&warning);
         }
-        let export = gtk::Button::with_label("Сохранить локальную копию…");
+        let export = gtk::Button::with_label(t("Save local copy…", "Зберегти локальну копію…"));
         row.append(&export);
         let export_drive_id = draft.drive_id.clone();
         let export_item_id = draft.item_id.clone();
@@ -1595,7 +1645,7 @@ fn present_virtual_drafts_dialog(
         export.connect_clicked(move |button| {
             button.set_sensitive(false);
             let dialog = gtk::FileDialog::new();
-            dialog.set_title("Сохранить локальный черновик");
+            dialog.set_title(t("Save local draft", "Зберегти локальну чернетку"));
             dialog.set_initial_name(Some(&export_name));
             let button = button.clone();
             let result = export_result.clone();
@@ -1610,11 +1660,14 @@ fn present_virtual_drafts_dialog(
                         return;
                     };
                     let Some(path) = file.path() else {
-                        result.set_text("Выберите локальный путь для копии");
+                        result.set_text(t(
+                            "Choose a local path for the copy",
+                            "Виберіть локальний шлях для копії",
+                        ));
                         button.set_sensitive(true);
                         return;
                     };
-                    result.set_text("Сохранение локальной копии…");
+                    result.set_text(t("Saving local copy…", "Збереження локальної копії…"));
                     let (sender, receiver) = std::sync::mpsc::channel();
                     std::thread::spawn(move || {
                         let _ = sender.send(export_virtual_draft(
@@ -1625,10 +1678,25 @@ fn present_virtual_drafts_dialog(
                     });
                     gtk::glib::timeout_add_local(Duration::from_millis(100), move || {
                         match receiver.try_recv() {
-                            Ok(Ok(())) => result.set_text("Локальная копия сохранена. Черновик оставлен без изменений."),
-                            Ok(Err(error)) => result.set_text(&format!("Не удалось сохранить копию: {error}. Существующий файл не перезаписывается.")),
-                            Err(std::sync::mpsc::TryRecvError::Empty) => return gtk::glib::ControlFlow::Continue,
-                            Err(std::sync::mpsc::TryRecvError::Disconnected) => result.set_text("Не удалось получить результат сохранения"),
+                            Ok(Ok(())) => result.set_text(t(
+                                "Local copy saved. Draft unchanged.",
+                                "Локальну копію збережено. Чернетку не змінено.",
+                            )),
+                            Ok(Err(error)) => result.set_text(&format!(
+                                "{}: {error}. {}",
+                                t("Could not save copy", "Не вдалося зберегти копію"),
+                                t(
+                                    "Existing files are not overwritten.",
+                                    "Наявні файли не перезаписуються."
+                                )
+                            )),
+                            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                                return gtk::glib::ControlFlow::Continue;
+                            }
+                            Err(std::sync::mpsc::TryRecvError::Disconnected) => result.set_text(t(
+                                "Could not get save result",
+                                "Не вдалося отримати результат збереження",
+                            )),
                         }
                         button.set_sensitive(true);
                         gtk::glib::ControlFlow::Break
@@ -1645,7 +1713,8 @@ fn present_virtual_drafts_dialog(
                 | "uncertain-new"
         ) && upload_enabled
         {
-            let compare = gtk::Button::with_label("Проверить содержимое в OneDrive");
+            let compare =
+                gtk::Button::with_label(t("Compare with OneDrive", "Порівняти з OneDrive"));
             row.append(&compare);
             let item_id = draft.item_id.clone();
             let result = result.clone();
@@ -1655,7 +1724,7 @@ fn present_virtual_drafts_dialog(
             let state = state.clone();
             compare.connect_clicked(move |button| {
                 button.set_sensitive(false);
-                result.set_text("Сравнение облачного файла с локальным черновиком…");
+                result.set_text(t("Comparing cloud file with local draft…", "Порівняння хмарного файлу з локальною чернеткою…"));
                 let (sender, receiver) = std::sync::mpsc::channel();
                 let item_id = item_id.clone();
                 std::thread::spawn(move || {
@@ -1671,26 +1740,26 @@ fn present_virtual_drafts_dialog(
                     match receiver.try_recv() {
                         Ok(Ok(outcome)) if outcome == "identical-acknowledged" => {
                             rows.remove(&row);
-                            result.set_text("Содержимое совпадает. Облачная копия подтверждена, черновик закрыт.");
+                            result.set_text(t("Contents match. Cloud copy confirmed; draft closed.", "Вміст збігається. Хмарну копію підтверджено; чернетку закрито."));
                             controls.refresh();
                         }
                         Ok(Ok(outcome)) => {
                             state.set_text(if outcome == "different" {
-                                "Облачный файл отличается. Черновик сохранён; сравните копии вручную."
+                                t("Cloud file differs. Draft retained; compare copies manually.", "Хмарний файл відрізняється. Чернетку збережено; порівняйте копії вручну.")
                             } else {
-                                "Локальные данные отличаются от отправленного снимка или изменились во время проверки. Черновик сохранён."
+                                t("Local data differs from the uploaded snapshot or changed during comparison. Draft retained.", "Локальні дані відрізняються від надісланого знімка або змінилися під час перевірки. Чернетку збережено.")
                             });
-                            result.set_text("Черновик оставлен без изменений.");
+                            result.set_text(t("Draft unchanged.", "Чернетку не змінено."));
                             button.set_sensitive(true);
                             controls.refresh();
                         }
                         Ok(Err(error)) => {
-                            result.set_text(&format!("Не удалось сравнить файлы: {error}"));
+                            result.set_text(&format!("{}: {error}", t("Could not compare files", "Не вдалося порівняти файли")));
                             button.set_sensitive(true);
                         }
                         Err(std::sync::mpsc::TryRecvError::Empty) => return gtk::glib::ControlFlow::Continue,
                         Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                            result.set_text("Не удалось получить результат сравнения");
+                            result.set_text(t("Could not get comparison result", "Не вдалося отримати результат порівняння"));
                             button.set_sensitive(true);
                         }
                     }
@@ -1698,7 +1767,7 @@ fn present_virtual_drafts_dialog(
                 });
             });
         }
-        let discard = gtk::Button::with_label("Удалить черновик…");
+        let discard = gtk::Button::with_label(t("Discard draft…", "Видалити чернетку…"));
         row.append(&discard);
         let discard_parent = parent.clone();
         let discard_name = name.to_owned();
@@ -1710,10 +1779,10 @@ fn present_virtual_drafts_dialog(
         let discard_controls = controls.clone();
         discard.connect_clicked(move |button| {
             let confirmation = gtk::AlertDialog::builder()
-                .message(format!("Удалить локальный черновик «{discard_name}»?"))
-                .detail("Локальные изменения будут удалены без возможности восстановления. Файл в OneDrive не удаляется. Если результат прежней отправки неизвестен, облачная копия уже может существовать. При необходимости сначала сохраните локальную копию.")
+                .message(format!("{} “{discard_name}”?", t("Discard local draft", "Видалити локальну чернетку")))
+                .detail(t("Local edits will be permanently lost. The OneDrive file is not deleted. If a previous upload outcome is uncertain, a cloud copy may already exist. Save a local copy first if needed.", "Локальні зміни буде безповоротно втрачено. Файл у OneDrive не видаляється. Якщо результат попереднього надсилання невідомий, хмарна копія вже може існувати. За потреби спочатку збережіть локальну копію."))
                 .build();
-            confirmation.set_buttons(&["Отмена", "Удалить черновик"]);
+            confirmation.set_buttons(&[t("Cancel", "Скасувати"), t("Discard draft", "Видалити чернетку")]);
             confirmation.set_cancel_button(0);
             confirmation.set_default_button(0);
             let button = button.clone();
@@ -1728,7 +1797,7 @@ fn present_virtual_drafts_dialog(
                     return;
                 }
                 button.set_sensitive(false);
-                result.set_text("Удаление локального черновика…");
+                result.set_text(t("Discarding local draft…", "Видалення локальної чернетки…"));
                 let (sender, receiver) = std::sync::mpsc::channel();
                 std::thread::spawn(move || {
                     let _ = sender.send(discard_virtual_draft(&drive_id, &item_id));
@@ -1737,16 +1806,16 @@ fn present_virtual_drafts_dialog(
                     match receiver.try_recv() {
                         Ok(Ok(())) => {
                             rows.remove(&row);
-                            result.set_text("Локальный черновик удалён. Облачный файл не изменён.");
+                            result.set_text(t("Local draft discarded. Cloud file unchanged.", "Локальну чернетку видалено. Хмарний файл не змінено."));
                             controls.refresh();
                         }
                         Ok(Err(error)) => {
-                            result.set_text(&format!("Не удалось удалить черновик: {error}"));
+                            result.set_text(&format!("{}: {error}", t("Could not discard draft", "Не вдалося видалити чернетку")));
                             button.set_sensitive(true);
                         }
                         Err(std::sync::mpsc::TryRecvError::Empty) => return gtk::glib::ControlFlow::Continue,
                         Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                            result.set_text("Не удалось получить результат удаления");
+                            result.set_text(t("Could not get discard result", "Не вдалося отримати результат видалення"));
                             button.set_sensitive(true);
                         }
                     }
@@ -1755,7 +1824,7 @@ fn present_virtual_drafts_dialog(
             });
         });
         if upload_enabled && matches!(draft.status.as_str(), "ready" | "ready-new") {
-            let send = gtk::Button::with_label("Отправить в OneDrive");
+            let send = gtk::Button::with_label(t("Upload to OneDrive", "Надіслати до OneDrive"));
             row.append(&send);
             let item_id = draft.item_id;
             let result = result.clone();
@@ -1765,7 +1834,7 @@ fn present_virtual_drafts_dialog(
             let state = state.clone();
             send.connect_clicked(move |button| {
                 button.set_sensitive(false);
-                result.set_text("Отправка черновика…");
+                result.set_text(t("Uploading draft…", "Надсилання чернетки…"));
                 let (sender, receiver) = std::sync::mpsc::channel();
                 let item_id = item_id.clone();
                 std::thread::spawn(move || {
@@ -1782,15 +1851,15 @@ fn present_virtual_drafts_dialog(
                         Ok(Ok(outcome)) => {
                             if outcome == "uploaded" {
                                 rows.remove(&row);
-                                result.set_text("Черновик отправлен.");
+                                result.set_text(t("Draft uploaded.", "Чернетку надіслано."));
                             } else {
-                                state.set_text("Файл отправлен, но появились новые локальные правки. Откройте список заново для проверки.");
-                                result.set_text("Новые локальные правки сохранены.");
+                                state.set_text(t("File uploaded, but new local edits appeared. Reopen the list to review.", "Файл надіслано, але з’явилися нові локальні зміни. Відкрийте список знову для перевірки."));
+                                result.set_text(t("New local edits retained.", "Нові локальні зміни збережено."));
                             }
                             controls.refresh();
                         }
                         Ok(Err(error)) => {
-                            result.set_text(&format!("Не удалось отправить черновик: {error}"));
+                            result.set_text(&format!("{}: {error}", t("Could not upload draft", "Не вдалося надіслати чернетку")));
                             button.set_sensitive(true);
                             controls.refresh();
                         }
@@ -1798,7 +1867,7 @@ fn present_virtual_drafts_dialog(
                             return gtk::glib::ControlFlow::Continue;
                         }
                         Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                            result.set_text("Не удалось получить результат отправки");
+                            result.set_text(t("Could not get upload result", "Не вдалося отримати результат надсилання"));
                             button.set_sensitive(true);
                         }
                     }
@@ -1816,7 +1885,10 @@ fn present_virtual_drafts_dialog(
     content.append(&scroll);
     let dialog = gtk::Window::builder()
         .transient_for(parent)
-        .title("Локальные изменения виртуального диска")
+        .title(t(
+            "Virtual-drive local changes",
+            "Локальні зміни віртуального диска",
+        ))
         .default_width(700)
         .default_height(460)
         .child(&content)
@@ -2006,12 +2078,19 @@ fn run_offline_batch(
 ) {
     let ids = offline_file_ids(items, &selected.borrow());
     if ids.is_empty() {
-        result.set_text("Выберите хотя бы один файл или папку с файлами");
+        result.set_text(t(
+            "Select at least one file or a folder containing files",
+            "Виберіть принаймні один файл або теку з файлами",
+        ));
         return;
     }
     pin_button.set_sensitive(false);
     unpin_button.set_sensitive(false);
-    result.set_text(&format!("Обработка файлов: {}…", ids.len()));
+    result.set_text(&format!(
+        "{}: {}…",
+        t("Processing files", "Обробка файлів"),
+        ids.len()
+    ));
     let (sender, receiver) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut succeeded = 0;
@@ -2038,13 +2117,16 @@ fn run_offline_batch(
         match receiver.try_recv() {
             Ok((succeeded, failed, first_error)) => {
                 let action = if pinned {
-                    "Закреплено"
+                    t("Pinned", "Закріплено")
                 } else {
-                    "Откреплено"
+                    t("Unpinned", "Відкріплено")
                 };
                 let error =
                     first_error.map_or(String::new(), |error| format!(". Первая ошибка: {error}"));
-                result.set_text(&format!("{action}: {succeeded}; ошибок: {failed}{error}"));
+                result.set_text(&format!(
+                    "{action}: {succeeded}; {}: {failed}{error}",
+                    t("errors", "помилок")
+                ));
                 pin_button.set_sensitive(true);
                 unpin_button.set_sensitive(true);
                 cache.refresh();
@@ -2052,7 +2134,10 @@ fn run_offline_batch(
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                result.set_text("Не удалось завершить обработку файлов");
+                result.set_text(t(
+                    "Could not finish processing files",
+                    "Не вдалося завершити обробку файлів",
+                ));
                 pin_button.set_sensitive(true);
                 unpin_button.set_sensitive(true);
                 gtk::glib::ControlFlow::Break
@@ -2113,29 +2198,30 @@ fn present_offline_dialog(
     body.set_margin_end(16);
     body.set_margin_top(16);
     body.set_margin_bottom(16);
-    body.append(&gtk::Label::builder().label("Отметьте несколько файлов или папок. Выбранная папка включает все вложенные файлы. Дерево раскрывается стрелкой.").xalign(0.0).wrap(true).build());
+    body.append(&gtk::Label::builder().label(t("Select multiple files or folders. A selected folder includes all nested files. Use the arrow to expand the tree.", "Виберіть кілька файлів або тек. Вибрана тека включає всі вкладені файли. Розгортайте дерево стрілкою.")).xalign(0.0).wrap(true).build());
     body.append(
         &gtk::ScrolledWindow::builder()
             .child(&tree)
             .vexpand(true)
             .build(),
     );
-    let result = gtk::Label::new(Some(
-        "Выбранные файлы сохраняются в кэше для работы без сети",
-    ));
+    let result = gtk::Label::new(Some(t(
+        "Selected files are cached for offline use",
+        "Вибрані файли зберігаються в кеші для роботи без мережі",
+    )));
     result.set_xalign(0.0);
     result.set_wrap(true);
     body.append(&result);
     let actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-    let pin = gtk::Button::with_label("Сохранить офлайн");
-    let unpin = gtk::Button::with_label("Снять закрепление");
+    let pin = gtk::Button::with_label(t("Keep offline", "Зберегти офлайн"));
+    let unpin = gtk::Button::with_label(t("Remove offline pin", "Зняти закріплення"));
     actions.append(&pin);
     actions.append(&unpin);
     body.append(&actions);
     let dialog = gtk::Window::builder()
         .transient_for(parent)
         .modal(true)
-        .title("Офлайн-доступ к файлам")
+        .title(t("Offline file access", "Офлайн-доступ до файлів"))
         .default_width(620)
         .default_height(560)
         .child(&body)
@@ -2200,7 +2286,7 @@ fn main() {
                     if gio::AppInfo::launch_default_for_uri(&url, None::<&gio::AppLaunchContext>)
                         .is_err()
                     {
-                        status_after_login.set_text("Не удалось открыть браузер");
+                        status_after_login.set_text(t("Could not open browser", "Не вдалося відкрити браузер"));
                     }
                 }
                 Err(error) => status_after_login.set_text(&login_error_text(&error.to_string())),
@@ -2219,9 +2305,9 @@ fn main() {
             let status = status_after_scan.clone();
             gtk::glib::timeout_add_local(Duration::from_millis(100), move || {
                 match receiver.try_recv() {
-                    Ok(Ok(())) => status.set_text("Проверка каталога запущена"),
+                    Ok(Ok(())) => status.set_text(t("Catalog refresh started", "Оновлення каталогу розпочато")),
                     Ok(Err(_)) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        status.set_text("Не удалось запустить проверку каталога");
+                        status.set_text(t("Could not start catalog refresh", "Не вдалося розпочати оновлення каталогу"));
                     }
                     Err(std::sync::mpsc::TryRecvError::Empty) => {
                         return gtk::glib::ControlFlow::Continue;
@@ -2454,12 +2540,12 @@ fn main() {
         let feedback_for_download = files_feedback.clone();
         download.connect_clicked(move |_| {
             let Some(row) = list_for_download.selected_row() else {
-                feedback_for_download.set_text("Сначала выберите файл");
+                feedback_for_download.set_text(t("Select a file first", "Спочатку виберіть файл"));
                 return;
             };
             let item_id = row.widget_name().to_string();
             let dialog = gtk::FileDialog::new();
-            dialog.set_title("Сохранить файл OneDrive");
+            dialog.set_title(t("Save OneDrive file", "Зберегти файл OneDrive"));
             dialog.set_initial_name(Some(row.tooltip_text().as_deref().unwrap_or("download")));
             let status_after_dialog = status_for_download.clone();
             let feedback_after_dialog = feedback_for_download.clone();
@@ -2469,14 +2555,14 @@ fn main() {
                 move |result| {
                     let Ok(file) = result else { return };
                     let Some(path) = file.path() else {
-                        feedback_after_dialog.set_text("Выберите локальный путь");
+                        feedback_after_dialog.set_text(t("Choose a local path", "Виберіть локальний шлях"));
                         return;
                     };
                     let destination = path.to_string_lossy();
                     let message = if download_item(&item_id, &destination).is_ok() {
-                        "Скачивание запущено"
+                        t("Download started", "Завантаження розпочато")
                     } else {
-                        "Не удалось начать скачивание"
+                        t("Could not start download", "Не вдалося розпочати завантаження")
                     };
                     feedback_after_dialog.set_text(message);
                     status_after_dialog.set_text(message);
@@ -2488,7 +2574,7 @@ fn main() {
         let monitor_for_folder = monitor.clone();
         choose_sync.connect_clicked(move |_| {
             let dialog = gtk::FileDialog::new();
-            dialog.set_title("Выберите папку синхронизации");
+            dialog.set_title(t("Choose sync folder", "Виберіть теку синхронізації"));
             let status_after_dialog = status_for_folder.clone();
             let monitor_after_dialog = monitor_for_folder.clone();
             dialog.select_folder(
@@ -2497,17 +2583,17 @@ fn main() {
                 move |result| {
                     let Ok(folder) = result else { return };
                     let Some(path) = folder.path() else {
-                        status_after_dialog.set_text("Нужна локальная папка");
+                        status_after_dialog.set_text(t("Choose a local folder", "Виберіть локальну теку"));
                         return;
                     };
                     match set_sync_root(&path.to_string_lossy()) {
                         Ok(_) => {
                             monitor_after_dialog.update_root_available(true);
                             status_after_dialog
-                                .set_text("Папка сохранена. Проверьте план синхронизации");
+                                .set_text(t("Folder saved. Review the sync preview.", "Теку збережено. Перевірте попередній перегляд синхронізації."));
                         }
                         Err(_) => {
-                            status_after_dialog.set_text("Не удалось сохранить папку синхронизации")
+                            status_after_dialog.set_text(t("Could not save sync folder", "Не вдалося зберегти теку синхронізації"))
                         }
                     }
                 },
@@ -2518,7 +2604,7 @@ fn main() {
         let controls_for_mount = mount_controls.clone();
         mount.connect_clicked(move |_| {
             let dialog = gtk::FileDialog::new();
-            dialog.set_title("Выберите пустую папку для виртуального диска");
+            dialog.set_title(t("Choose an empty folder for the virtual drive", "Виберіть порожню теку для віртуального диска"));
             let status = status_for_mount.clone();
             let controls = controls_for_mount.clone();
             dialog.select_folder(
@@ -2527,7 +2613,7 @@ fn main() {
                 move |result| {
                     let Ok(folder) = result else { return };
                     let Some(path) = folder.path() else {
-                        status.set_text("Выберите локальную папку для виртуального диска");
+                        status.set_text(t("Choose a local folder for the virtual drive", "Виберіть локальну теку для віртуального диска"));
                         return;
                     };
                     controls.run(Some(path.to_string_lossy().into_owned()), &status);
@@ -2544,7 +2630,7 @@ fn main() {
         let controls_for_drafts = mount_controls.clone();
         show_drafts.connect_clicked(move |button| {
             button.set_sensitive(false);
-            status_for_drafts.set_text("Загрузка локальных изменений…");
+            status_for_drafts.set_text(t("Loading local changes…", "Завантаження локальних змін…"));
             let (sender, receiver) = std::sync::mpsc::channel();
             std::thread::spawn(move || {
                 let _ = sender.send((read_virtual_drafts(), read_virtual_draft_upload_enabled()));
@@ -2560,7 +2646,7 @@ fn main() {
                         return gtk::glib::ControlFlow::Continue;
                     }
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        status.set_text("Не удалось загрузить локальные изменения");
+                        status.set_text(t("Could not load local changes", "Не вдалося завантажити локальні зміни"));
                         button.set_sensitive(true);
                         return gtk::glib::ControlFlow::Break;
                     }
@@ -2568,12 +2654,10 @@ fn main() {
                 match response {
                     (Ok(drafts), Ok(enabled)) => {
                         present_virtual_drafts_dialog(&parent, &controls, drafts, enabled);
-                        status.set_text("Локальные изменения загружены");
+                        status.set_text(t("Local changes loaded", "Локальні зміни завантажено"));
                     }
                     (Err(error), _) | (_, Err(error)) => {
-                        status.set_text(&format!(
-                            "Не удалось загрузить локальные изменения: {error}"
-                        ));
+                        status.set_text(&format!("{}: {error}", t("Could not load local changes", "Не вдалося завантажити локальні зміни")));
                     }
                 }
                 button.set_sensitive(true);
@@ -2598,9 +2682,9 @@ fn main() {
                     Ok(Ok(mutations)) => {
                         present_virtual_mutation_conflicts_dialog(&window, &controls, mutations);
                     }
-                    Ok(Err(error)) => status.set_text(&format!("Не удалось загрузить конфликты: {error}")),
+                    Ok(Err(error)) => status.set_text(&format!("{}: {error}", t("Could not load conflicts", "Не вдалося завантажити конфлікти"))),
                     Err(std::sync::mpsc::TryRecvError::Empty) => return gtk::glib::ControlFlow::Continue,
-                    Err(std::sync::mpsc::TryRecvError::Disconnected) => status.set_text("Демон недоступен"),
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => status.set_text(t("Daemon unavailable", "Фоновий процес недоступний")),
                 }
                 button.set_sensitive(true);
                 gtk::glib::ControlFlow::Break
@@ -2632,10 +2716,10 @@ fn main() {
                 match result {
                     Ok(count) if count > 10 => {
                         let dialog = gtk::AlertDialog::builder()
-                            .message(format!("Удалить {count} объектов из OneDrive?"))
-                            .detail("Будут выполнены только операции, прошедшие повторную проверку версии и расположения в облаке.")
+                            .message(format!("{} {count} {}?", t("Delete", "Видалити"), t("items from OneDrive", "об’єктів із OneDrive")))
+                            .detail(t("Only operations that pass another cloud version and location check will run.", "Виконуватимуться лише операції, які пройшли повторну перевірку версії та розташування в хмарі."))
                             .build();
-                        dialog.set_buttons(&["Отмена", "Подтвердить удаление"]);
+                        dialog.set_buttons(&[t("Cancel", "Скасувати"), t("Confirm deletion", "Підтвердити видалення")]);
                         dialog.set_cancel_button(0);
                         dialog.set_default_button(0);
                         let status = status.clone();
@@ -2648,17 +2732,17 @@ fn main() {
                             let controls = controls.clone();
                             gtk::glib::timeout_add_local(Duration::from_millis(100), move || {
                                 match receiver.try_recv() {
-                                    Ok(Ok(())) => { status.set_text("Массовое удаление подтверждено"); controls.refresh(); },
-                                    Ok(Err(error)) => status.set_text(&format!("Не удалось подтвердить удаление: {error}")),
+                                    Ok(Ok(())) => { status.set_text(t("Bulk deletion confirmed", "Масове видалення підтверджено")); controls.refresh(); },
+                                    Ok(Err(error)) => status.set_text(&format!("{}: {error}", t("Could not confirm deletion", "Не вдалося підтвердити видалення"))),
                                     Err(std::sync::mpsc::TryRecvError::Empty) => return gtk::glib::ControlFlow::Continue,
-                                    Err(std::sync::mpsc::TryRecvError::Disconnected) => status.set_text("Не удалось подтвердить удаление"),
+                                    Err(std::sync::mpsc::TryRecvError::Disconnected) => status.set_text(t("Could not confirm deletion", "Не вдалося підтвердити видалення")),
                                 }
                                 gtk::glib::ControlFlow::Break
                             });
                         });
                     }
-                    Ok(_) => status.set_text("Массового удаления нет"),
-                    Err(error) => status.set_text(&format!("Не удалось проверить очередь: {error}")),
+                    Ok(_) => status.set_text(t("No bulk deletion pending", "Немає масового видалення")),
+                    Err(error) => status.set_text(&format!("{}: {error}", t("Could not check queue", "Не вдалося перевірити чергу"))),
                 }
                 gtk::glib::ControlFlow::Break
             });
@@ -2676,7 +2760,7 @@ fn main() {
         let window_for_preview = window.clone();
         let status_for_preview = status.clone();
         preview_sync.connect_clicked(move |_| {
-            status_for_preview.set_text("Сканирование локальной папки…");
+            status_for_preview.set_text(t("Scanning local folder…", "Сканування локальної теки…"));
             let (sender, receiver) = std::sync::mpsc::channel();
             std::thread::spawn(move || {
                 let _ = sender.send(read_sync_preview());
@@ -2689,11 +2773,11 @@ fn main() {
                 };
                 match result {
                     Ok(preview) => {
-                        status.set_text("План готов. Изменения пока не выполняются");
+                        status.set_text(t("Preview ready. Changes have not been applied.", "Попередній перегляд готовий. Зміни ще не виконуються."));
                         let text = gtk::TextView::new();
                         text.set_editable(false);
                         text.set_monospace(true);
-                        text.buffer().set_text(&preview_text(preview));
+                        text.buffer().set_text(&locale::summary(&preview_text(preview)));
                         let scroll = gtk::ScrolledWindow::builder()
                             .child(&text)
                             .vexpand(true)
@@ -2701,14 +2785,14 @@ fn main() {
                             .build();
                         let dialog = gtk::Window::builder()
                             .transient_for(&parent)
-                            .title("Предварительный план синхронизации")
+                            .title(t("Sync preview", "Попередній перегляд синхронізації"))
                             .default_width(650)
                             .default_height(450)
                             .child(&scroll)
                             .build();
                         dialog.present();
                     }
-                    Err(error) => status.set_text(&format!("Не удалось построить план: {error}")),
+                    Err(error) => status.set_text(&format!("{}: {error}", t("Could not build sync preview", "Не вдалося побудувати попередній перегляд"))),
                 }
                 gtk::glib::ControlFlow::Break
             });
@@ -2717,7 +2801,7 @@ fn main() {
         let status_for_review = status.clone();
         review.connect_clicked(move |button| {
             button.set_sensitive(false);
-            status_for_review.set_text("Проверка изменений…");
+            status_for_review.set_text(t("Checking changes…", "Перевірка змін…"));
             let (sender, receiver) = std::sync::mpsc::channel();
             std::thread::spawn(move || {
                 let _ = sender.send(queue_and_read_review());
@@ -2729,24 +2813,19 @@ fn main() {
                 match receiver.try_recv() {
                     Ok(Ok((operations, queue_error))) => {
                         match queue_error {
-                            Some(error) => status.set_text(&format!(
-                                "Не удалось обновить план; показана сохранённая очередь: {error}"
-                            )),
-                            None => status.set_text(&format!(
-                                "Операций на рассмотрении: {}",
-                                operations.len()
-                            )),
+                            Some(error) => status.set_text(&format!("{}: {error}", t("Could not refresh preview; showing saved queue", "Не вдалося оновити план; показано збережену чергу"))),
+                            None => status.set_text(&format!("{}: {}", t("Operations to review", "Операцій для розгляду"), operations.len())),
                         }
                         present_review_dialog(&parent, &status, operations);
                     }
                     Ok(Err(error)) => {
-                        status.set_text(&format!("Не удалось прочитать очередь: {error}"));
+                        status.set_text(&format!("{}: {error}", t("Could not read queue", "Не вдалося прочитати чергу")));
                     }
                     Err(std::sync::mpsc::TryRecvError::Empty) => {
                         return gtk::glib::ControlFlow::Continue;
                     }
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        status.set_text("Не удалось прочитать очередь");
+                        status.set_text(t("Could not read queue", "Не вдалося прочитати чергу"));
                     }
                 }
                 button.set_sensitive(true);
@@ -2770,7 +2849,7 @@ fn main() {
                         let text = gtk::TextView::new();
                         text.set_editable(false);
                         text.set_monospace(true);
-                        text.buffer().set_text(&history_text(history));
+                        text.buffer().set_text(&locale::summary(&history_text(history)));
                         let scroll = gtk::ScrolledWindow::builder()
                             .child(&text)
                             .vexpand(true)
@@ -2778,7 +2857,7 @@ fn main() {
                             .build();
                         let dialog = gtk::Window::builder()
                             .transient_for(&parent)
-                            .title("Очередь и история")
+                            .title(t("Queue and history", "Черга та історія"))
                             .default_width(750)
                             .default_height(500)
                             .child(&scroll)
@@ -2786,13 +2865,13 @@ fn main() {
                         dialog.present();
                     }
                     Ok(Err(error)) => {
-                        status.set_text(&format!("Не удалось прочитать очередь: {error}"));
+                        status.set_text(&format!("{}: {error}", t("Could not read queue", "Не вдалося прочитати чергу")));
                     }
                     Err(std::sync::mpsc::TryRecvError::Empty) => {
                         return gtk::glib::ControlFlow::Continue;
                     }
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        status.set_text("Не удалось прочитать очередь");
+                        status.set_text(t("Could not read queue", "Не вдалося прочитати чергу"));
                     }
                 }
                 button.set_sensitive(true);
@@ -2818,15 +2897,15 @@ fn main() {
                         monitor.pause_busy.set(false);
                         monitor.update_paused(Some(paused));
                         status.set_text(if paused {
-                            "Синхронизация приостановлена; текущая операция может завершиться"
+                            t("Sync paused; the current operation may finish", "Синхронізацію призупинено; поточна операція може завершитися")
                         } else {
-                            "Синхронизация возобновлена"
+                            t("Sync resumed", "Синхронізацію відновлено")
                         });
                     }
                     Ok(Err(error)) => {
                         monitor.pause_busy.set(false);
                         button.set_sensitive(true);
-                        status.set_text(&format!("Не удалось изменить паузу: {error}"));
+                        status.set_text(&format!("{}: {error}", t("Could not change pause state", "Не вдалося змінити стан паузи")));
                     }
                     Err(std::sync::mpsc::TryRecvError::Empty) => {
                         return gtk::glib::ControlFlow::Continue;
@@ -2834,7 +2913,7 @@ fn main() {
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                         monitor.pause_busy.set(false);
                         button.set_sensitive(true);
-                        status.set_text("Не удалось изменить паузу");
+                        status.set_text(t("Could not change pause state", "Не вдалося змінити стан паузи"));
                     }
                 }
                 gtk::glib::ControlFlow::Break
@@ -2882,7 +2961,7 @@ fn main() {
                         return gtk::glib::ControlFlow::Continue;
                     }
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        Err("Не удалось прочитать папку синхронизации".to_owned())
+                        Err(t("Could not read sync folder", "Не вдалося прочитати теку синхронізації").to_owned())
                     }
                 };
                 let message = match result {
@@ -2890,9 +2969,9 @@ fn main() {
                         let uri = gio::File::for_path(&root).uri();
                         gio::AppInfo::launch_default_for_uri(&uri, None::<&gio::AppLaunchContext>)
                             .err()
-                            .map(|_| "Не удалось открыть папку синхронизации".to_owned())
+                            .map(|_| t("Could not open sync folder", "Не вдалося відкрити теку синхронізації").to_owned())
                     }
-                    Ok(None) => Some("Сначала выберите папку синхронизации".to_owned()),
+                    Ok(None) => Some(t("Choose a sync folder first", "Спочатку виберіть теку синхронізації").to_owned()),
                     Err(error) => Some(error),
                 };
                 if let Some(message) = message {
@@ -2913,7 +2992,7 @@ fn main() {
         let cache_for_offline = cache_controls.clone();
         offline_action.connect_activate(move |_, _| {
             if let Some(status) = status_for_offline.upgrade() {
-                status.set_text("Загрузка дерева файлов для офлайн-доступа…");
+                status.set_text(t("Loading offline file tree…", "Завантаження дерева файлів для офлайн-доступу…"));
             }
             let (sender, receiver) = std::sync::mpsc::channel();
             std::thread::spawn(move || {
@@ -2932,14 +3011,14 @@ fn main() {
                     }
                     Ok(Err(error)) => {
                         if let Some(status) = status.upgrade() {
-                            status.set_text(&format!("Не удалось открыть список файлов: {error}"));
+                            status.set_text(&format!("{}: {error}", t("Could not open file list", "Не вдалося відкрити список файлів")));
                         }
                         gtk::glib::ControlFlow::Break
                     }
                     Err(std::sync::mpsc::TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                         if let Some(status) = status.upgrade() {
-                            status.set_text("Не удалось открыть список файлов");
+                            status.set_text(t("Could not open file list", "Не вдалося відкрити список файлів"));
                         }
                         gtk::glib::ControlFlow::Break
                     }
