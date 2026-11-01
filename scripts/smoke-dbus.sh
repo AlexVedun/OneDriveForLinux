@@ -39,7 +39,10 @@ revision=$(gdbus call --session \
     --dest io.github.onedrive_linux.Daemon \
     --object-path /io/github/onedrive_linux/Daemon \
     --method io.github.onedrive_linux.Daemon.ApiRevision)
-test "$revision" = "(uint32 2,)"
+repo=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+expected_revision=$(sed -n 's/^pub const DAEMON_API_REVISION: u32 = \([0-9][0-9]*\);/\1/p' "$repo/crates/core/src/lib.rs")
+test -n "$expected_revision"
+test "$revision" = "(uint32 $expected_revision,)"
 
 # A second client can still query the daemon after the first one disconnects.
 result=$(gdbus call --session \
