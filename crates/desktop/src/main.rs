@@ -1,3 +1,4 @@
+mod locale;
 mod tray;
 
 use adw::{gio, gtk, prelude::*};
@@ -10,6 +11,10 @@ use std::rc::Rc;
 use std::time::Duration;
 
 const APP_ID: &str = "io.github.onedrive_linux";
+
+fn t(english: &'static str, ukrainian: &'static str) -> &'static str {
+    locale::text(english, ukrainian)
+}
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 struct UiItem {
@@ -131,19 +136,23 @@ fn classify_daemon_status(status: Option<String>, revision: Option<u32>) -> Stri
 
 fn state_label(state: &str) -> &str {
     match state {
-        "needs-login" => "Требуется вход в Microsoft",
-        "error" => "Ошибка синхронизации",
-        "reconciliation-needed" => "Нужна сверка каталога",
-        "offline" => "Нет соединения",
-        "paused" => "Синхронизация приостановлена",
-        "transferring" => "Передача файлов",
-        "checking" => "Проверка изменений",
-        "connected" => "Подключено",
-        "synced" => "Синхронизировано",
-        "daemon-unavailable" => "Фоновый процесс недоступен",
-        "daemon-outdated" => {
-            "Работает старый фоновый процесс. Завершите прежнее приложение и запустите AppImage заново"
-        }
+        "needs-login" => t("Microsoft sign-in required", "Потрібен вхід до Microsoft"),
+        "error" => t("Sync error", "Помилка синхронізації"),
+        "reconciliation-needed" => t("Catalog review required", "Потрібна перевірка каталогу"),
+        "offline" => t("Offline", "Немає з’єднання"),
+        "paused" => t("Sync paused", "Синхронізацію призупинено"),
+        "transferring" => t("Transferring files", "Передавання файлів"),
+        "checking" => t("Checking for changes", "Перевірка змін"),
+        "connected" => t("Connected", "Підключено"),
+        "synced" => t("Synced", "Синхронізовано"),
+        "daemon-unavailable" => t(
+            "Background daemon unavailable",
+            "Фоновий процес недоступний",
+        ),
+        "daemon-outdated" => t(
+            "An older daemon is running. Close the old application and restart the AppImage.",
+            "Працює старий фоновий процес. Закрийте попередню програму й перезапустіть AppImage.",
+        ),
         _ => state,
     }
 }
@@ -158,25 +167,52 @@ fn attention_notification(
     }
     match current {
         "needs-login" => Some((
-            "Требуется вход в OneDrive",
-            "Откройте приложение и войдите в аккаунт Microsoft.",
+            t("OneDrive sign-in required", "Потрібен вхід до OneDrive"),
+            t(
+                "Open the application and sign in to your Microsoft account.",
+                "Відкрийте програму й увійдіть до облікового запису Microsoft.",
+            ),
         )),
         "error" => Some((
-            "Ошибка синхронизации",
-            "Откройте очередь и историю, чтобы увидеть причину.",
+            t("Sync error", "Помилка синхронізації"),
+            t(
+                "Open the queue and history to see the cause.",
+                "Відкрийте чергу та історію, щоб побачити причину.",
+            ),
         )),
         "reconciliation-needed" => Some((
-            "Нужна сверка OneDrive",
-            "Откройте приложение и проверьте каталог OneDrive.",
+            t("OneDrive review required", "Потрібна перевірка OneDrive"),
+            t(
+                "Open the application and check the OneDrive catalog.",
+                "Відкрийте програму й перевірте каталог OneDrive.",
+            ),
         )),
-        "offline" => Some(("OneDrive недоступен", "Проверьте соединение с сетью.")),
+        "offline" => Some((
+            t("OneDrive unavailable", "OneDrive недоступний"),
+            t(
+                "Check your network connection.",
+                "Перевірте мережеве з’єднання.",
+            ),
+        )),
         "daemon-unavailable" => Some((
-            "Фоновый процесс недоступен",
-            "Запустите демон OneDrive для Linux.",
+            t(
+                "Background daemon unavailable",
+                "Фоновий процес недоступний",
+            ),
+            t(
+                "Start the OneDrive daemon.",
+                "Запустіть фоновий процес OneDrive.",
+            ),
         )),
         "daemon-outdated" => Some((
-            "Запущен старый демон OneDrive",
-            "Завершите прежнее приложение и запустите новый AppImage заново.",
+            t(
+                "An older OneDrive daemon is running",
+                "Працює старий фоновий процес OneDrive",
+            ),
+            t(
+                "Close the old application and restart the new AppImage.",
+                "Закрийте попередню програму й перезапустіть новий AppImage.",
+            ),
         )),
         _ => None,
     }
@@ -200,7 +236,11 @@ impl StateMonitor {
         pause: &gtk::Button,
         initial: String,
     ) -> Self {
-        label.set_text(&format!("Состояние: {}", state_label(&initial)));
+        label.set_text(&format!(
+            "{}: {}",
+            t("Status", "Стан"),
+            state_label(&initial)
+        ));
         let app_for_menu = app.downgrade();
         let menu_action = Rc::new(move |action: tray::MenuAction| {
             let Some(app) = app_for_menu.upgrade() else {
@@ -2087,7 +2127,7 @@ fn main() {
         }
         let engine_status = gtk::Label::new(None);
         engine_status.set_xalign(0.0);
-        let pause = gtk::Button::with_label("Пауза недоступна");
+        let pause = gtk::Button::with_label(t("Pause unavailable", "Пауза недоступна"));
         pause.set_sensitive(false);
         let monitor = StateMonitor::new(app, &engine_status, &pause, read_status());
         let status = gtk::Label::new(None);
@@ -2095,7 +2135,7 @@ fn main() {
         status.set_wrap(true);
         let list = gtk::ListBox::new();
         list.set_selection_mode(gtk::SelectionMode::Single);
-        let login = gtk::Button::with_label("Войти через Microsoft");
+        let login = gtk::Button::with_label(t("Sign in with Microsoft", "Увійти через Microsoft"));
         let status_after_login = status.clone();
         login.connect_clicked(move |_| {
             let result: zbus::Result<String> = daemon_call("BeginLogin");
@@ -2110,7 +2150,7 @@ fn main() {
                 Err(error) => status_after_login.set_text(&login_error_text(&error.to_string())),
             }
         });
-        let scan = gtk::Button::with_label("Проверить OneDrive");
+        let scan = gtk::Button::with_label(t("Refresh OneDrive", "Оновити OneDrive"));
         let status_after_scan = status.clone();
         scan.connect_clicked(move |button| {
             button.set_sensitive(false);
@@ -2135,7 +2175,7 @@ fn main() {
                 gtk::glib::ControlFlow::Break
             });
         });
-        let reload = gtk::Button::with_label("Обновить список");
+        let reload = gtk::Button::with_label(t("Refresh list", "Оновити список"));
         let status_for_reload = status.clone();
         let list_for_reload = list.clone();
         let pause_for_reload = pause.clone();
@@ -2148,73 +2188,77 @@ fn main() {
                 &pause_for_reload,
             )
         });
-        let download = gtk::Button::with_label("Скачать выбранный файл");
-        let choose_sync = gtk::Button::with_label("Папка синхронизации");
-        let preview_sync = gtk::Button::with_label("План синхронизации");
-        let review = gtk::Button::with_label("Рассмотреть изменения");
-        let history = gtk::Button::with_label("Очередь и история");
-        let mount = gtk::Button::with_label("Подключить виртуальный диск");
-        let unmount = gtk::Button::with_label("Отключить виртуальный диск");
-        let show_drafts = gtk::Button::with_label("Все локальные изменения…");
-        let show_mutation_conflicts = gtk::Button::with_label("Конфликты виртуального диска…");
-        let confirm_deletes = gtk::Button::with_label("Подтвердить массовое удаление…");
+        let download = gtk::Button::with_label(t("Download selected file", "Завантажити вибраний файл"));
+        let choose_sync = gtk::Button::with_label(t("Sync folder", "Тека синхронізації"));
+        let preview_sync = gtk::Button::with_label(t("Sync preview", "Попередній перегляд синхронізації"));
+        let review = gtk::Button::with_label(t("Review changes", "Переглянути зміни"));
+        let history = gtk::Button::with_label(t("Queue and history", "Черга та історія"));
+        let mount = gtk::Button::with_label(t("Mount virtual drive", "Підключити віртуальний диск"));
+        let unmount = gtk::Button::with_label(t("Unmount virtual drive", "Відключити віртуальний диск"));
+        let show_drafts = gtk::Button::with_label(t("All local changes…", "Усі локальні зміни…"));
+        let show_mutation_conflicts = gtk::Button::with_label(t("Virtual-drive conflicts…", "Конфлікти віртуального диска…"));
+        let confirm_deletes = gtk::Button::with_label(t("Confirm bulk deletion…", "Підтвердити масове видалення…"));
         mount.set_sensitive(false);
         unmount.set_sensitive(false);
-        let mount_label = gtk::Label::new(Some("Виртуальный диск: проверка состояния…"));
+        let mount_label = gtk::Label::new(Some(t("Virtual drive: checking status…", "Віртуальний диск: перевірка стану…")));
         mount_label.set_xalign(0.0);
         mount_label.set_wrap(true);
         mount_label.set_selectable(true);
-        let fuse_label = gtk::Label::new(Some("FUSE: проверка состояния…"));
+        let fuse_label = gtk::Label::new(Some(t("FUSE: checking status…", "FUSE: перевірка стану…")));
         fuse_label.set_xalign(0.0);
         fuse_label.set_wrap(true);
-        let drafts_label = gtk::Label::new(Some("Локальные изменения: проверка состояния…"));
+        let drafts_label = gtk::Label::new(Some(t("Local changes: checking status…", "Локальні зміни: перевірка стану…")));
         drafts_label.set_xalign(0.0);
         drafts_label.set_wrap(true);
         let mount_controls =
             VirtualMountControls::new(&mount_label, &fuse_label, &drafts_label, &mount, &unmount);
-        let cache_label = gtk::Label::new(Some("Кэш: проверка состояния…"));
+        let cache_label = gtk::Label::new(Some(t("Cache: checking status…", "Кеш: перевірка стану…")));
         cache_label.set_xalign(0.0);
         let cache_size = gtk::SpinButton::with_range(0.25, 64.0, 0.25);
         cache_size.set_digits(2);
         cache_size.set_numeric(true);
-        let cache_apply = gtk::Button::with_label("Сохранить лимит кэша");
+        let cache_apply = gtk::Button::with_label(t("Save cache limit", "Зберегти обмеження кешу"));
         cache_apply.set_sensitive(false);
         let cache_controls = VirtualCacheControls::new(&cache_label, &cache_size, &cache_apply);
-        let cache_clear = gtk::Button::with_label("Очистить кэш");
-        cache_clear.set_tooltip_text(Some("Удалить временные копии; офлайн-файлы и локальные черновики сохранятся"));
-        let exit = gtk::Button::with_label("Выход");
+        let cache_clear = gtk::Button::with_label(t("Clear cache", "Очистити кеш"));
+        cache_clear.set_tooltip_text(Some(t("Remove temporary copies; offline files and local drafts are kept", "Видалити тимчасові копії; офлайн-файли та локальні чернетки збережуться")));
+        let exit = gtk::Button::with_label(t("Quit", "Вийти"));
         let account_menu = gio::Menu::new();
-        account_menu.append(Some("Войти через Microsoft"), Some("app.login"));
-        account_menu.append(Some("Выход"), Some("app.quit"));
+        account_menu.append(Some(t("Sign in with Microsoft", "Увійти через Microsoft")), Some("app.login"));
+        account_menu.append(Some(t("Quit", "Вийти")), Some("app.quit"));
         let sync_menu = gio::Menu::new();
         for (label, action) in [
-            ("Проверить OneDrive", "app.refresh"),
-            ("Файлы OneDrive…", "app.browse-files"),
-            ("Папка синхронизации", "app.choose-sync"),
-            ("Открыть папку синхронизации", "app.open-sync-folder"),
-            ("План синхронизации", "app.preview-sync"),
-            ("Рассмотреть изменения", "app.review"),
-            ("Очередь и история", "app.history"),
-            ("Приостановить / возобновить", "app.toggle-pause"),
+            (t("Refresh OneDrive", "Оновити OneDrive"), "app.refresh"),
+            (t("OneDrive files…", "Файли OneDrive…"), "app.browse-files"),
+            (t("Sync folder", "Тека синхронізації"), "app.choose-sync"),
+            (t("Open sync folder", "Відкрити теку синхронізації"), "app.open-sync-folder"),
+            (t("Sync preview", "Попередній перегляд синхронізації"), "app.preview-sync"),
+            (t("Review changes", "Переглянути зміни"), "app.review"),
+            (t("Queue and history", "Черга та історія"), "app.history"),
+            (t("Pause / resume", "Призупинити / відновити"), "app.toggle-pause"),
         ] {
             sync_menu.append(Some(label), Some(action));
         }
         let virtual_menu = gio::Menu::new();
         for (label, action) in [
-            ("Подключить диск", "app.mount"),
-            ("Отключить диск", "app.unmount"),
-            ("Локальные изменения", "app.show-drafts"),
-            ("Конфликты", "app.mutation-conflicts"),
-            ("Подтвердить массовое удаление", "app.confirm-deletes"),
-            ("Выбрать файлы для офлайн-доступа", "app.offline-files"),
-            ("Сохранить лимит кэша", "app.cache-limit"),
+            (t("Mount drive", "Підключити диск"), "app.mount"),
+            (t("Unmount drive", "Відключити диск"), "app.unmount"),
+            (t("Local changes", "Локальні зміни"), "app.show-drafts"),
+            (t("Conflicts", "Конфлікти"), "app.mutation-conflicts"),
+            (t("Confirm bulk deletion", "Підтвердити масове видалення"), "app.confirm-deletes"),
+            (t("Choose files for offline access", "Вибрати файли для офлайн-доступу"), "app.offline-files"),
+            (t("Save cache limit", "Зберегти обмеження кешу"), "app.cache-limit"),
         ] {
             virtual_menu.append(Some(label), Some(action));
         }
         let menu = gio::Menu::new();
-        menu.append_submenu(Some("Аккаунт"), &account_menu);
-        menu.append_submenu(Some("Синхронизация"), &sync_menu);
-        menu.append_submenu(Some("Виртуальный диск"), &virtual_menu);
+        menu.append_submenu(Some(t("Account", "Обліковий запис")), &account_menu);
+        menu.append_submenu(Some(t("Sync", "Синхронізація")), &sync_menu);
+        menu.append_submenu(Some(t("Virtual drive", "Віртуальний диск")), &virtual_menu);
+        let language_menu = gio::Menu::new();
+        language_menu.append(Some("English"), Some("app.language-en"));
+        language_menu.append(Some("Українська"), Some("app.language-uk"));
+        menu.append_submenu(Some(t("Language", "Мова")), &language_menu);
         let menu_bar = gtk::PopoverMenuBar::from_model(Some(&menu));
         menu_bar.set_margin_start(18);
         menu_bar.set_margin_end(18);
@@ -2225,9 +2269,9 @@ fn main() {
         account_status.set_margin_end(12);
         account_status.set_margin_top(12);
         account_status.set_margin_bottom(12);
-        account_status.append(&gtk::Label::builder().label("Состояние OneDrive").xalign(0.0).css_classes(["heading"]).build());
+        account_status.append(&gtk::Label::builder().label(t("OneDrive status", "Стан OneDrive")).xalign(0.0).css_classes(["heading"]).build());
         account_status.append(&engine_status);
-        account_status.append(&gtk::Label::builder().label("Последнее действие").xalign(0.0).css_classes(["heading"]).build());
+        account_status.append(&gtk::Label::builder().label(t("Latest action", "Остання дія")).xalign(0.0).css_classes(["heading"]).build());
         account_status.append(&status);
         let account_frame = gtk::Frame::new(None);
         account_frame.set_child(Some(&account_status));
@@ -2236,10 +2280,10 @@ fn main() {
         virtual_status.set_margin_end(12);
         virtual_status.set_margin_top(12);
         virtual_status.set_margin_bottom(12);
-        virtual_status.append(&gtk::Label::builder().label("Виртуальный диск").xalign(0.0).css_classes(["heading"]).build());
+        virtual_status.append(&gtk::Label::builder().label(t("Virtual drive", "Віртуальний диск")).xalign(0.0).css_classes(["heading"]).build());
         virtual_status.append(&mount_label);
         virtual_status.append(&fuse_label);
-        virtual_status.append(&gtk::Label::builder().label("Локальные изменения и операции").xalign(0.0).css_classes(["heading"]).build());
+        virtual_status.append(&gtk::Label::builder().label(t("Local changes and operations", "Локальні зміни та операції")).xalign(0.0).css_classes(["heading"]).build());
         virtual_status.append(&drafts_label);
         let virtual_frame = gtk::Frame::new(None);
         virtual_frame.set_child(Some(&virtual_status));
@@ -2248,11 +2292,11 @@ fn main() {
         cache_controls_box.set_margin_end(12);
         cache_controls_box.set_margin_top(12);
         cache_controls_box.set_margin_bottom(12);
-        cache_controls_box.append(&gtk::Label::builder().label("Офлайн-доступ и кэш").xalign(0.0).css_classes(["heading"]).build());
-        cache_controls_box.append(&gtk::Label::builder().label("Закреплённые файлы остаются доступными без сети. Выбор файлов и папок — в меню «Виртуальный диск».").xalign(0.0).wrap(true).build());
+        cache_controls_box.append(&gtk::Label::builder().label(t("Offline access and cache", "Офлайн-доступ і кеш")).xalign(0.0).css_classes(["heading"]).build());
+        cache_controls_box.append(&gtk::Label::builder().label(t("Pinned files remain available offline. Choose files and folders from the Virtual drive menu.", "Закріплені файли доступні без мережі. Вибір файлів і тек — у меню «Віртуальний диск».")).xalign(0.0).wrap(true).build());
         cache_controls_box.append(&cache_label);
         let cache_actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-        cache_actions.append(&gtk::Label::new(Some("Лимит кэша (ГиБ):")));
+        cache_actions.append(&gtk::Label::new(Some(t("Cache limit (GiB):", "Обмеження кешу (ГіБ):"))));
         cache_actions.append(&cache_size);
         cache_actions.append(&cache_clear);
         cache_controls_box.append(&cache_actions);
@@ -2287,18 +2331,35 @@ fn main() {
             .default_height(540)
             .content(&layout)
             .build();
+        for (code, language) in [
+            ("language-en", locale::Language::English),
+            ("language-uk", locale::Language::Ukrainian),
+        ] {
+            let action = gio::SimpleAction::new(code, None);
+            let feedback = status.clone();
+            action.connect_activate(move |_, _| {
+                match locale::save(language) {
+                    Ok(()) => feedback.set_text(t(
+                        "Language saved. Restart the application to apply it.",
+                        "Мову збережено. Перезапустіть програму, щоб застосувати її.",
+                    )),
+                    Err(error) => feedback.set_text(&format!("Could not save language: {error}")),
+                }
+            });
+            app.add_action(&action);
+        }
         let files_menu = gio::Menu::new();
-        files_menu.append(Some("Обновить список"), Some("app.reload"));
-        files_menu.append(Some("Скачать выбранный файл"), Some("app.download"));
+        files_menu.append(Some(t("Refresh list", "Оновити список")), Some("app.reload"));
+        files_menu.append(Some(t("Download selected file", "Завантажити вибраний файл")), Some("app.download"));
         let files_root_menu = gio::Menu::new();
-        files_root_menu.append_submenu(Some("Файлы"), &files_menu);
+        files_root_menu.append_submenu(Some(t("Files", "Файли")), &files_menu);
         let files_layout = gtk::Box::new(gtk::Orientation::Vertical, 6);
         let files_menu_bar = gtk::PopoverMenuBar::from_model(Some(&files_root_menu));
         files_menu_bar.set_margin_start(12);
         files_menu_bar.set_margin_end(12);
         files_layout.append(&files_menu_bar);
         files_layout.append(&gtk::Label::builder()
-            .label("Каталог OneDrive. Выберите файл и используйте меню «Файлы» для скачивания.")
+            .label(t("OneDrive catalog. Select a file and use the Files menu to download it.", "Каталог OneDrive. Виберіть файл і скористайтеся меню «Файли» для завантаження."))
             .xalign(0.0).wrap(true).margin_start(12).margin_end(12).build());
         let files_feedback = gtk::Label::new(None);
         files_feedback.set_xalign(0.0);
@@ -2310,7 +2371,7 @@ fn main() {
         let files_window = gtk::Window::builder()
             .application(app)
             .transient_for(&window)
-            .title("Файлы OneDrive")
+            .title(t("OneDrive files", "Файли OneDrive"))
             .default_width(700)
             .default_height(560)
             .child(&files_layout)
@@ -3042,7 +3103,7 @@ mod tests {
         assert!(attention_notification(Some("paused"), "reconciliation-needed").is_some());
         assert_eq!(
             state_label("daemon-unavailable"),
-            "Фоновый процесс недоступен"
+            "Background daemon unavailable"
         );
     }
 
@@ -3061,7 +3122,7 @@ mod tests {
             "daemon-outdated"
         );
         assert_eq!(classify_daemon_status(None, None), "daemon-unavailable");
-        assert!(state_label("daemon-outdated").contains("старый фоновый процесс"));
+        assert!(state_label("daemon-outdated").contains("older daemon"));
     }
 
     #[test]
