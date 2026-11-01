@@ -1,6 +1,8 @@
 name: Rust checks
 on:
   push:
+    branches:
+      - '**'
   pull_request:
 
 jobs:
@@ -13,6 +15,7 @@ jobs:
           components: clippy, rustfmt
       - name: Install native dependencies
         run: sudo apt-get update && sudo apt-get install -y libgtk-4-dev libadwaita-1-dev pkg-config dbus-bin libglib2.0-bin desktop-file-utils appstream
+      - run: sh scripts/test-release-tag.sh
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace

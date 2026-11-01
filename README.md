@@ -130,6 +130,22 @@ To build an AppImage, provide locally verified `linuxdeploy` and
 `appimagetool` executables and run `scripts/build-appimage.sh`. The version
 comes from `[workspace.package].version` in the root `Cargo.toml`.
 
+## Publish a release
+
+After setting the workspace version and merging the release commit, push a
+tag with the exact `X.Y.Z` version (without a `v` prefix):
+
+```sh
+git tag 1.0.0
+git push origin 1.0.0
+```
+
+The tag must match the Cargo version. The release workflow runs source and
+smoke checks, builds and checks an x86_64 AppImage, writes its SHA-256 checksum,
+and publishes both files to a GitHub Release. A tag such as `v1.0.0` or
+`1.0.0-rc1` does not produce a release. The ordinary CI workflow runs on
+branch pushes and pull requests; tag pushes use the release workflow.
+
 Local tests cover recovery and conflicts, but a full live-account and
 cross-distribution AppImage validation is still needed. Keep an independent
 backup of important cloud files while testing write operations.
