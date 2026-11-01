@@ -2051,7 +2051,11 @@ fn main() {
     });
     app.add_action(&show_action);
     app.connect_activate(|app| {
-        if let Some(window) = app.windows().into_iter().next() {
+        if let Some(window) = app
+            .windows()
+            .into_iter()
+            .find(|window| window.is::<adw::ApplicationWindow>())
+        {
             window.present();
             return;
         }
@@ -2159,8 +2163,7 @@ fn main() {
         let sync_menu = gio::Menu::new();
         for (label, action) in [
             ("Проверить OneDrive", "app.refresh"),
-            ("Обновить список", "app.reload"),
-            ("Скачать выбранный файл", "app.download"),
+            ("Файлы OneDrive…", "app.browse-files"),
             ("Папка синхронизации", "app.choose-sync"),
             ("Открыть папку синхронизации", "app.open-sync-folder"),
             ("План синхронизации", "app.preview-sync"),
@@ -2187,6 +2190,10 @@ fn main() {
         menu.append_submenu(Some("Синхронизация"), &sync_menu);
         menu.append_submenu(Some("Виртуальный диск"), &virtual_menu);
         let menu_bar = gtk::PopoverMenuBar::from_model(Some(&menu));
+        menu_bar.set_margin_start(18);
+        menu_bar.set_margin_end(18);
+        menu_bar.set_margin_top(6);
+        menu_bar.set_margin_bottom(6);
         let account_status = gtk::Box::new(gtk::Orientation::Vertical, 6);
         account_status.set_margin_start(12);
         account_status.set_margin_end(12);
@@ -2230,12 +2237,9 @@ fn main() {
         content.set_margin_end(18);
         content.set_margin_top(18);
         content.set_margin_bottom(18);
-        content.append(&menu_bar);
         content.append(&account_frame);
         content.append(&virtual_frame);
         content.append(&cache_frame);
-        content.append(&gtk::Label::builder().label("Файлы OneDrive").xalign(0.0).css_classes(["heading"]).build());
-        content.append(&list);
         let title = app_title();
         let header = adw::HeaderBar::new();
         let title_label = gtk::Label::new(Some(&title));
@@ -2243,6 +2247,7 @@ fn main() {
         header.set_title_widget(Some(&title_label));
         let layout = gtk::Box::new(gtk::Orientation::Vertical, 0);
         layout.append(&header);
+        layout.append(&menu_bar);
         layout.append(&gtk::ScrolledWindow::builder().child(&content).vexpand(true).build());
         let window = adw::ApplicationWindow::builder()
             .application(app)
@@ -2251,6 +2256,38 @@ fn main() {
             .default_height(540)
             .content(&layout)
             .build();
+        let files_menu = gio::Menu::new();
+        files_menu.append(Some("Обновить список"), Some("app.reload"));
+        files_menu.append(Some("Скачать выбранный файл"), Some("app.download"));
+        let files_root_menu = gio::Menu::new();
+        files_root_menu.append_submenu(Some("Файлы"), &files_menu);
+        let files_layout = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        let files_menu_bar = gtk::PopoverMenuBar::from_model(Some(&files_root_menu));
+        files_menu_bar.set_margin_start(12);
+        files_menu_bar.set_margin_end(12);
+        files_layout.append(&files_menu_bar);
+        files_layout.append(&gtk::Label::builder()
+            .label("Каталог OneDrive. Выберите файл и используйте меню «Файлы» для скачивания.")
+            .xalign(0.0).wrap(true).margin_start(12).margin_end(12).build());
+        let files_feedback = gtk::Label::new(None);
+        files_feedback.set_xalign(0.0);
+        files_feedback.set_wrap(true);
+        files_feedback.set_margin_start(12);
+        files_feedback.set_margin_end(12);
+        files_layout.append(&files_feedback);
+        files_layout.append(&gtk::ScrolledWindow::builder().child(&list).vexpand(true).build());
+        let files_window = gtk::Window::builder()
+            .application(app)
+            .transient_for(&window)
+            .title("Файлы OneDrive")
+            .default_width(700)
+            .default_height(560)
+            .child(&files_layout)
+            .build();
+        files_window.connect_close_request(|window| {
+            window.set_visible(false);
+            gtk::glib::Propagation::Stop
+        });
         let hold = app.hold();
         window.connect_close_request(move |window| {
             let _keep_app_running = &hold;
@@ -2265,10 +2302,11 @@ fn main() {
         });
         let list_for_download = list.clone();
         let status_for_download = status.clone();
-        let window_for_download = window.clone();
+        let window_for_download = files_window.clone();
+        let feedback_for_download = files_feedback.clone();
         download.connect_clicked(move |_| {
             let Some(row) = list_for_download.selected_row() else {
-                status_for_download.set_text("Сначала выберите файл");
+                feedback_for_download.set_text("Сначала выберите файл");
                 return;
             };
             let item_id = row.widget_name().to_string();
@@ -2276,23 +2314,24 @@ fn main() {
             dialog.set_title("Сохранить файл OneDrive");
             dialog.set_initial_name(Some(row.tooltip_text().as_deref().unwrap_or("download")));
             let status_after_dialog = status_for_download.clone();
+            let feedback_after_dialog = feedback_for_download.clone();
             dialog.save(
                 Some(&window_for_download),
                 None::<&gio::Cancellable>,
                 move |result| {
                     let Ok(file) = result else { return };
                     let Some(path) = file.path() else {
-                        status_after_dialog.set_text("Выберите локальный путь");
+                        feedback_after_dialog.set_text("Выберите локальный путь");
                         return;
                     };
                     let destination = path.to_string_lossy();
-                    status_after_dialog.set_text(
-                        if download_item(&item_id, &destination).is_ok() {
-                            "Скачивание запущено"
-                        } else {
-                            "Не удалось начать скачивание"
-                        },
-                    );
+                    let message = if download_item(&item_id, &destination).is_ok() {
+                        "Скачивание запущено"
+                    } else {
+                        "Не удалось начать скачивание"
+                    };
+                    feedback_after_dialog.set_text(message);
+                    status_after_dialog.set_text(message);
                 },
             );
         });
@@ -2668,6 +2707,12 @@ fn main() {
         ] {
             add_button_action(app, name, button);
         }
+        let browse_files_action = gio::SimpleAction::new("browse-files", None);
+        let files_window_for_action = files_window.clone();
+        browse_files_action.connect_activate(move |_, _| {
+            files_window_for_action.present();
+        });
+        app.add_action(&browse_files_action);
         let open_folder_action = gio::SimpleAction::new("open-sync-folder", None);
         let window_for_open = window.downgrade();
         let status_for_open = status.downgrade();
