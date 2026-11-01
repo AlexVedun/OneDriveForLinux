@@ -70,6 +70,10 @@ opens a separate browser for manual downloads. To mount a drive, choose
 the sync folder and cache. A configured mount directory is remembered and
 remounted on the next daemon start after the catalog is ready.
 
+English is the default interface language. Choose Ukrainian from the
+**Language** menu, then restart the desktop application. The selection
+is saved under `$XDG_CONFIG_HOME/onedrive-linux/language`.
+
 SQLite state is stored under `$XDG_STATE_HOME/onedrive-linux/` (normally
 `~/.local/state/onedrive-linux/`). Keep that directory when upgrading: it
 contains the catalog, queues, and local drafts.
