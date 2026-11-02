@@ -85,6 +85,9 @@ mean the cloud copy has changed. Closed drafts upload only while the daemon
 is connected, the drive is mounted, and a sync folder is not configured.
 New folders must be confirmed in OneDrive before their files can upload.
 Drafts with an uncertain upload result are retained for review.
+After a completed catalog refresh, cloud-deleted files disappear from an
+already mounted drive. Open read handles and local drafts remain available.
+New cloud files still appear after remounting the drive.
 
 Use **Virtual drive → Local changes** to inspect drafts. You can export a copy
 without removing its draft, compare small files with their cloud copy, retry

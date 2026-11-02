@@ -65,6 +65,7 @@ pub type ContentLoader = dyn Fn(&DownloadRequest) -> io::Result<()> + Send + Syn
 pub struct PublishedVersionController {
     drive_id: String,
     versions: Arc<Mutex<HashMap<u64, (String, u64)>>>,
+    deleted_remote_files: Arc<Mutex<HashSet<String>>>,
     operations: Arc<Mutex<PublicationOperations>>,
     open_lock: Arc<Mutex<()>>,
     files: Arc<Mutex<HashMap<u64, OpenFile>>>,
@@ -113,6 +114,11 @@ impl Drop for OpeningFile {
 impl PublishedVersionController {
     pub fn drive_id(&self) -> &str {
         &self.drive_id
+    }
+
+    /// Apply confirmed cloud file deletions without discarding local drafts.
+    pub fn set_deleted_remote_files(&self, item_ids: impl IntoIterator<Item = String>) {
+        *self.deleted_remote_files.lock().unwrap() = item_ids.into_iter().collect();
     }
 
     /// Reserve an idle existing file until its uploaded draft is acknowledged.
@@ -422,6 +428,7 @@ pub struct VirtualFuse {
     directory_aliases: Arc<Mutex<HashMap<String, u64>>>,
     remote_changes: Mutex<HashMap<u64, Mutation>>,
     published_versions: Arc<Mutex<HashMap<u64, (String, u64)>>>,
+    deleted_remote_files: Arc<Mutex<HashSet<String>>>,
     publication_operations: Arc<Mutex<PublicationOperations>>,
     next_handle: AtomicU64,
     uid: u32,
@@ -450,6 +457,7 @@ impl VirtualFuse {
             directory_aliases: Arc::new(Mutex::new(HashMap::new())),
             remote_changes: Mutex::new(HashMap::new()),
             published_versions: Arc::new(Mutex::new(HashMap::new())),
+            deleted_remote_files: Arc::new(Mutex::new(HashSet::new())),
             publication_operations: Arc::new(Mutex::new(PublicationOperations::default())),
             next_handle: AtomicU64::new(1),
             uid: unsafe { libc::geteuid() },
@@ -490,6 +498,7 @@ impl VirtualFuse {
         PublishedVersionController {
             drive_id: self.tree.drive_id().to_owned(),
             versions: Arc::clone(&self.published_versions),
+            deleted_remote_files: Arc::clone(&self.deleted_remote_files),
             operations: Arc::clone(&self.publication_operations),
             open_lock: Arc::clone(&self.open_lock),
             files: Arc::clone(&self.files),
@@ -716,6 +725,16 @@ impl VirtualFuse {
     }
 
     fn remote_node(&self, node: &Node) -> Option<Node> {
+        if node.kind == NodeKind::File
+            && self
+                .deleted_remote_files
+                .lock()
+                .unwrap()
+                .contains(&node.item_id)
+            && matches!(self.draft_for_node(node), Ok(None))
+        {
+            return None;
+        }
         let remote_inode = crate::stable_inode(self.tree.drive_id(), &node.item_id);
         let mutation = self
             .remote_changes
@@ -2931,6 +2950,113 @@ mod tests {
             modified: None,
             deleted: false,
         }
+    }
+
+    #[test]
+    fn completed_cloud_deletion_hides_clean_file_but_keeps_open_read_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_root = dir.path().join("cache");
+        let source = dir.path().join("source");
+        fs::write(&source, b"hello").unwrap();
+        let tree = VirtualTree::from_items("drive", "root", [file_item()]).unwrap();
+        let request = tree.request_for_item("file").unwrap();
+        CacheStore::open(&cache_root, 10)
+            .unwrap()
+            .put(&request.cache_key(), &source, 5)
+            .unwrap();
+        let fuse = VirtualFuse::new_writable(
+            tree,
+            cache_root,
+            dir.path().join("drafts"),
+            10,
+            Arc::new(|_| Err(io::ErrorKind::NotConnected.into())),
+        );
+        let inode = fuse.lookup_node(ROOT_INODE, "текст.txt").unwrap().inode;
+        let handle = fuse.open_file(inode, OpenFlags(libc::O_RDONLY)).unwrap();
+        let controller = fuse.published_version_controller();
+        controller.set_deleted_remote_files(["file".to_owned()]);
+        assert!(fuse.lookup_node(ROOT_INODE, "текст.txt").is_none());
+        assert!(
+            fuse.directory_entries(ROOT_INODE)
+                .unwrap()
+                .iter()
+                .all(|entry| entry.2 != "текст.txt")
+        );
+        assert_eq!(
+            fuse.open_file(inode, OpenFlags(libc::O_RDONLY)),
+            Err(Errno::ENOENT)
+        );
+        assert_eq!(fuse.read_file(inode, handle, 0, 5).unwrap(), b"hello");
+        controller.set_deleted_remote_files([]);
+        assert!(fuse.lookup_node(ROOT_INODE, "текст.txt").is_some());
+    }
+
+    #[test]
+    fn completed_cloud_deletion_keeps_local_draft_visible() {
+        let dir = tempfile::tempdir().unwrap();
+        let draft_root = dir.path().join("drafts");
+        DraftStore::open(&draft_root)
+            .unwrap()
+            .begin_empty(DraftIdentity {
+                drive_id: "drive".into(),
+                item_id: "file".into(),
+                base_etag: "v1".into(),
+                new_file: None,
+            })
+            .unwrap()
+            .write_at(0, b"unsent")
+            .unwrap();
+        let fuse = VirtualFuse::new_writable(
+            VirtualTree::from_items("drive", "root", [file_item()]).unwrap(),
+            dir.path().join("cache"),
+            draft_root,
+            10,
+            Arc::new(|_| Err(io::ErrorKind::NotConnected.into())),
+        );
+        fuse.load_local_files().unwrap();
+        fuse.published_version_controller()
+            .set_deleted_remote_files(["file".to_owned()]);
+        let node = fuse.lookup_node(ROOT_INODE, "текст.txt").unwrap();
+        let handle = fuse
+            .open_file(node.inode, OpenFlags(libc::O_RDONLY))
+            .unwrap();
+        assert_eq!(fuse.read_file(node.inode, handle, 0, 6).unwrap(), b"unsent");
+    }
+
+    #[test]
+    fn completed_cloud_deletion_hides_published_local_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let fuse = VirtualFuse::new_writable(
+            VirtualTree::from_items("drive", "root", []).unwrap(),
+            dir.path().join("cache"),
+            dir.path().join("drafts"),
+            10,
+            Arc::new(|_| Err(io::ErrorKind::NotConnected.into())),
+        );
+        let inode = crate::stable_inode("drive", "local:video");
+        fuse.local_files.lock().unwrap().insert(
+            inode,
+            Node {
+                inode,
+                parent_inode: ROOT_INODE,
+                item_id: "remote-video".into(),
+                name: "video.mp4".into(),
+                kind: NodeKind::File,
+                size: 100,
+                etag: Some("uploaded".into()),
+                ctag: None,
+            },
+        );
+        assert!(fuse.lookup_node(ROOT_INODE, "video.mp4").is_some());
+        fuse.published_version_controller()
+            .set_deleted_remote_files(["remote-video".to_owned()]);
+        assert!(fuse.lookup_node(ROOT_INODE, "video.mp4").is_none());
+        assert!(
+            fuse.directory_entries(ROOT_INODE)
+                .unwrap()
+                .iter()
+                .all(|entry| entry.2 != "video.mp4")
+        );
     }
 
     #[test]

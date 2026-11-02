@@ -379,6 +379,15 @@ impl Catalog {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// File tombstones from a completed delta scan, for mounted FUSE views.
+    pub fn deleted_file_ids(&self, drive_id: &str) -> Result<Vec<String>, CatalogError> {
+        let mut statement = self.connection.prepare(
+            "SELECT item_id FROM remote_item WHERE drive_id = ?1 AND kind = 'file' AND deleted = 1",
+        )?;
+        let rows = statement.query_map([drive_id], |row| row.get(0))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     pub fn item(&self, drive_id: &str, item_id: &str) -> Result<Option<CatalogItem>, CatalogError> {
         self.connection
             .query_row(
@@ -592,6 +601,7 @@ mod tests {
         assert_eq!(items[0].name.as_deref(), Some("before.txt"));
         assert_eq!(items[0].etag.as_deref(), Some("v1"));
         assert!(items[0].deleted);
+        assert_eq!(catalog.deleted_file_ids("drive").unwrap(), vec!["item"]);
     }
 
     #[test]

@@ -1776,6 +1776,9 @@ impl Daemon {
             session,
             published_versions,
         });
+        // A catalog scan can finish while FUSE is starting; apply any tombstones
+        // already committed by that scan to the newly mounted view as well.
+        let _ = refresh_mounted_deleted_files(&self.catalog, &self.virtual_mount);
         Ok(mount_path.to_string_lossy().into_owned())
     }
 
@@ -2928,11 +2931,14 @@ impl Daemon {
             ));
         }
         let catalog = Arc::clone(&self.catalog);
+        let virtual_mount = Arc::clone(&self.virtual_mount);
         let state = Arc::clone(&self.state);
         let in_progress = Arc::clone(&self.scan_in_progress);
         tokio::spawn(async move {
             *state.lock().unwrap() = EngineState::Checking;
-            let outcome = scan_catalog(catalog, client_id).await;
+            let outcome = scan_catalog(Arc::clone(&catalog), client_id)
+                .await
+                .and_then(|_| refresh_mounted_deleted_files(&catalog, &virtual_mount));
             *state.lock().unwrap() = scan_outcome_state(&outcome);
             if outcome.is_err() {
                 eprintln!("catalog scan failed; request URLs and credentials were not logged");
@@ -4059,6 +4065,35 @@ async fn scan_catalog(
     Ok(())
 }
 
+fn refresh_mounted_deleted_files(
+    catalog: &Arc<Mutex<Catalog>>,
+    virtual_mount: &Arc<Mutex<Option<MountedVirtualDrive>>>,
+) -> Result<(), ScanCatalogError> {
+    let (drive_id, deleted) = {
+        let catalog = catalog.lock().unwrap();
+        let drive_id = catalog
+            .active_drive_id()
+            .map_err(|_| ScanCatalogError::Failed)?
+            .ok_or(ScanCatalogError::Failed)?;
+        if !catalog
+            .is_complete(&drive_id)
+            .map_err(|_| ScanCatalogError::Failed)?
+        {
+            return Err(ScanCatalogError::Failed);
+        }
+        let deleted = catalog
+            .deleted_file_ids(&drive_id)
+            .map_err(|_| ScanCatalogError::Failed)?;
+        (drive_id, deleted)
+    };
+    if let Some(mounted) = virtual_mount.lock().unwrap().as_ref()
+        && mounted.published_versions.drive_id() == drive_id
+    {
+        mounted.published_versions.set_deleted_remote_files(deleted);
+    }
+    Ok(())
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum TokenAccessError {
     Auth,
@@ -4123,6 +4158,7 @@ async fn access_token(client_id: &str) -> Result<String, ()> {
 async fn poll_catalog(
     state: Arc<Mutex<EngineState>>,
     catalog: Arc<Mutex<Catalog>>,
+    virtual_mount: Arc<Mutex<Option<MountedVirtualDrive>>>,
     scan_in_progress: Arc<AtomicBool>,
     download_in_progress: Arc<AtomicBool>,
     upload_in_progress: Arc<AtomicBool>,
@@ -4146,7 +4182,9 @@ async fn poll_catalog(
             continue;
         }
         *state.lock().unwrap() = EngineState::Checking;
-        let result = scan_catalog(Arc::clone(&catalog), client_id.clone()).await;
+        let result = scan_catalog(Arc::clone(&catalog), client_id.clone())
+            .await
+            .and_then(|_| refresh_mounted_deleted_files(&catalog, &virtual_mount));
         *state.lock().unwrap() = scan_outcome_state(&result);
         scan_in_progress.store(false, Ordering::SeqCst);
     }
@@ -4780,6 +4818,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tokio::spawn(poll_catalog(
             state,
             catalog,
+            Arc::clone(&virtual_mount),
             scan_in_progress,
             download_in_progress,
             upload_in_progress,
