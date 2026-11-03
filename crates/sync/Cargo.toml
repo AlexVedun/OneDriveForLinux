@@ -8,7 +8,7 @@ license.workspace = true
 libc = "0.2"
 onedrive-catalog = { path = "../catalog" }
 onedrive-core = { path = "../core" }
-rusqlite = { version = "0.40.2", features = ["bundled"] }
+rusqlite = { version = "0.41.1", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
 sha2 = "0.10"
 tempfile = "3.27"
