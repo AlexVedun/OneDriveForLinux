@@ -65,7 +65,7 @@ jobs:
           cd target/dist
           sha256sum "$image" > "$image.sha256"
           sha256sum -c "$image.sha256"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: OneDriveForLinux-${{ env.RELEASE_TAG }}-x86_64
           path: |
