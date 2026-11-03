@@ -9,7 +9,7 @@ jobs:
   check:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
@@ -30,7 +30,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: Install native dependencies
         run: sudo apt-get update && sudo apt-get install -y libgtk-4-dev libgtk-4-bin libadwaita-1-dev adwaita-icon-theme librsvg2-common libgdk-pixbuf2.0-bin pkg-config dbus-bin libglib2.0-bin desktop-file-utils appstream
