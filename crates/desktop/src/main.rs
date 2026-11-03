@@ -3138,7 +3138,10 @@ mod tests {
 
     #[test]
     fn title_shows_workspace_version_and_login_error_explains_missing_configuration() {
-        assert_eq!(app_title(), "OneDriveForLinux - 1.0.0");
+        assert_eq!(
+            app_title(),
+            format!("OneDriveForLinux - {}", env!("CARGO_PKG_VERSION"))
+        );
         assert!(
             login_error_text(
                 "org.freedesktop.DBus.Error.Failed: ONEDRIVE_CLIENT_ID is not configured"
