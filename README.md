@@ -149,6 +149,14 @@ and publishes both files to a GitHub Release. A tag such as `v1.0.0` or
 `1.0.0-rc1` does not produce a release. The ordinary CI workflow runs on
 branch pushes and pull requests; tag pushes use the release workflow.
 
+If a tagged release fails and the fix keeps the same application version,
+open **Actions → Release AppImage → Run workflow**. Select the branch with
+the fix and enter the existing `X.Y.Z` tag. The workflow checks that the
+branch still declares that version, runs the tests, and builds and verifies
+the AppImage. Only then does it move the tag to the verified commit and
+publish the release. It refuses to move a tag that already has a release.
+The moved tag makes the release source archive match the AppImage source.
+
 Local tests cover recovery and conflicts, but a full live-account and
 cross-distribution AppImage validation is still needed. Keep an independent
 backup of important cloud files while testing write operations.

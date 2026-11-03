@@ -4,30 +4,44 @@ on:
   push:
     tags:
       - '[0-9]*.[0-9]*.[0-9]*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing X.Y.Z tag to move to the selected branch after a successful build'
+        required: true
+        type: string
 
 permissions:
   contents: write
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
   release:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
+    env:
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
       - name: Validate release tag and Cargo version
-        run: sh scripts/check-release-tag.sh "$GITHUB_REF_NAME"
+        run: |
+          sh scripts/check-release-tag.sh "$RELEASE_TAG"
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
+            test "$GITHUB_REF_TYPE" = branch || { echo 'Select a branch containing the release fix.' >&2; exit 1; }
+            git ls-remote --exit-code --refs origin "refs/tags/$RELEASE_TAG" >/dev/null || { echo "Tag $RELEASE_TAG does not exist." >&2; exit 1; }
+          fi
       - name: Install native dependencies
         run: sudo apt-get update && sudo apt-get install -y libgtk-4-dev libgtk-4-bin libadwaita-1-dev adwaita-icon-theme pkg-config dbus-bin libglib2.0-bin desktop-file-utils appstream
       - name: Check source and release tag validation
         run: |
           sh scripts/test-release-tag.sh
+          sh scripts/test-retarget-release-tag.sh
           cargo fmt --all -- --check
           cargo clippy --workspace --all-targets -- -D warnings
           cargo test --workspace
@@ -45,7 +59,7 @@ jobs:
         run: sh scripts/smoke-appimage.sh
       - name: Build and verify release AppImage
         run: |
-          image="OneDriveForLinux-${GITHUB_REF_NAME}-x86_64.AppImage"
+          image="OneDriveForLinux-${RELEASE_TAG}-x86_64.AppImage"
           sh scripts/build-appimage.sh
           dbus-run-session -- sh scripts/smoke-appimage-runtime.sh "target/dist/$image"
           cd target/dist
@@ -53,16 +67,21 @@ jobs:
           sha256sum -c "$image.sha256"
       - uses: actions/upload-artifact@v4
         with:
-          name: OneDriveForLinux-${{ github.ref_name }}-x86_64
+          name: OneDriveForLinux-${{ env.RELEASE_TAG }}-x86_64
           path: |
-            target/dist/OneDriveForLinux-${{ github.ref_name }}-x86_64.AppImage
-            target/dist/OneDriveForLinux-${{ github.ref_name }}-x86_64.AppImage.sha256
+            target/dist/OneDriveForLinux-${{ env.RELEASE_TAG }}-x86_64.AppImage
+            target/dist/OneDriveForLinux-${{ env.RELEASE_TAG }}-x86_64.AppImage.sha256
           if-no-files-found: error
+      - name: Point failed tag at the verified build
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: sh scripts/retarget-release-tag.sh "$RELEASE_TAG"
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          image="OneDriveForLinux-${GITHUB_REF_NAME}-x86_64.AppImage"
-          gh release create "$GITHUB_REF_NAME" \
+          image="OneDriveForLinux-${RELEASE_TAG}-x86_64.AppImage"
+          gh release create "$RELEASE_TAG" \
             "target/dist/$image" "target/dist/$image.sha256" \
-            --verify-tag --title "OneDriveForLinux $GITHUB_REF_NAME" --generate-notes
+            --verify-tag --title "OneDriveForLinux $RELEASE_TAG" --generate-notes
