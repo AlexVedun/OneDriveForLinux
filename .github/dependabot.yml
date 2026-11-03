@@ -5,6 +5,11 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    ignore:
+      # The desktop crate uses the blocking feature, which zbus 6 removed.
+      - dependency-name: zbus
+        update-types:
+          - version-update:semver-major
 
   - package-ecosystem: github-actions
     directory: /
