@@ -13,7 +13,12 @@ fi
 test ! -e "$scratch/failed.AppImage"
 test "$(find "$scratch" -maxdepth 1 -name '.onedrive-appimage.*' | wc -l)" -eq 0
 
-ONEDRIVE_APPDIR_PROFILE=dev sh "$repo/scripts/build-appimage.sh" "$scratch/OneDriveForLinux.AppImage" >"$scratch/build.log"
+if ! ONEDRIVE_APPDIR_PROFILE=dev sh "$repo/scripts/build-appimage.sh" \
+    "$scratch/OneDriveForLinux.AppImage" >"$scratch/build.log" 2>&1; then
+    cat "$scratch/build.log" >&2
+    echo "AppImage smoke build failed" >&2
+    exit 1
+fi
 image="$scratch/OneDriveForLinux.AppImage"
 test -x "$image"
 readelf -h "$image" >/dev/null

@@ -50,17 +50,28 @@ mkdir -p "$(dirname -- "$output")"
 staging=$(mktemp -d "$(dirname -- "$output")/.onedrive-bundle.XXXXXX")
 trap 'rm -rf "$staging"' EXIT HUP INT TERM
 cp -a "$input/." "$staging/"
+bundled_loader_dir="$staging/usr/lib/gdk-pixbuf-2.0/2.10.0/loaders"
+mkdir -p "$bundled_loader_dir"
+bundled_loader="$bundled_loader_dir/libpixbufloader-svg.so"
+install -m 755 "$svg_loader" "$bundled_loader"
 "$tool" "$@" --appdir="$staging" \
     --deploy-deps-only="$staging/usr/bin/onedrive-daemon" \
     --deploy-deps-only="$staging/usr/bin/onedrive-desktop" \
-    --deploy-deps-only="$svg_loader" \
+    --deploy-deps-only="$bundled_loader" \
     --custom-apprun="$repo/packaging/AppRun"
 
 audit=$(sh "$repo/scripts/audit-appdir-libs.sh" "$staging")
-printf '%s\n' "$audit" | grep -q '^  BUNDLED libgtk-4.so.1 '
-printf '%s\n' "$audit" | grep -q '^  BUNDLED libadwaita-1.so.0 '
-printf '%s\n' "$audit" | grep -q '^  BUNDLED libgio-2.0.so.0 '
-printf '%s\n' "$audit" | grep -q '^  BUNDLED libglib-2.0.so.0 '
+require_audit() {
+    if ! printf '%s\n' "$1" | grep -q "$2"; then
+        echo "Missing expected AppDir dependency: $2" >&2
+        printf '%s\n' "$1" >&2
+        exit 1
+    fi
+}
+require_audit "$audit" '^  BUNDLED libgtk-4.so.1 '
+require_audit "$audit" '^  BUNDLED libadwaita-1.so.0 '
+require_audit "$audit" '^  BUNDLED libgio-2.0.so.0 '
+require_audit "$audit" '^  BUNDLED libglib-2.0.so.0 '
 cmp "$repo/packaging/AppRun" "$staging/AppRun"
 
 schema_source=$(pkg-config --variable=schemasdir gio-2.0)
@@ -87,17 +98,17 @@ fi
 mkdir -p "$staging/usr/share/icons"
 cp -a "$icon_theme" "$staging/usr/share/icons/"
 
-bundled_loader_dir="$staging/usr/lib/gdk-pixbuf-2.0/2.10.0/loaders"
-mkdir -p "$bundled_loader_dir"
-install -m 755 "$svg_loader" "$bundled_loader_dir/libpixbufloader-svg.so"
-"$query_loaders" "$bundled_loader_dir/libpixbufloader-svg.so" \
+"$query_loaders" "$bundled_loader" \
     | python3 -c 'import sys; print(sys.stdin.read().replace(sys.argv[1], "@APPDIR@"), end="")' "$staging" \
     > "$bundled_loader_dir/loaders.cache.in"
-grep -q '@APPDIR@/usr/lib/gdk-pixbuf-2.0/2.10.0/loaders/libpixbufloader-svg.so' \
-    "$bundled_loader_dir/loaders.cache.in"
+if ! grep -q '@APPDIR@/usr/lib/gdk-pixbuf-2.0/2.10.0/loaders/libpixbufloader-svg.so' \
+    "$bundled_loader_dir/loaders.cache.in"; then
+    echo "SVG loader cache does not point into the AppDir" >&2
+    exit 1
+fi
 plugin_audit=$(sh "$repo/scripts/audit-appdir-libs.sh" "$staging")
-printf '%s\n' "$plugin_audit" | grep -q '^svg-loader:$'
-printf '%s\n' "$plugin_audit" | grep -q '^  BUNDLED librsvg-2.so.2 '
+require_audit "$plugin_audit" '^svg-loader:$'
+require_audit "$plugin_audit" '^  BUNDLED librsvg-2.so.2 '
 
 python3 "$repo/scripts/collect-appdir-licenses.py" "$input" "$staging" "$svg_loader"
 
