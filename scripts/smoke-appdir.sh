@@ -53,9 +53,12 @@ fi
 test "$(find "$scratch" -maxdepth 1 -name '.onedrive-appdir.*' | wc -l)" -eq 0
 
 # Test launcher process ownership and library paths without opening GTK or D-Bus.
-fake="$scratch/fake AppDir"
+fake="$scratch/fake & AppDir"
 mkdir -p "$fake/usr/bin" "$fake/usr/lib" "$fake/usr/lib64" "$fake/usr/lib/x86_64-linux-gnu"
 mkdir -p "$fake/usr/share/glib-2.0/schemas"
+mkdir -p "$fake/usr/lib/gdk-pixbuf-2.0/2.10.0/loaders"
+printf '"@APPDIR@/usr/lib/gdk-pixbuf-2.0/2.10.0/loaders/libpixbufloader-svg.so"\n' \
+    > "$fake/usr/lib/gdk-pixbuf-2.0/2.10.0/loaders/loaders.cache.in"
 printf 'compiled fixture\n' > "$fake/usr/share/glib-2.0/schemas/gschemas.compiled"
 cp "$appdir/AppRun" "$fake/AppRun"
 cat > "$fake/usr/bin/onedrive-daemon" <<'EOF'
@@ -68,6 +71,9 @@ cat > "$fake/usr/bin/onedrive-desktop" <<'EOF'
 printf '%s\n' "$LD_LIBRARY_PATH" > "$ONEDRIVE_APPDIR_SMOKE_LIBPATH"
 printf '%s\n' "$GSETTINGS_SCHEMA_DIR" > "$ONEDRIVE_APPDIR_SMOKE_SCHEMAS"
 printf '%s\n' "$XDG_DATA_DIRS" > "$ONEDRIVE_APPDIR_SMOKE_DATA_DIRS"
+printf '%s\n' "$GDK_PIXBUF_MODULEDIR" > "$ONEDRIVE_APPDIR_SMOKE_PIXBUF_DIR"
+printf '%s\n' "$GDK_PIXBUF_MODULE_FILE" > "$ONEDRIVE_APPDIR_SMOKE_PIXBUF_PATH"
+cat "$GDK_PIXBUF_MODULE_FILE" > "$ONEDRIVE_APPDIR_SMOKE_PIXBUF_CACHE"
 sleep 1
 exit 7
 EOF
@@ -76,6 +82,9 @@ export ONEDRIVE_APPDIR_SMOKE_MARKER="$scratch/daemon-stopped"
 export ONEDRIVE_APPDIR_SMOKE_LIBPATH="$scratch/library-path"
 export ONEDRIVE_APPDIR_SMOKE_SCHEMAS="$scratch/schema-path"
 export ONEDRIVE_APPDIR_SMOKE_DATA_DIRS="$scratch/data-dirs"
+export ONEDRIVE_APPDIR_SMOKE_PIXBUF_DIR="$scratch/pixbuf-dir"
+export ONEDRIVE_APPDIR_SMOKE_PIXBUF_PATH="$scratch/pixbuf-path"
+export ONEDRIVE_APPDIR_SMOKE_PIXBUF_CACHE="$scratch/pixbuf-cache"
 if LD_LIBRARY_PATH="$scratch/host-lib" GSETTINGS_SCHEMA_DIR="$scratch/host-schemas" \
     XDG_DATA_DIRS="$scratch/host-data" "$fake/AppRun"; then
     echo "AppRun lost the desktop exit status" >&2
@@ -90,3 +99,6 @@ test "$(cat "$ONEDRIVE_APPDIR_SMOKE_LIBPATH")" = "$expected_libpath"
 expected_schemas="$fake/usr/share/glib-2.0/schemas:$scratch/host-schemas"
 test "$(cat "$ONEDRIVE_APPDIR_SMOKE_SCHEMAS")" = "$expected_schemas"
 test "$(cat "$ONEDRIVE_APPDIR_SMOKE_DATA_DIRS")" = "$fake/usr/share:$scratch/host-data"
+test "$(cat "$ONEDRIVE_APPDIR_SMOKE_PIXBUF_DIR")" = "$fake/usr/lib/gdk-pixbuf-2.0/2.10.0/loaders"
+test "$(cat "$ONEDRIVE_APPDIR_SMOKE_PIXBUF_CACHE")" = "\"$fake/usr/lib/gdk-pixbuf-2.0/2.10.0/loaders/libpixbufloader-svg.so\""
+test ! -e "$(cat "$ONEDRIVE_APPDIR_SMOKE_PIXBUF_PATH")"

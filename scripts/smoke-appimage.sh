@@ -28,6 +28,8 @@ test -x "$extracted/AppRun"
 test -x "$extracted/usr/bin/onedrive-desktop"
 test -s "$extracted/usr/share/glib-2.0/schemas/gschemas.compiled"
 test -f "$extracted/usr/share/icons/Adwaita/index.theme"
+test -f "$extracted/usr/lib/gdk-pixbuf-2.0/2.10.0/loaders/libpixbufloader-svg.so"
+test -s "$extracted/usr/lib/gdk-pixbuf-2.0/2.10.0/loaders/loaders.cache.in"
 test -f "$extracted/usr/share/metainfo/io.github.onedrive_linux.appdata.xml"
 version=$(sh "$repo/scripts/app-version.sh")
 grep -qx "X-AppImage-Version=$version" "$extracted/io.github.onedrive_linux.desktop"

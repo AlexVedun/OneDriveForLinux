@@ -18,8 +18,14 @@ done
 # Resolve libraries in the AppRun search paths. This audit reports host
 # dependencies; it does not certify AppImage portability.
 lib_paths="$appdir/usr/lib:$appdir/usr/lib64:$appdir/usr/lib/x86_64-linux-gnu"
-for binary in onedrive-daemon onedrive-desktop; do
-    path="$appdir/usr/bin/$binary"
+svg_loader="$appdir/usr/lib/gdk-pixbuf-2.0/2.10.0/loaders/libpixbufloader-svg.so"
+for binary in onedrive-daemon onedrive-desktop svg-loader; do
+    if [ "$binary" = svg-loader ]; then
+        [ -f "$svg_loader" ] || continue
+        path=$svg_loader
+    else
+        path="$appdir/usr/bin/$binary"
+    fi
     echo "$binary:"
     ldd_status=0
     output=$(LD_LIBRARY_PATH="$lib_paths${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" ldd "$path" 2>&1) || ldd_status=$?

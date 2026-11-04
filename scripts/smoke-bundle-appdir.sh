@@ -39,9 +39,15 @@ for library in ("libgtk-4.so.1", "libadwaita-1.so.0", "libglib-2.0.so.0"):
     owner = libraries[library]
     assert packages[(owner["manager"], owner["package"])]["license_files"], library
 assert (appdir / "usr/share/icons/Adwaita/index.theme").is_file()
+assert (appdir / "usr/lib/gdk-pixbuf-2.0/2.10.0/loaders/libpixbufloader-svg.so").is_file()
+assert "@APPDIR@/usr/lib/gdk-pixbuf-2.0/2.10.0/loaders/libpixbufloader-svg.so" in (
+    appdir / "usr/lib/gdk-pixbuf-2.0/2.10.0/loaders/loaders.cache.in").read_text()
 theme = next(item for item in manifest["resources"]
              if item["resource"] == "usr/share/icons/Adwaita")
 assert packages[(theme["manager"], theme["package"])]["license_files"]
+svg_loader = next(item for item in manifest["resources"]
+                  if item["resource"] == "usr/lib/gdk-pixbuf-2.0/2.10.0/loaders/libpixbufloader-svg.so")
+assert (svg_loader["manager"], svg_loader["package"]) in packages
 for package in manifest["packages"]:
     for name in package["license_files"]:
         assert (appdir / name).is_file(), name
@@ -58,6 +64,8 @@ XDG_DATA_HOME="$scratch/empty-data" XDG_DATA_DIRS="$scratch/empty-data" \
 sh "$repo/scripts/audit-appdir-libs.sh" "$bundled" > "$scratch/audit.log"
 grep -q '^  BUNDLED libgtk-4.so.1 ' "$scratch/audit.log"
 grep -q '^  BUNDLED libadwaita-1.so.0 ' "$scratch/audit.log"
+grep -q '^svg-loader:$' "$scratch/audit.log"
+grep -q '^  BUNDLED librsvg-2.so.2 ' "$scratch/audit.log"
 sh "$repo/scripts/audit-appdir-libs.sh" "$scratch/input.AppDir" > "$scratch/input-audit.log"
 grep -q '^  HOST libgtk-4.so.1 ' "$scratch/input-audit.log"
 if sh "$repo/scripts/bundle-appdir-libs.sh" "$scratch/input.AppDir" "$bundled" >/dev/null 2>&1; then

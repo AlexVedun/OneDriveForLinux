@@ -12,10 +12,11 @@ def command(*args):
     return subprocess.run(args, check=True, capture_output=True, text=True).stdout
 
 
-def source_libraries(input_dir):
+def source_libraries(input_dir, svg_loader):
     sources = {}
-    for binary in ("onedrive-daemon", "onedrive-desktop"):
-        output = command("ldd", str(input_dir / "usr/bin" / binary))
+    for binary in (input_dir / "usr/bin/onedrive-daemon",
+                   input_dir / "usr/bin/onedrive-desktop", svg_loader):
+        output = command("ldd", str(binary))
         for line in output.splitlines():
             fields = line.strip().split()
             if len(fields) >= 3 and fields[1] == "=>":
@@ -61,8 +62,8 @@ def license_details(manager, package):
     return declared, files
 
 
-def collect(input_dir, appdir):
-    sources = source_libraries(input_dir)
+def collect(input_dir, appdir, svg_loader):
+    sources = source_libraries(input_dir, svg_loader)
     library_dir = appdir / "usr/lib"
     libraries = sorted(path for path in library_dir.iterdir()
                        if path.is_file() and ".so" in path.name)
@@ -101,6 +102,9 @@ def collect(input_dir, appdir):
         manager, package = record_package(Path("/usr/share/icons/Adwaita/index.theme"))
         resources.append({"resource": "usr/share/icons/Adwaita", "manager": manager,
                           "package": package})
+    manager, package = record_package(svg_loader)
+    resources.append({"resource": "usr/lib/gdk-pixbuf-2.0/2.10.0/loaders/libpixbufloader-svg.so",
+                      "manager": manager, "package": package})
     manifest = {"libraries": records, "resources": resources,
                 "packages": sorted(packages.values(),
                 key=lambda item: (item["manager"], item["package"]))}
@@ -112,9 +116,9 @@ def collect(input_dir, appdir):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 3:
-        sys.exit("Usage: collect-appdir-licenses.py INPUT_APPDIR BUNDLED_APPDIR")
+    if len(sys.argv) != 4:
+        sys.exit("Usage: collect-appdir-licenses.py INPUT_APPDIR BUNDLED_APPDIR SVG_LOADER")
     try:
-        collect(Path(sys.argv[1]), Path(sys.argv[2]))
+        collect(Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3]))
     except (OSError, subprocess.CalledProcessError, RuntimeError) as error:
         sys.exit(f"License collection failed: {error}")

@@ -25,7 +25,7 @@ only one mode at a time when using virtual-drive uploads.
 On Fedora:
 
 ```sh
-sudo dnf install rust cargo rustfmt clippy gcc pkgconf-pkg-config gtk4-devel libadwaita-devel fuse3
+sudo dnf install rust cargo rustfmt clippy gcc pkgconf-pkg-config gtk4-devel libadwaita-devel fuse3 rsvg-pixbuf-loader
 ```
 
 The virtual drive needs `/dev/fuse` and `fusermount3`. Sign-in needs a running

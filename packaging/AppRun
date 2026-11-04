@@ -16,10 +16,14 @@ if [ -s "$schema_dir/gschemas.compiled" ]; then
     export GSETTINGS_SCHEMA_DIR="$schema_dir${GSETTINGS_SCHEMA_DIR:+:$GSETTINGS_SCHEMA_DIR}"
 fi
 export XDG_DATA_DIRS="$appdir/usr/share:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+pixbuf_cache=
 daemon_pid=
 desktop_pid=
 
 stop_children() {
+    if [ -n "$pixbuf_cache" ]; then
+        rm -f -- "$pixbuf_cache"
+    fi
     if [ -n "$desktop_pid" ]; then
         kill "$desktop_pid" 2>/dev/null || true
         wait "$desktop_pid" 2>/dev/null || true
@@ -32,6 +36,15 @@ stop_children() {
 trap stop_children EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+
+pixbuf_template="$appdir/usr/lib/gdk-pixbuf-2.0/2.10.0/loaders/loaders.cache.in"
+if [ -f "$pixbuf_template" ]; then
+    pixbuf_cache=$(mktemp "${TMPDIR:-/tmp}/onedrive-pixbuf.XXXXXX")
+    escaped_appdir=$(printf '%s' "$appdir" | sed 's/[\&|]/\\&/g')
+    sed "s|@APPDIR@|$escaped_appdir|g" "$pixbuf_template" > "$pixbuf_cache"
+    export GDK_PIXBUF_MODULEDIR="$appdir/usr/lib/gdk-pixbuf-2.0/2.10.0/loaders"
+    export GDK_PIXBUF_MODULE_FILE="$pixbuf_cache"
+fi
 
 "$appdir/usr/bin/onedrive-daemon" &
 daemon_pid=$!

@@ -38,6 +38,14 @@ case "$tool" in
     *) set -- ;;
 esac
 
+svg_loader_dir=$(pkg-config --variable=gdk_pixbuf_moduledir gdk-pixbuf-2.0)
+svg_loader="$svg_loader_dir/libpixbufloader-svg.so"
+query_loaders=$(pkg-config --variable=gdk_pixbuf_query_loaders gdk-pixbuf-2.0)
+if [ ! -f "$svg_loader" ] || [ ! -x "$query_loaders" ]; then
+    echo "SVG icon loader is unavailable; install the GdkPixbuf SVG loader and query tool" >&2
+    exit 2
+fi
+
 mkdir -p "$(dirname -- "$output")"
 staging=$(mktemp -d "$(dirname -- "$output")/.onedrive-bundle.XXXXXX")
 trap 'rm -rf "$staging"' EXIT HUP INT TERM
@@ -45,6 +53,7 @@ cp -a "$input/." "$staging/"
 "$tool" "$@" --appdir="$staging" \
     --deploy-deps-only="$staging/usr/bin/onedrive-daemon" \
     --deploy-deps-only="$staging/usr/bin/onedrive-desktop" \
+    --deploy-deps-only="$svg_loader" \
     --custom-apprun="$repo/packaging/AppRun"
 
 audit=$(sh "$repo/scripts/audit-appdir-libs.sh" "$staging")
@@ -78,7 +87,19 @@ fi
 mkdir -p "$staging/usr/share/icons"
 cp -a "$icon_theme" "$staging/usr/share/icons/"
 
-python3 "$repo/scripts/collect-appdir-licenses.py" "$input" "$staging"
+bundled_loader_dir="$staging/usr/lib/gdk-pixbuf-2.0/2.10.0/loaders"
+mkdir -p "$bundled_loader_dir"
+install -m 755 "$svg_loader" "$bundled_loader_dir/libpixbufloader-svg.so"
+"$query_loaders" "$bundled_loader_dir/libpixbufloader-svg.so" \
+    | python3 -c 'import sys; print(sys.stdin.read().replace(sys.argv[1], "@APPDIR@"), end="")' "$staging" \
+    > "$bundled_loader_dir/loaders.cache.in"
+grep -q '@APPDIR@/usr/lib/gdk-pixbuf-2.0/2.10.0/loaders/libpixbufloader-svg.so' \
+    "$bundled_loader_dir/loaders.cache.in"
+plugin_audit=$(sh "$repo/scripts/audit-appdir-libs.sh" "$staging")
+printf '%s\n' "$plugin_audit" | grep -q '^svg-loader:$'
+printf '%s\n' "$plugin_audit" | grep -q '^  BUNDLED librsvg-2.so.2 '
+
+python3 "$repo/scripts/collect-appdir-licenses.py" "$input" "$staging" "$svg_loader"
 
 mv -T --no-clobber "$staging" "$output"
 if [ -e "$staging" ]; then
