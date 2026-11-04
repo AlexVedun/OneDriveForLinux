@@ -2605,9 +2605,15 @@ fn main() {
             gtk::glib::Propagation::Stop
         });
         let hold = app.hold();
+        let tray_for_close = monitor.tray.clone();
+        let app_for_close = app.downgrade();
         window.connect_close_request(move |window| {
             let _keep_app_running = &hold;
-            window.set_visible(false);
+            if tray_for_close.as_ref().is_some_and(|tray| tray.has_watcher()) {
+                window.set_visible(false);
+            } else if let Some(app) = app_for_close.upgrade() {
+                app.quit();
+            }
             gtk::glib::Propagation::Stop
         });
         let app_for_exit = app.downgrade();
