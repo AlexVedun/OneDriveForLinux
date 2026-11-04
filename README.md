@@ -63,6 +63,9 @@ cargo run -p onedrive-daemon
 cargo run -p onedrive-desktop
 ```
 
+The desktop starts in the tray. Choose **Open window** from the tray menu to
+show it. If no tray watcher is available, the window opens on startup instead.
+
 Choose **Account → Sign in with Microsoft**. After the browser flow, use
 **Sync → Refresh OneDrive** to fetch the catalog. **Sync → OneDrive files**
 opens a separate browser for manual downloads. To mount a drive, choose

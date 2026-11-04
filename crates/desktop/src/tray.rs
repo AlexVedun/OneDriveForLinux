@@ -488,6 +488,26 @@ pub struct TrayIndicator {
 }
 
 impl TrayIndicator {
+    pub fn has_watcher(&self) -> bool {
+        INTERFACES.iter().any(|(_, watcher)| {
+            self.connection
+                .call_sync(
+                    Some("org.freedesktop.DBus"),
+                    "/org/freedesktop/DBus",
+                    "org.freedesktop.DBus",
+                    "NameHasOwner",
+                    Some(&(watcher,).to_variant()),
+                    None,
+                    gio::DBusCallFlags::NONE,
+                    2_000,
+                    None::<&gio::Cancellable>,
+                )
+                .ok()
+                .and_then(|reply| reply.get::<(bool,)>())
+                .is_some_and(|(present,)| present)
+        })
+    }
+
     pub fn start(
         app: &adw::Application,
         initial: &str,

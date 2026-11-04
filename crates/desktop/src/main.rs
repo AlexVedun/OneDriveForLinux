@@ -2353,6 +2353,7 @@ fn main() {
         let pause = gtk::Button::with_label(t("Pause unavailable", "Пауза недоступна"));
         pause.set_sensitive(false);
         let monitor = StateMonitor::new(app, &engine_status, &pause, read_status());
+        let tray_available = monitor.tray.as_ref().is_some_and(|tray| tray.has_watcher());
         let status = gtk::Label::new(None);
         status.set_xalign(0.0);
         status.set_wrap(true);
@@ -2551,7 +2552,7 @@ fn main() {
             .application(app)
             .title(&title)
             .default_width(850)
-            .default_height(540)
+            .default_height(640)
             .content(&layout)
             .build();
         for (code, language) in [
@@ -3127,7 +3128,9 @@ fn main() {
             gtk::glib::ControlFlow::Continue
         });
         monitor.start();
-        window.present();
+        if !tray_available {
+            window.present();
+        }
     });
     app.run();
 }
