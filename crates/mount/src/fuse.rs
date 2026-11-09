@@ -64,6 +64,11 @@ pub type ContentLoader = dyn Fn(&DownloadRequest) -> io::Result<()> + Send + Syn
 #[derive(Clone)]
 pub struct PublishedVersionController {
     drive_id: String,
+    tree: Arc<Mutex<Arc<VirtualTree>>>,
+    tree_generation: Arc<AtomicU64>,
+    draft_root: Option<PathBuf>,
+    orphaned_remote_files: Arc<Mutex<HashSet<u64>>>,
+    removed_open_files: Arc<Mutex<HashMap<u64, Node>>>,
     versions: Arc<Mutex<HashMap<u64, (String, u64)>>>,
     deleted_remote_files: Arc<Mutex<HashSet<String>>>,
     operations: Arc<Mutex<PublicationOperations>>,
@@ -71,6 +76,7 @@ pub struct PublishedVersionController {
     files: Arc<Mutex<HashMap<u64, OpenFile>>>,
     local_files: Arc<Mutex<HashMap<u64, Node>>>,
     directory_aliases: Arc<Mutex<HashMap<String, u64>>>,
+    remote_changes: Arc<Mutex<HashMap<u64, Mutation>>>,
 }
 
 #[derive(Default)]
@@ -114,6 +120,236 @@ impl Drop for OpeningFile {
 impl PublishedVersionController {
     pub fn drive_id(&self) -> &str {
         &self.drive_id
+    }
+
+    /// Replace the mounted catalog view without disturbing open handles or drafts.
+    /// Returns entries that the FUSE kernel cache should invalidate.
+    pub fn replace_tree(&self, tree: VirtualTree) -> io::Result<Vec<(u64, String)>> {
+        if tree.drive_id() != self.drive_id {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        let _serialized = self.open_lock.lock().unwrap();
+        let mut current = self.tree.lock().unwrap();
+        let mut changed = current.changed_entries(&tree);
+        {
+            let open = self.files.lock().unwrap();
+            let mut removed = self.removed_open_files.lock().unwrap();
+            for node in current.removed_nodes(&tree) {
+                if open.values().any(|file| file.inode == node.inode) {
+                    removed.insert(node.inode, node);
+                }
+            }
+            removed.retain(|inode, _| open.values().any(|file| file.inode == *inode));
+        }
+        if let Some(root) = &self.draft_root {
+            let store = MutationStore::open(root)?;
+            let mut pending = HashMap::new();
+            for mutation in store.list()? {
+                if mutation.drive_id != self.drive_id {
+                    continue;
+                }
+                let inode = crate::stable_inode(&mutation.drive_id, &mutation.item_id);
+                let confirmed = mutation.status == MutationStatus::Applied
+                    && match &mutation.kind {
+                        MutationKind::Delete => tree.getattr(inode).is_none(),
+                        MutationKind::Rename {
+                            target_parent_id,
+                            target_name,
+                        } => tree.getattr(inode).is_some_and(|node| {
+                            node.name == *target_name
+                                && tree
+                                    .getattr(node.parent_inode)
+                                    .is_some_and(|parent| parent.item_id == *target_parent_id)
+                        }),
+                    };
+                if confirmed {
+                    store.remove(&mutation)?;
+                } else {
+                    pending.insert(inode, mutation);
+                }
+            }
+            *self.remote_changes.lock().unwrap() = pending;
+        }
+        let aliases = self.directory_aliases.lock().unwrap();
+        for (parent, name) in changed.clone() {
+            let parent_id = tree
+                .getattr(parent)
+                .or_else(|| current.getattr(parent))
+                .map(|node| &node.item_id);
+            if let Some(alias) = parent_id.and_then(|id| aliases.get(id)) {
+                changed.push((*alias, name));
+            }
+        }
+        drop(aliases);
+        if let Some(root) = &self.draft_root {
+            let drafts = DraftStore::open(root)?;
+            let directories = DirectoryStore::open(root)?;
+            for directory in directories.list()? {
+                if directory.drive_id == self.drive_id
+                    && !directory.seen_remote
+                    && directory.remote_id.as_ref().is_some_and(|remote_id| {
+                        tree.getattr(crate::stable_inode(&self.drive_id, remote_id))
+                            .is_some()
+                    })
+                {
+                    directories.mark_seen(&directory)?;
+                }
+            }
+            let mut local = self.local_files.lock().unwrap();
+            let mut orphaned = self.orphaned_remote_files.lock().unwrap();
+            let open_inodes: HashSet<_> = self
+                .files
+                .lock()
+                .unwrap()
+                .values()
+                .map(|file| file.inode)
+                .collect();
+            let mut removed_open = self.removed_open_files.lock().unwrap();
+            for node in local.values() {
+                if open_inodes.contains(&node.inode)
+                    && tree
+                        .getattr(crate::stable_inode(&self.drive_id, &node.item_id))
+                        .is_none()
+                {
+                    removed_open.insert(node.inode, node.clone());
+                }
+            }
+            drop(removed_open);
+            self.versions.lock().unwrap().retain(|inode, (etag, size)| {
+                let remote_inode = local
+                    .get(inode)
+                    .map(|node| crate::stable_inode(&self.drive_id, &node.item_id))
+                    .unwrap_or(*inode);
+                let previous = current.getattr(remote_inode);
+                let updated = tree.getattr(remote_inode);
+                !updated.is_some_and(|node| {
+                    (node.etag.as_deref() == Some(etag.as_str()) && node.size == *size)
+                        || previous.is_some_and(|old| old.etag != node.etag)
+                })
+            });
+            let aliases = self.directory_aliases.lock().unwrap().clone();
+            for node in local.values_mut() {
+                let remote_inode = crate::stable_inode(&self.drive_id, &node.item_id);
+                if node.inode == remote_inode {
+                    continue;
+                }
+                let Some(remote) = tree.getattr(remote_inode) else {
+                    continue;
+                };
+                let parent = tree
+                    .getattr(remote.parent_inode)
+                    .and_then(|parent| aliases.get(&parent.item_id).copied())
+                    .unwrap_or(remote.parent_inode);
+                if node.parent_inode != parent || node.name != remote.name {
+                    changed.push((node.parent_inode, node.name.clone()));
+                    changed.push((parent, remote.name.clone()));
+                }
+                node.parent_inode = parent;
+                node.name = remote.name.clone();
+                node.etag = remote.etag.clone();
+                node.ctag = remote.ctag.clone();
+                node.size = remote.size;
+            }
+            let deleted_folders: Vec<_> = local
+                .values()
+                .filter(|node| {
+                    node.kind == NodeKind::Directory
+                        && node.inode != crate::stable_inode(&self.drive_id, &node.item_id)
+                        && tree.is_deleted(&node.item_id)
+                        && !local.values().any(|child| child.parent_inode == node.inode)
+                })
+                .cloned()
+                .collect();
+            for node in deleted_folders {
+                if let Some(record) = directories.list()?.into_iter().find(|record| {
+                    record.drive_id == self.drive_id
+                        && record.remote_id.as_deref() == Some(node.item_id.as_str())
+                }) {
+                    directories.remove_remote_deleted(&record)?;
+                }
+                local.remove(&node.inode);
+                self.directory_aliases.lock().unwrap().remove(&node.item_id);
+                changed.push((node.parent_inode, node.name));
+            }
+            for inode in orphaned.iter().copied().collect::<Vec<_>>() {
+                let discard = if tree.getattr(inode).is_some() {
+                    true
+                } else if let Some(node) = local.get(&inode) {
+                    drafts
+                        .recover_item(&self.drive_id, &node.item_id)?
+                        .is_none()
+                } else {
+                    true
+                };
+                if discard {
+                    if let Some(node) = local.remove(&inode) {
+                        changed.push((crate::ROOT_INODE, node.name));
+                    }
+                    orphaned.remove(&inode);
+                }
+            }
+            for mut node in current.removed_nodes(&tree) {
+                if node.kind != NodeKind::File || local.contains_key(&node.inode) {
+                    continue;
+                }
+                if drafts
+                    .recover_item(&self.drive_id, &node.item_id)?
+                    .is_none()
+                {
+                    continue;
+                }
+                node.parent_inode = crate::ROOT_INODE;
+                let prefix = format!(".orphan-{}-", node.inode);
+                let mut name = prefix.clone();
+                for character in node.name.chars() {
+                    if name.len() + character.len_utf8() > 255 {
+                        break;
+                    }
+                    name.push(character);
+                }
+                node.name = name;
+                changed.push((crate::ROOT_INODE, node.name.clone()));
+                orphaned.insert(node.inode);
+                local.insert(node.inode, node);
+            }
+            // A file created on another device can take a local draft's name.
+            // Keep both visible and let the upload conflict workflow handle the draft.
+            let local_inodes: Vec<_> = local.keys().copied().collect();
+            for inode in local_inodes {
+                let Some(node) = local.get(&inode).cloned() else {
+                    continue;
+                };
+                if !node.item_id.starts_with("local:") && !node.item_id.starts_with("local-dir:") {
+                    continue;
+                }
+                let collision = tree.readdir(node.parent_inode).is_some_and(|children| {
+                    children
+                        .into_iter()
+                        .any(|remote| remote.name.to_lowercase() == node.name.to_lowercase())
+                });
+                if !collision {
+                    continue;
+                }
+                let prefix = format!(".conflict-{inode}-");
+                let mut name = prefix.clone();
+                for character in node.name.chars() {
+                    if name.len() + character.len_utf8() > 255 {
+                        break;
+                    }
+                    name.push(character);
+                }
+                if let Some(entry) = local.get_mut(&inode) {
+                    changed.push((entry.parent_inode, entry.name.clone()));
+                    entry.name = name;
+                    changed.push((entry.parent_inode, entry.name.clone()));
+                }
+            }
+        }
+        *current = Arc::new(tree);
+        if !changed.is_empty() {
+            self.tree_generation.fetch_add(1, Ordering::Release);
+        }
+        Ok(changed)
     }
 
     /// Apply confirmed cloud file deletions without discarding local drafts.
@@ -404,6 +640,7 @@ type DirectoryEntry = (u64, FileType, String);
 struct OpenDirectory {
     inode: u64,
     entries: Arc<Vec<DirectoryEntry>>,
+    generation: u64,
 }
 
 #[derive(Clone)]
@@ -414,7 +651,8 @@ enum OpenHandle {
 }
 
 pub struct VirtualFuse {
-    tree: VirtualTree,
+    tree: Arc<Mutex<Arc<VirtualTree>>>,
+    tree_generation: Arc<AtomicU64>,
     cache_root: PathBuf,
     draft_root: Option<PathBuf>,
     cache_limit: u64,
@@ -424,9 +662,11 @@ pub struct VirtualFuse {
     files: Arc<Mutex<HashMap<u64, OpenFile>>>,
     directories: Mutex<HashMap<u64, OpenDirectory>>,
     local_files: Arc<Mutex<HashMap<u64, Node>>>,
+    orphaned_remote_files: Arc<Mutex<HashSet<u64>>>,
     detached_files: Mutex<HashMap<u64, Node>>,
+    removed_open_files: Arc<Mutex<HashMap<u64, Node>>>,
     directory_aliases: Arc<Mutex<HashMap<String, u64>>>,
-    remote_changes: Mutex<HashMap<u64, Mutation>>,
+    remote_changes: Arc<Mutex<HashMap<u64, Mutation>>>,
     published_versions: Arc<Mutex<HashMap<u64, (String, u64)>>>,
     deleted_remote_files: Arc<Mutex<HashSet<String>>>,
     publication_operations: Arc<Mutex<PublicationOperations>>,
@@ -443,7 +683,8 @@ impl VirtualFuse {
         loader: Arc<ContentLoader>,
     ) -> Self {
         Self {
-            tree,
+            tree: Arc::new(Mutex::new(Arc::new(tree))),
+            tree_generation: Arc::new(AtomicU64::new(0)),
             cache_root,
             draft_root: None,
             cache_limit,
@@ -453,9 +694,11 @@ impl VirtualFuse {
             files: Arc::new(Mutex::new(HashMap::new())),
             directories: Mutex::new(HashMap::new()),
             local_files: Arc::new(Mutex::new(HashMap::new())),
+            orphaned_remote_files: Arc::new(Mutex::new(HashSet::new())),
             detached_files: Mutex::new(HashMap::new()),
+            removed_open_files: Arc::new(Mutex::new(HashMap::new())),
             directory_aliases: Arc::new(Mutex::new(HashMap::new())),
-            remote_changes: Mutex::new(HashMap::new()),
+            remote_changes: Arc::new(Mutex::new(HashMap::new())),
             published_versions: Arc::new(Mutex::new(HashMap::new())),
             deleted_remote_files: Arc::new(Mutex::new(HashSet::new())),
             publication_operations: Arc::new(Mutex::new(PublicationOperations::default())),
@@ -496,7 +739,12 @@ impl VirtualFuse {
 
     pub fn published_version_controller(&self) -> PublishedVersionController {
         PublishedVersionController {
-            drive_id: self.tree.drive_id().to_owned(),
+            drive_id: self.tree_snapshot().drive_id().to_owned(),
+            tree: Arc::clone(&self.tree),
+            tree_generation: Arc::clone(&self.tree_generation),
+            draft_root: self.draft_root.clone(),
+            orphaned_remote_files: Arc::clone(&self.orphaned_remote_files),
+            removed_open_files: Arc::clone(&self.removed_open_files),
             versions: Arc::clone(&self.published_versions),
             deleted_remote_files: Arc::clone(&self.deleted_remote_files),
             operations: Arc::clone(&self.publication_operations),
@@ -504,6 +752,29 @@ impl VirtualFuse {
             files: Arc::clone(&self.files),
             local_files: Arc::clone(&self.local_files),
             directory_aliases: Arc::clone(&self.directory_aliases),
+            remote_changes: Arc::clone(&self.remote_changes),
+        }
+    }
+
+    fn tree_snapshot(&self) -> Arc<VirtualTree> {
+        Arc::clone(&self.tree.lock().unwrap())
+    }
+
+    fn tree_parent_inode(&self, inode: u64) -> u64 {
+        let item_id = self
+            .local_files
+            .lock()
+            .unwrap()
+            .get(&inode)
+            .map(|node| node.item_id.clone());
+        let Some(item_id) = item_id else {
+            return inode;
+        };
+        let remote = crate::stable_inode(self.tree_snapshot().drive_id(), &item_id);
+        if self.tree_snapshot().getattr(remote).is_some() {
+            remote
+        } else {
+            inode
         }
     }
 
@@ -556,8 +827,13 @@ impl VirtualFuse {
             };
             Arc::clone(cached)
         };
-        let node = self.tree.getattr(inode).ok_or(Errno::ENOENT)?;
-        let mut attr = self.attr_with_store(node, None)?;
+        let tree = self.tree_snapshot();
+        let node = tree
+            .getattr(inode)
+            .cloned()
+            .or_else(|| self.removed_open_files.lock().unwrap().get(&inode).cloned())
+            .ok_or(Errno::ENOENT)?;
+        let mut attr = self.attr_with_store(&node, None)?;
         attr.size = cached
             .source_file()
             .metadata()
@@ -597,7 +873,7 @@ impl VirtualFuse {
             store
                 .map(|store| {
                     store
-                        .recover_item(self.tree.drive_id(), &node.item_id)
+                        .recover_item(self.tree_snapshot().drive_id(), &node.item_id)
                         .map_err(|_| Errno::EIO)
                 })
                 .transpose()?
@@ -673,7 +949,7 @@ impl VirtualFuse {
             return Ok(None);
         };
         DraftStore::open(root)
-            .and_then(|store| store.recover_item(self.tree.drive_id(), &node.item_id))
+            .and_then(|store| store.recover_item(self.tree_snapshot().drive_id(), &node.item_id))
             .map_err(|_| Errno::EIO)
     }
 
@@ -688,7 +964,7 @@ impl VirtualFuse {
         let mut node = if let Some(local) = local {
             self.remote_node(&local)?
         } else {
-            self.tree
+            self.tree_snapshot()
                 .getattr(inode)
                 .and_then(|node| self.remote_node(node))?
         };
@@ -706,7 +982,7 @@ impl VirtualFuse {
             .filter(|etag| !etag.is_empty())
             .ok_or(OpenError::MissingVersion)?;
         Ok(DownloadRequest {
-            drive_id: self.tree.drive_id().to_owned(),
+            drive_id: self.tree_snapshot().drive_id().to_owned(),
             item_id: node.item_id.clone(),
             etag,
             size: node.size,
@@ -735,7 +1011,7 @@ impl VirtualFuse {
         {
             return None;
         }
-        let remote_inode = crate::stable_inode(self.tree.drive_id(), &node.item_id);
+        let remote_inode = crate::stable_inode(self.tree_snapshot().drive_id(), &node.item_id);
         let mutation = self
             .remote_changes
             .lock()
@@ -749,23 +1025,32 @@ impl VirtualFuse {
                 target_name,
             }) => {
                 let mut moved = node.clone();
-                moved.parent_inode =
-                    if target_parent_id == self.tree.getattr(crate::ROOT_INODE)?.item_id {
-                        crate::ROOT_INODE
-                    } else {
-                        self.directory_aliases
-                            .lock()
-                            .unwrap()
-                            .get(&target_parent_id)
-                            .copied()
-                            .unwrap_or_else(|| {
-                                crate::stable_inode(self.tree.drive_id(), &target_parent_id)
-                            })
-                    };
+                moved.parent_inode = if target_parent_id
+                    == self.tree_snapshot().getattr(crate::ROOT_INODE)?.item_id
+                {
+                    crate::ROOT_INODE
+                } else {
+                    self.directory_aliases
+                        .lock()
+                        .unwrap()
+                        .get(&target_parent_id)
+                        .copied()
+                        .unwrap_or_else(|| {
+                            crate::stable_inode(self.tree_snapshot().drive_id(), &target_parent_id)
+                        })
+                };
                 moved.name = target_name;
                 Some(moved)
             }
-            None => Some(node.clone()),
+            None => {
+                let mut visible = node.clone();
+                if let Some(parent) = self.tree_snapshot().getattr(node.parent_inode)
+                    && let Some(alias) = self.directory_aliases.lock().unwrap().get(&parent.item_id)
+                {
+                    visible.parent_inode = *alias;
+                }
+                Some(visible)
+            }
         }
     }
 
@@ -788,7 +1073,13 @@ impl VirtualFuse {
         local: &HashMap<u64, Node>,
     ) -> bool {
         let folded = name.to_lowercase();
-        self.tree.readdir(parent).is_some_and(|children| {
+        let tree = self.tree_snapshot();
+        let remote_parent = local
+            .get(&parent)
+            .map(|node| crate::stable_inode(tree.drive_id(), &node.item_id))
+            .filter(|inode| tree.getattr(*inode).is_some())
+            .unwrap_or(parent);
+        tree.readdir(remote_parent).is_some_and(|children| {
             children.into_iter().any(|child| {
                 self.remote_node(child).is_some_and(|visible| {
                     visible.parent_inode == parent
@@ -883,18 +1174,24 @@ impl VirtualFuse {
                 })
             {
                 return self
-                    .tree
+                    .tree_snapshot()
                     .getattr(crate::stable_inode(&mutation.drive_id, &mutation.item_id))
                     .and_then(|node| self.node(node.inode));
             }
         }
-        self.tree
-            .lookup(parent, name)
+        self.tree_snapshot()
+            .lookup(self.tree_parent_inode(parent), name)
             .and_then(|node| self.node(node.inode))
             .filter(|node| node.parent_inode == parent && node.name == name)
     }
 
     fn visible_child(&self, parent: u64, name: &str, local: &HashMap<u64, Node>) -> Option<Node> {
+        let tree = self.tree_snapshot();
+        let remote_parent = local
+            .get(&parent)
+            .map(|node| crate::stable_inode(tree.drive_id(), &node.item_id))
+            .filter(|inode| tree.getattr(*inode).is_some())
+            .unwrap_or(parent);
         let visible = local
             .values()
             .filter_map(|node| self.remote_node(node))
@@ -902,7 +1199,7 @@ impl VirtualFuse {
             .or_else(|| {
                 let parent_id = &local
                     .get(&parent)
-                    .or_else(|| self.tree.getattr(parent))?
+                    .or_else(|| tree.getattr(parent))?
                     .item_id;
                 let mutation = self.remote_changes
                     .lock()
@@ -914,13 +1211,12 @@ impl VirtualFuse {
                                 && target_name == name)
                     })
                     .cloned()?;
-                self.tree
+                self.tree_snapshot()
                     .getattr(crate::stable_inode(&mutation.drive_id, &mutation.item_id))
                     .and_then(|node| self.remote_node(node))
             })
             .or_else(|| {
-                self.tree
-                    .lookup(parent, name)
+                tree.lookup(remote_parent, name)
                     .and_then(|node| self.remote_node(node))
                     .filter(|node| node.parent_inode == parent && node.name == name)
             });
@@ -934,6 +1230,7 @@ impl VirtualFuse {
     }
 
     fn load_local_files(&self) -> io::Result<()> {
+        let tree = self.tree_snapshot();
         let Some(root) = &self.draft_root else {
             return Ok(());
         };
@@ -941,20 +1238,19 @@ impl VirtualFuse {
         let mutation_store = MutationStore::open(root)?;
         let mut changes = self.remote_changes.lock().unwrap();
         for mutation in mutation_store.list()? {
-            if mutation.drive_id != self.tree.drive_id() {
+            if mutation.drive_id != tree.drive_id() {
                 continue;
             }
             let inode = crate::stable_inode(&mutation.drive_id, &mutation.item_id);
             if mutation.status == MutationStatus::Applied {
                 let confirmed = match &mutation.kind {
-                    MutationKind::Delete => self.tree.getattr(inode).is_none(),
+                    MutationKind::Delete => tree.getattr(inode).is_none(),
                     MutationKind::Rename {
                         target_parent_id,
                         target_name,
-                    } => self.tree.getattr(inode).is_some_and(|node| {
+                    } => tree.getattr(inode).is_some_and(|node| {
                         node.name == *target_name
-                            && self
-                                .tree
+                            && tree
                                 .getattr(node.parent_inode)
                                 .is_some_and(|parent| parent.item_id == *target_parent_id)
                     }),
@@ -972,7 +1268,7 @@ impl VirtualFuse {
         let mut directories: Vec<_> = directory_store
             .list()?
             .into_iter()
-            .filter(|directory| directory.drive_id == self.tree.drive_id())
+            .filter(|directory| directory.drive_id == tree.drive_id())
             .collect();
         let mappings: HashMap<_, _> = directories
             .iter()
@@ -986,8 +1282,7 @@ impl VirtualFuse {
         for directory in &directories {
             if let Some(remote_id) = &directory.remote_id
                 && !directory.seen_remote
-                && self
-                    .tree
+                && tree
                     .getattr(crate::stable_inode(&directory.drive_id, remote_id))
                     .is_some()
             {
@@ -997,8 +1292,7 @@ impl VirtualFuse {
         directories.retain(|directory| {
             !directory.seen_remote
                 && directory.remote_id.as_ref().is_none_or(|remote_id| {
-                    self.tree
-                        .getattr(crate::stable_inode(&directory.drive_id, remote_id))
+                    tree.getattr(crate::stable_inode(&directory.drive_id, remote_id))
                         .is_none()
                 })
         });
@@ -1008,17 +1302,14 @@ impl VirtualFuse {
                 let parent_id = mappings
                     .get(&directory.parent_id)
                     .filter(|remote_id| {
-                        self.tree
-                            .getattr(crate::stable_inode(&directory.drive_id, remote_id))
+                        tree.getattr(crate::stable_inode(&directory.drive_id, remote_id))
                             .is_some()
                     })
                     .unwrap_or(&directory.parent_id);
-                let parent = self
-                    .tree
+                let parent = tree
                     .getattr(crate::stable_inode(&directory.drive_id, parent_id))
                     .or_else(|| {
-                        self.tree
-                            .getattr(crate::ROOT_INODE)
+                        tree.getattr(crate::ROOT_INODE)
                             .filter(|node| node.item_id == *parent_id)
                     })
                     .cloned()
@@ -1032,7 +1323,7 @@ impl VirtualFuse {
                     return true;
                 };
                 let inode = crate::stable_inode(&directory.drive_id, &directory.item_id);
-                if self.tree.getattr(inode).is_none() && !local.contains_key(&inode) {
+                if tree.getattr(inode).is_none() && !local.contains_key(&inode) {
                     let name = if self.name_taken(
                         parent.inode,
                         &parent.item_id,
@@ -1064,7 +1355,7 @@ impl VirtualFuse {
                 // Keep descendants available even if a remote parent vanished.
                 for directory in directories.drain(..) {
                     let inode = crate::stable_inode(&directory.drive_id, &directory.item_id);
-                    let root = self.tree.getattr(crate::ROOT_INODE).expect("virtual root");
+                    let root = tree.getattr(crate::ROOT_INODE).expect("virtual root");
                     let name = self.recovery_name(root, inode, &directory.name, true, &local);
                     local.insert(
                         inode,
@@ -1083,13 +1374,13 @@ impl VirtualFuse {
             }
         }
         for identity in store.list()? {
-            if identity.drive_id != self.tree.drive_id() {
+            if identity.drive_id != tree.drive_id() {
                 continue;
             }
             let inode = crate::stable_inode(&identity.drive_id, &identity.item_id);
             let Some(location) = &identity.new_file else {
-                if self.tree.getattr(inode).is_none() && !local.contains_key(&inode) {
-                    let root = self.tree.getattr(crate::ROOT_INODE).expect("virtual root");
+                if tree.getattr(inode).is_none() && !local.contains_key(&inode) {
+                    let root = tree.getattr(crate::ROOT_INODE).expect("virtual root");
                     let name = self.recovery_name(root, inode, "remote-file", true, &local);
                     local.insert(
                         inode,
@@ -1110,17 +1401,14 @@ impl VirtualFuse {
             let parent_id = mappings
                 .get(&location.parent_id)
                 .filter(|remote_id| {
-                    self.tree
-                        .getattr(crate::stable_inode(&identity.drive_id, remote_id))
+                    tree.getattr(crate::stable_inode(&identity.drive_id, remote_id))
                         .is_some()
                 })
                 .unwrap_or(&location.parent_id);
-            let parent = self
-                .tree
+            let parent = tree
                 .getattr(crate::stable_inode(&identity.drive_id, parent_id))
                 .or_else(|| {
-                    self.tree
-                        .getattr(crate::ROOT_INODE)
+                    tree.getattr(crate::ROOT_INODE)
                         .filter(|node| node.item_id == *parent_id)
                 })
                 .cloned()
@@ -1135,10 +1423,7 @@ impl VirtualFuse {
                 .filter(|node| node.kind == NodeKind::Directory)
             {
                 Some(parent) => (parent, false),
-                None => (
-                    self.tree.getattr(crate::ROOT_INODE).expect("virtual root"),
-                    true,
-                ),
+                None => (tree.getattr(crate::ROOT_INODE).expect("virtual root"), true),
             };
             let mut visible_name = location.name.clone();
             if orphaned
@@ -1147,7 +1432,7 @@ impl VirtualFuse {
                 let inode = crate::stable_inode(&identity.drive_id, &identity.item_id);
                 visible_name = self.recovery_name(parent, inode, &location.name, orphaned, &local);
             }
-            if self.tree.getattr(inode).is_some() || local.contains_key(&inode) {
+            if tree.getattr(inode).is_some() || local.contains_key(&inode) {
                 continue;
             }
             local.insert(
@@ -1195,7 +1480,7 @@ impl VirtualFuse {
         let item_id = format!("local:{random}");
         drop(temporary);
         let identity = DraftIdentity {
-            drive_id: self.tree.drive_id().to_owned(),
+            drive_id: self.tree_snapshot().drive_id().to_owned(),
             item_id: item_id.clone(),
             base_etag: "local-new".to_owned(),
             new_file: Some(NewFileLocation {
@@ -1203,8 +1488,8 @@ impl VirtualFuse {
                 name: name.to_owned(),
             }),
         };
-        let inode = crate::stable_inode(self.tree.drive_id(), &item_id);
-        if self.tree.getattr(inode).is_some() || local.contains_key(&inode) {
+        let inode = crate::stable_inode(self.tree_snapshot().drive_id(), &item_id);
+        if self.tree_snapshot().getattr(inode).is_some() || local.contains_key(&inode) {
             return Err(Errno::EEXIST);
         }
         let draft = store.begin_empty(identity).map_err(map_draft_error)?;
@@ -1236,7 +1521,7 @@ impl VirtualFuse {
         let Some(root) = &self.draft_root else {
             return Err(Errno::EROFS);
         };
-        let remote_inode = crate::stable_inode(self.tree.drive_id(), &node.item_id);
+        let remote_inode = crate::stable_inode(self.tree_snapshot().drive_id(), &node.item_id);
         if self
             .files
             .lock()
@@ -1251,7 +1536,7 @@ impl VirtualFuse {
         }
         let parent = self.node(node.parent_inode).ok_or(Errno::EIO)?;
         let mutation = Mutation {
-            drive_id: self.tree.drive_id().to_owned(),
+            drive_id: self.tree_snapshot().drive_id().to_owned(),
             item_id: node.item_id.clone(),
             parent_id: self.remote_parent_id(&parent)?,
             name: node.name.clone(),
@@ -1303,7 +1588,7 @@ impl VirtualFuse {
             return Err(Errno::EIO);
         }
         DraftStore::open(root)
-            .and_then(|store| store.remove_new(self.tree.drive_id(), &node.item_id))
+            .and_then(|store| store.remove_new(self.tree_snapshot().drive_id(), &node.item_id))
             .map_err(map_draft_error)?;
         let mut detached = false;
         for open in files.values().filter(|open| open.inode == node.inode) {
@@ -1323,6 +1608,7 @@ impl VirtualFuse {
     }
 
     fn create_directory(&self, parent: u64, name: &str) -> Result<Node, Errno> {
+        let tree = self.tree_snapshot();
         let Some(root) = &self.draft_root else {
             return Err(Errno::EROFS);
         };
@@ -1333,7 +1619,7 @@ impl VirtualFuse {
         let mut local = self.local_files.lock().unwrap();
         let parent_node = local
             .get(&parent)
-            .or_else(|| self.tree.getattr(parent))
+            .or_else(|| tree.getattr(parent))
             .ok_or(Errno::ENOENT)?;
         if parent_node.kind != NodeKind::Directory {
             return Err(Errno::ENOTDIR);
@@ -1343,9 +1629,11 @@ impl VirtualFuse {
         }
         DraftStore::open(root).map_err(map_draft_error)?;
         let directory = DirectoryStore::open(root)
-            .and_then(|store| store.create(self.tree.drive_id(), &parent_node.item_id, name))
+            .and_then(|store| {
+                store.create(self.tree_snapshot().drive_id(), &parent_node.item_id, name)
+            })
             .map_err(map_draft_error)?;
-        let inode = crate::stable_inode(self.tree.drive_id(), &directory.item_id);
+        let inode = crate::stable_inode(self.tree_snapshot().drive_id(), &directory.item_id);
         let node = Node {
             inode,
             parent_inode: parent,
@@ -1380,7 +1668,7 @@ impl VirtualFuse {
             return Err(Errno::ENOTEMPTY);
         }
         if self
-            .tree
+            .tree_snapshot()
             .readdir(node.inode)
             .is_some_and(|children| !children.is_empty())
         {
@@ -1398,7 +1686,7 @@ impl VirtualFuse {
             .find(|directory| directory.item_id == node.item_id)
             .ok_or(Errno::EIO)?;
         if let Some(remote_id) = &directory.remote_id {
-            if !self.tree.is_deleted(remote_id) {
+            if !self.tree_snapshot().is_deleted(remote_id) {
                 return Err(Errno::EBUSY);
             }
             store
@@ -1424,6 +1712,7 @@ impl VirtualFuse {
         new_name: &str,
         flags: fuser::RenameFlags,
     ) -> Result<(), Errno> {
+        let tree = self.tree_snapshot();
         let _serialized = self.open_lock.lock().unwrap();
         let Some(root) = &self.draft_root else {
             return Err(Errno::EROFS);
@@ -1472,16 +1761,19 @@ impl VirtualFuse {
                 .remote_changes
                 .lock()
                 .unwrap()
-                .contains_key(&crate::stable_inode(self.tree.drive_id(), &target.item_id))
+                .contains_key(&crate::stable_inode(
+                    self.tree_snapshot().drive_id(),
+                    &target.item_id,
+                ))
             {
                 return Err(Errno::EEXIST);
             }
             let store = DraftStore::open(root).map_err(map_draft_error)?;
             store
-                .ensure_new_removable(self.tree.drive_id(), &node.item_id)
+                .ensure_new_removable(self.tree_snapshot().drive_id(), &node.item_id)
                 .map_err(map_draft_error)?;
             let source = store
-                .recover_item(self.tree.drive_id(), &node.item_id)
+                .recover_item(self.tree_snapshot().drive_id(), &node.item_id)
                 .map_err(map_draft_error)?
                 .ok_or(Errno::EIO)?;
             let snapshot = store
@@ -1530,14 +1822,14 @@ impl VirtualFuse {
             }
             let store = DraftStore::open(root).map_err(map_draft_error)?;
             store
-                .ensure_new_removable(self.tree.drive_id(), &target.item_id)
+                .ensure_new_removable(self.tree_snapshot().drive_id(), &target.item_id)
                 .map_err(map_draft_error)?;
             let source_draft = store
-                .recover_item(self.tree.drive_id(), &node.item_id)
+                .recover_item(self.tree_snapshot().drive_id(), &node.item_id)
                 .map_err(map_draft_error)?
                 .ok_or(Errno::EIO)?;
             let target_draft = store
-                .recover_item(self.tree.drive_id(), &target.item_id)
+                .recover_item(self.tree_snapshot().drive_id(), &target.item_id)
                 .map_err(map_draft_error)?
                 .ok_or(Errno::EIO)?;
             store
@@ -1592,7 +1884,7 @@ impl VirtualFuse {
                 }
                 ancestor = local
                     .get(&ancestor)
-                    .or_else(|| self.tree.getattr(ancestor))
+                    .or_else(|| tree.getattr(ancestor))
                     .ok_or(Errno::ENOENT)?
                     .parent_inode;
             }
@@ -1643,7 +1935,7 @@ impl VirtualFuse {
                 }
                 ancestor = local
                     .get(&ancestor)
-                    .or_else(|| self.tree.getattr(ancestor))
+                    .or_else(|| tree.getattr(ancestor))
                     .ok_or(Errno::ENOENT)?
                     .parent_inode;
             }
@@ -1677,7 +1969,7 @@ impl VirtualFuse {
             DraftStore::open(root)
                 .and_then(|store| {
                     store.relocate_new(
-                        self.tree.drive_id(),
+                        self.tree_snapshot().drive_id(),
                         &node.item_id,
                         NewFileLocation {
                             parent_id: parent_node.item_id,
@@ -1694,11 +1986,14 @@ impl VirtualFuse {
     }
 
     fn directory_entries(&self, inode: u64) -> Option<Vec<DirectoryEntry>> {
+        let tree = self.tree_snapshot();
         let directory = self.node(inode)?;
         if directory.kind != NodeKind::Directory {
             return None;
         }
-        let children = self.tree.readdir(inode).unwrap_or_default();
+        let children = tree
+            .readdir(self.tree_parent_inode(inode))
+            .unwrap_or_default();
         let mut entries = vec![
             (inode, FileType::Directory, ".".to_owned()),
             (directory.parent_inode, FileType::Directory, "..".to_owned()),
@@ -1733,7 +2028,7 @@ impl VirtualFuse {
             } = &mutation.kind
                 && self.target_parent_matches(inode, &directory.item_id, target_parent_id)
                 && let Some(source) = self
-                    .tree
+                    .tree_snapshot()
                     .getattr(crate::stable_inode(&mutation.drive_id, &mutation.item_id))
                 && source.parent_inode != inode
                 && let Some(node) = self.remote_node(source)
@@ -1794,6 +2089,7 @@ impl VirtualFuse {
             OpenDirectory {
                 inode,
                 entries: Arc::new(entries),
+                generation: self.tree_generation.load(Ordering::Acquire),
             },
         );
         Ok(handle)
@@ -1811,6 +2107,33 @@ impl VirtualFuse {
             .filter(|open| open.inode == inode)
             .map(|open| Arc::clone(&open.entries))
             .ok_or(Errno::EBADF)
+    }
+
+    fn directory_entries_for_read(
+        &self,
+        inode: u64,
+        handle: u64,
+        offset: u64,
+    ) -> Result<Arc<Vec<DirectoryEntry>>, Errno> {
+        if offset == 0 {
+            let generation = self.tree_generation.load(Ordering::Acquire);
+            let stale = self
+                .directories
+                .lock()
+                .unwrap()
+                .get(&handle)
+                .is_some_and(|open| open.inode == inode && open.generation != generation);
+            if stale {
+                let entries = Arc::new(self.directory_entries(inode).ok_or(Errno::ENOENT)?);
+                if let Some(open) = self.directories.lock().unwrap().get_mut(&handle)
+                    && open.inode == inode
+                {
+                    open.entries = entries;
+                    open.generation = generation;
+                }
+            }
+        }
+        self.directory_entries_for_handle(inode, handle)
     }
 
     fn close_directory(&self, inode: u64, handle: u64) -> Result<(), Errno> {
@@ -2539,7 +2862,7 @@ impl Filesystem for VirtualFuse {
         offset: u64,
         mut reply: ReplyDirectory,
     ) {
-        let entries = match self.directory_entries_for_handle(inode.0, handle.0) {
+        let entries = match self.directory_entries_for_read(inode.0, handle.0, offset) {
             Ok(entries) => entries,
             Err(error) => {
                 reply.error(error);
@@ -2565,7 +2888,7 @@ impl Filesystem for VirtualFuse {
         offset: u64,
         mut reply: ReplyDirectoryPlus,
     ) {
-        let entries = match self.directory_entries_for_handle(inode.0, handle.0) {
+        let entries = match self.directory_entries_for_read(inode.0, handle.0, offset) {
             Ok(entries) => entries,
             Err(error) => {
                 reply.error(error);
@@ -6206,7 +6529,11 @@ mod tests {
                 .collect::<Vec<_>>(),
             [".", "..", "текст.txt"]
         );
-        let inode = fuse.tree.lookup(ROOT_INODE, "текст.txt").unwrap().inode;
+        let inode = fuse
+            .tree_snapshot()
+            .lookup(ROOT_INODE, "текст.txt")
+            .unwrap()
+            .inode;
         assert!(fuse.open_file(inode, OpenFlags(libc::O_WRONLY)).is_err());
         let handle = fuse.open_file(inode, OpenFlags(libc::O_RDONLY)).unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -6460,14 +6787,20 @@ mod tests {
             10,
             Arc::new(|_| Err(io::ErrorKind::NotConnected.into())),
         );
-        let inode = fuse.tree.lookup(ROOT_INODE, "текст.txt").unwrap().inode;
+        let inode = fuse
+            .tree_snapshot()
+            .lookup(ROOT_INODE, "текст.txt")
+            .unwrap()
+            .inode;
         let reader = fuse.open_file(inode, OpenFlags(libc::O_RDONLY)).unwrap();
         let handle = fuse.open_file(inode, OpenFlags(libc::O_RDWR)).unwrap();
         assert_eq!(fuse.write_file(inode, handle, 1, b"a").unwrap(), 1);
         assert_eq!(fuse.read_file(inode, handle, 0, 5).unwrap(), b"hallo");
         assert_eq!(fuse.read_file(inode, reader, 0, 5).unwrap(), b"hallo");
         assert_eq!(
-            fuse.attr(fuse.tree.getattr(inode).unwrap()).unwrap().size,
+            fuse.attr(fuse.tree_snapshot().getattr(inode).unwrap())
+                .unwrap()
+                .size,
             5
         );
         drop(fuse);
@@ -7612,7 +7945,8 @@ mod tests {
             10,
             Arc::new(|_| Err(io::ErrorKind::NotConnected.into())),
         );
-        let parent = fuse.tree.getattr(ROOT_INODE).unwrap();
+        let tree = fuse.tree_snapshot();
+        let parent = tree.getattr(ROOT_INODE).unwrap();
         let name = fuse.recovery_name(parent, u64::MAX, &"💾".repeat(100), false, &HashMap::new());
         assert!(name.starts_with(".conflict-"));
         assert!(name.len() <= 255);
@@ -7695,7 +8029,11 @@ mod tests {
             10,
             Arc::new(|_| Err(io::ErrorKind::NotConnected.into())),
         );
-        let inode = fuse.tree.lookup(ROOT_INODE, "текст.txt").unwrap().inode;
+        let inode = fuse
+            .tree_snapshot()
+            .lookup(ROOT_INODE, "текст.txt")
+            .unwrap()
+            .inode;
         let handle = fuse
             .open_file(inode, OpenFlags(libc::O_WRONLY | libc::O_TRUNC))
             .unwrap();
@@ -8403,5 +8741,324 @@ mod tests {
             Some(libc::ENETDOWN)
         );
         session.umount_and_join().unwrap();
+    }
+
+    #[test]
+    fn catalog_refresh_updates_mounted_directory_without_remount() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = CatalogItem {
+            item_id: "folder".into(),
+            name: Some("Shared".into()),
+            kind: "folder".into(),
+            ..file_item()
+        };
+        let fuse = VirtualFuse::new_writable(
+            VirtualTree::from_items("drive", "root", [folder.clone()]).unwrap(),
+            dir.path().join("cache"),
+            dir.path().join("drafts"),
+            10,
+            Arc::new(|_| Err(io::ErrorKind::NotConnected.into())),
+        );
+        fuse.load_local_files().unwrap();
+        let controller = fuse.published_version_controller();
+        let folder_inode = fuse.lookup_node(ROOT_INODE, "Shared").unwrap().inode;
+        assert!(fuse.lookup_node(folder_inode, "new.txt").is_none());
+        let new_file = CatalogItem {
+            item_id: "new-file".into(),
+            parent_id: Some("folder".into()),
+            name: Some("new.txt".into()),
+            ..file_item()
+        };
+        let changed = controller
+            .replace_tree(VirtualTree::from_items("drive", "root", [folder, new_file]).unwrap())
+            .unwrap();
+        assert!(changed.contains(&(folder_inode, "new.txt".to_owned())));
+        let found = fuse.lookup_node(folder_inode, "new.txt").unwrap();
+        assert_eq!(found.item_id, "new-file");
+        assert!(
+            fuse.directory_entries(folder_inode)
+                .unwrap()
+                .iter()
+                .any(|entry| entry.2 == "new.txt")
+        );
+        assert_eq!(fuse.request_for_node(&found).unwrap().item_id, "new-file");
+    }
+
+    #[test]
+    fn catalog_refresh_preserves_draft_when_remote_file_disappears() {
+        let dir = tempfile::tempdir().unwrap();
+        let draft_root = dir.path().join("drafts");
+        DraftStore::open(&draft_root)
+            .unwrap()
+            .begin_empty(DraftIdentity {
+                drive_id: "drive".into(),
+                item_id: "file".into(),
+                base_etag: "v1".into(),
+                new_file: None,
+            })
+            .unwrap()
+            .write_at(0, b"unsent")
+            .unwrap();
+        let fuse = VirtualFuse::new_writable(
+            VirtualTree::from_items("drive", "root", [file_item()]).unwrap(),
+            dir.path().join("cache"),
+            draft_root,
+            10,
+            Arc::new(|_| Err(io::ErrorKind::NotConnected.into())),
+        );
+        let controller = fuse.published_version_controller();
+        controller
+            .replace_tree(VirtualTree::from_items("drive", "root", []).unwrap())
+            .unwrap();
+        let orphan = fuse
+            .directory_entries(ROOT_INODE)
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.2.starts_with(".orphan-"))
+            .unwrap();
+        let handle = fuse.open_file(orphan.0, OpenFlags(libc::O_RDONLY)).unwrap();
+        assert_eq!(fuse.read_file(orphan.0, handle, 0, 6).unwrap(), b"unsent");
+        controller
+            .replace_tree(VirtualTree::from_items("drive", "root", [file_item()]).unwrap())
+            .unwrap();
+        assert!(fuse.lookup_node(ROOT_INODE, &orphan.2).is_none());
+        assert!(fuse.lookup_node(ROOT_INODE, "текст.txt").is_some());
+    }
+
+    #[test]
+    fn catalog_refresh_keeps_new_remote_file_and_colliding_local_draft_visible() {
+        let dir = tempfile::tempdir().unwrap();
+        let draft_root = dir.path().join("drafts");
+        let fuse = VirtualFuse::new_writable(
+            VirtualTree::from_items("drive", "root", []).unwrap(),
+            dir.path().join("cache"),
+            draft_root,
+            10,
+            Arc::new(|_| Err(io::ErrorKind::NotConnected.into())),
+        );
+        fuse.create_file(
+            ROOT_INODE,
+            "текст.txt",
+            OpenFlags(libc::O_CREAT | libc::O_WRONLY),
+        )
+        .unwrap();
+        let controller = fuse.published_version_controller();
+        controller
+            .replace_tree(VirtualTree::from_items("drive", "root", [file_item()]).unwrap())
+            .unwrap();
+        assert_eq!(
+            fuse.lookup_node(ROOT_INODE, "текст.txt").unwrap().item_id,
+            "file"
+        );
+        let entries = fuse.directory_entries(ROOT_INODE).unwrap();
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.2.starts_with(".conflict-"))
+        );
+    }
+
+    #[test]
+    fn catalog_refresh_reaches_children_of_published_local_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let fuse = VirtualFuse::new_writable(
+            VirtualTree::from_items("drive", "root", []).unwrap(),
+            dir.path().join("cache"),
+            dir.path().join("drafts"),
+            10,
+            Arc::new(|_| Err(io::ErrorKind::NotConnected.into())),
+        );
+        let folder = fuse.create_directory(ROOT_INODE, "Shared").unwrap();
+        let directories = DirectoryStore::open(&dir.path().join("drafts")).unwrap();
+        let record = directories.list().unwrap().remove(0);
+        let created = directories.record_created(&record, "folder").unwrap();
+        let controller = fuse.published_version_controller();
+        let lease = controller
+            .try_begin_directory("drive", &folder.item_id)
+            .unwrap();
+        controller
+            .publish_directory(&lease, &folder.item_id, "folder", "v1")
+            .unwrap();
+        directories.mark_uploaded(&created, "folder").unwrap();
+        drop(lease);
+        let remote_folder = CatalogItem {
+            item_id: "folder".into(),
+            name: Some("Shared".into()),
+            kind: "folder".into(),
+            ..file_item()
+        };
+        let remote_file = CatalogItem {
+            item_id: "child".into(),
+            parent_id: Some("folder".into()),
+            name: Some("added.txt".into()),
+            ..file_item()
+        };
+        let changed = controller
+            .replace_tree(
+                VirtualTree::from_items("drive", "root", [remote_folder, remote_file]).unwrap(),
+            )
+            .unwrap();
+        assert!(changed.contains(&(folder.inode, "added.txt".to_owned())));
+        assert_eq!(
+            fuse.lookup_node(folder.inode, "added.txt").unwrap().item_id,
+            "child"
+        );
+        assert!(
+            fuse.directory_entries(folder.inode)
+                .unwrap()
+                .iter()
+                .any(|entry| entry.2 == "added.txt")
+        );
+        let renamed_folder = CatalogItem {
+            item_id: "folder".into(),
+            name: Some("Renamed".into()),
+            kind: "folder".into(),
+            ..file_item()
+        };
+        controller
+            .replace_tree(VirtualTree::from_items("drive", "root", [renamed_folder]).unwrap())
+            .unwrap();
+        assert!(fuse.lookup_node(ROOT_INODE, "Shared").is_none());
+        assert_eq!(
+            fuse.lookup_node(ROOT_INODE, "Renamed").unwrap().inode,
+            folder.inode
+        );
+        let deleted_folder = CatalogItem {
+            item_id: "folder".into(),
+            deleted: true,
+            ..file_item()
+        };
+        controller
+            .replace_tree(VirtualTree::from_items("drive", "root", [deleted_folder]).unwrap())
+            .unwrap();
+        assert!(fuse.lookup_node(ROOT_INODE, "Renamed").is_none());
+        assert!(directories.list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn catalog_refresh_updates_rewound_open_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let fuse = VirtualFuse::new_writable(
+            VirtualTree::from_items("drive", "root", []).unwrap(),
+            dir.path().join("cache"),
+            dir.path().join("drafts"),
+            10,
+            Arc::new(|_| Err(io::ErrorKind::NotConnected.into())),
+        );
+        fuse.load_local_files().unwrap();
+        let handle = fuse.open_directory(ROOT_INODE).unwrap();
+        assert_eq!(
+            fuse.directory_entries_for_handle(ROOT_INODE, handle)
+                .unwrap()
+                .len(),
+            2
+        );
+        fuse.published_version_controller()
+            .replace_tree(VirtualTree::from_items("drive", "root", [file_item()]).unwrap())
+            .unwrap();
+        assert_eq!(
+            fuse.directory_entries_for_read(ROOT_INODE, handle, 0)
+                .unwrap()
+                .len(),
+            3
+        );
+    }
+
+    #[test]
+    fn catalog_refresh_releases_published_version_after_confirmation() {
+        let dir = tempfile::tempdir().unwrap();
+        let fuse = VirtualFuse::new_writable(
+            VirtualTree::from_items("drive", "root", [file_item()]).unwrap(),
+            dir.path().join("cache"),
+            dir.path().join("drafts"),
+            10,
+            Arc::new(|_| Err(io::ErrorKind::NotConnected.into())),
+        );
+        fuse.load_local_files().unwrap();
+        let controller = fuse.published_version_controller();
+        controller.publish_existing("file", "v2".into(), 9);
+        let inode = crate::stable_inode("drive", "file");
+        assert_eq!(fuse.node(inode).unwrap().etag.as_deref(), Some("v2"));
+        let mut confirmed = file_item();
+        confirmed.etag = Some("v2".into());
+        confirmed.size = Some(9);
+        controller
+            .replace_tree(VirtualTree::from_items("drive", "root", [confirmed.clone()]).unwrap())
+            .unwrap();
+        confirmed.etag = Some("v3".into());
+        confirmed.size = Some(11);
+        controller
+            .replace_tree(VirtualTree::from_items("drive", "root", [confirmed]).unwrap())
+            .unwrap();
+        assert_eq!(fuse.node(inode).unwrap().etag.as_deref(), Some("v3"));
+        assert_eq!(fuse.node(inode).unwrap().size, 11);
+    }
+
+    #[test]
+    fn catalog_refresh_retires_confirmed_remote_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        let draft_root = dir.path().join("drafts");
+        let fuse = VirtualFuse::new_writable(
+            VirtualTree::from_items("drive", "root", [file_item()]).unwrap(),
+            dir.path().join("cache"),
+            draft_root.clone(),
+            10,
+            Arc::new(|_| Err(io::ErrorKind::NotConnected.into())),
+        );
+        fuse.load_local_files().unwrap();
+        let node = fuse.lookup_node(ROOT_INODE, "текст.txt").unwrap();
+        fuse.queue_remote_change(
+            &node,
+            MutationKind::Rename {
+                target_parent_id: "root".into(),
+                target_name: "renamed.txt".into(),
+            },
+        )
+        .unwrap();
+        let store = MutationStore::open(&draft_root).unwrap();
+        let mutation = store.list().unwrap().remove(0);
+        store
+            .update_status(&mutation, MutationStatus::Applied)
+            .unwrap();
+        let mut renamed = file_item();
+        renamed.name = Some("renamed.txt".into());
+        fuse.published_version_controller()
+            .replace_tree(VirtualTree::from_items("drive", "root", [renamed]).unwrap())
+            .unwrap();
+        assert!(store.list().unwrap().is_empty());
+        assert!(fuse.remote_changes.lock().unwrap().is_empty());
+        assert!(fuse.lookup_node(ROOT_INODE, "renamed.txt").is_some());
+    }
+
+    #[test]
+    fn catalog_refresh_keeps_open_cached_file_after_remote_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_root = dir.path().join("cache");
+        let source = dir.path().join("source");
+        fs::write(&source, b"hello").unwrap();
+        let tree = VirtualTree::from_items("drive", "root", [file_item()]).unwrap();
+        let request = tree.request_for_item("file").unwrap();
+        CacheStore::open(&cache_root, 10)
+            .unwrap()
+            .put(&request.cache_key(), &source, 5)
+            .unwrap();
+        let fuse = VirtualFuse::new_writable(
+            tree,
+            cache_root,
+            dir.path().join("drafts"),
+            10,
+            Arc::new(|_| Err(io::ErrorKind::NotConnected.into())),
+        );
+        fuse.load_local_files().unwrap();
+        let inode = fuse.lookup_node(ROOT_INODE, "текст.txt").unwrap().inode;
+        let handle = fuse.open_file(inode, OpenFlags(libc::O_RDONLY)).unwrap();
+        let controller = fuse.published_version_controller();
+        controller.set_deleted_remote_files(["file".to_owned()]);
+        controller
+            .replace_tree(VirtualTree::from_items("drive", "root", []).unwrap())
+            .unwrap();
+        assert!(fuse.lookup_node(ROOT_INODE, "текст.txt").is_none());
+        assert_eq!(fuse.read_file(inode, handle, 0, 5).unwrap(), b"hello");
+        assert_eq!(fuse.attr_for_handle(inode, Some(handle)).unwrap().nlink, 0);
     }
 }

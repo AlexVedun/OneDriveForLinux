@@ -9,7 +9,7 @@ pub mod preflight;
 use onedrive_cache::{CacheError, CacheKey, CacheStore};
 use onedrive_catalog::{Catalog, CatalogError, CatalogItem};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::io;
 use std::os::unix::fs::FileExt;
@@ -173,6 +173,35 @@ pub struct VirtualTree {
 }
 
 impl VirtualTree {
+    /// Entries whose names or metadata changed between two complete catalog scans.
+    pub fn changed_entries(&self, next: &Self) -> Vec<(u64, String)> {
+        let mut changed = BTreeSet::new();
+        for (parent, children) in self.children.iter().chain(next.children.iter()) {
+            for (name, inode) in children {
+                let old = self
+                    .children
+                    .get(parent)
+                    .and_then(|entries| entries.get(name));
+                let new = next
+                    .children
+                    .get(parent)
+                    .and_then(|entries| entries.get(name));
+                if old != new || self.nodes.get(inode) != next.nodes.get(inode) {
+                    changed.insert((*parent, name.clone()));
+                }
+            }
+        }
+        changed.into_iter().collect()
+    }
+
+    pub(crate) fn removed_nodes(&self, next: &Self) -> Vec<Node> {
+        self.nodes
+            .iter()
+            .filter(|(inode, _)| **inode != ROOT_INODE && !next.nodes.contains_key(inode))
+            .map(|(_, node)| node.clone())
+            .collect()
+    }
+
     pub fn drive_id(&self) -> &str {
         &self.drive_id
     }
