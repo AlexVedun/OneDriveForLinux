@@ -158,6 +158,17 @@ impl DirectoryStore {
         File::open(&self.root)?.sync_all()
     }
 
+    /// Discard a mapping only after the complete catalog explicitly marks its
+    /// remote folder deleted. The FUSE caller checks for local children first.
+    pub fn remove_remote_deleted(&self, directory: &LocalDirectory) -> io::Result<()> {
+        if directory.remote_id.is_none() || directory.created_remote_id.is_some() {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        self.require_current(directory)?;
+        fs::remove_file(self.path(&directory.item_id))?;
+        File::open(&self.root)?.sync_all()
+    }
+
     pub fn record_created(
         &self,
         directory: &LocalDirectory,

@@ -1397,7 +1397,18 @@ impl VirtualFuse {
             .into_iter()
             .find(|directory| directory.item_id == node.item_id)
             .ok_or(Errno::EIO)?;
-        if directory.remote_id.is_some() || directory.created_remote_id.is_some() {
+        if let Some(remote_id) = &directory.remote_id {
+            if !self.tree.is_deleted(remote_id) {
+                return Err(Errno::EBUSY);
+            }
+            store
+                .remove_remote_deleted(&directory)
+                .map_err(map_draft_error)?;
+            local.remove(&node.inode);
+            self.directory_aliases.lock().unwrap().remove(remote_id);
+            return Ok(());
+        }
+        if directory.created_remote_id.is_some() {
             return Err(Errno::EBUSY);
         }
         store.remove(&directory).map_err(map_draft_error)?;
@@ -3848,6 +3859,75 @@ mod tests {
             MutationStore::open(&draft_root).unwrap().list().unwrap()[0].kind,
             MutationKind::Delete
         );
+    }
+
+    #[test]
+    fn empty_uploaded_directory_can_be_removed_after_remote_tombstone() {
+        let dir = tempfile::tempdir().unwrap();
+        let draft_root = dir.path().join("drafts");
+        let make_fuse = || {
+            let mut remote = file_item();
+            remote.item_id = "remote-folder".into();
+            remote.name = Some("folder".into());
+            remote.kind = "folder".into();
+            remote.deleted = true;
+            VirtualFuse::new_writable(
+                VirtualTree::from_items("drive", "root", [remote]).unwrap(),
+                dir.path().join("cache"),
+                draft_root.clone(),
+                20,
+                Arc::new(|_| panic!("no download expected")),
+            )
+        };
+        let fuse = VirtualFuse::new_writable(
+            VirtualTree::from_items("drive", "root", []).unwrap(),
+            dir.path().join("cache"),
+            draft_root.clone(),
+            20,
+            Arc::new(|_| panic!("no download expected")),
+        );
+        let folder = fuse.create_directory(ROOT_INODE, "folder").unwrap();
+        let store = DirectoryStore::open(&draft_root).unwrap();
+        let directory = store.list().unwrap().remove(0);
+        let created = store.record_created(&directory, "remote-folder").unwrap();
+        store.mark_uploaded(&created, "remote-folder").unwrap();
+        drop(fuse);
+
+        let fuse = make_fuse();
+        fuse.load_local_files().unwrap();
+        assert_eq!(
+            fuse.lookup_node(ROOT_INODE, "folder").unwrap().inode,
+            folder.inode
+        );
+        fuse.create_directory(folder.inode, "child").unwrap();
+        assert_eq!(
+            fuse.remove_local_directory(ROOT_INODE, "folder"),
+            Err(Errno::ENOTEMPTY)
+        );
+        assert!(
+            store
+                .list()
+                .unwrap()
+                .iter()
+                .any(|item| item.item_id == directory.item_id)
+        );
+        fuse.remove_local_directory(folder.inode, "child").unwrap();
+        assert!(fuse.lookup_node(folder.inode, "child").is_none());
+        fuse.remove_local_directory(ROOT_INODE, "folder").unwrap();
+        assert!(fuse.lookup_node(ROOT_INODE, "folder").is_none());
+        assert!(store.list().unwrap().is_empty());
+        assert!(
+            MutationStore::open(&draft_root)
+                .unwrap()
+                .list()
+                .unwrap()
+                .is_empty()
+        );
+        drop(fuse);
+
+        let fuse = make_fuse();
+        fuse.load_local_files().unwrap();
+        assert!(fuse.lookup_node(ROOT_INODE, "folder").is_none());
     }
 
     #[test]

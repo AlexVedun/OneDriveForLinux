@@ -9,7 +9,7 @@ pub mod preflight;
 use onedrive_cache::{CacheError, CacheKey, CacheStore};
 use onedrive_catalog::{Catalog, CatalogError, CatalogItem};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::io;
 use std::os::unix::fs::FileExt;
@@ -169,11 +169,16 @@ pub struct VirtualTree {
     drive_id: String,
     nodes: HashMap<u64, Node>,
     children: HashMap<u64, BTreeMap<String, u64>>,
+    deleted_ids: HashSet<String>,
 }
 
 impl VirtualTree {
     pub fn drive_id(&self) -> &str {
         &self.drive_id
+    }
+
+    pub fn is_deleted(&self, item_id: &str) -> bool {
+        self.deleted_ids.contains(item_id)
     }
 
     pub fn request_for_item(&self, item_id: &str) -> Result<DownloadRequest, OpenError> {
@@ -255,11 +260,13 @@ impl VirtualTree {
         }
 
         let mut active = HashMap::new();
+        let mut deleted_ids = HashSet::new();
         for item in items {
             if item.drive_id != drive_id {
                 return Err(TreeError::WrongDrive(item.item_id));
             }
             if item.deleted {
+                deleted_ids.insert(item.item_id);
                 continue;
             }
             if item.item_id.is_empty() {
@@ -298,6 +305,7 @@ impl VirtualTree {
             drive_id: drive_id.to_owned(),
             nodes: HashMap::from([(ROOT_INODE, root)]),
             children: HashMap::new(),
+            deleted_ids,
         };
         let mut id_to_inode = HashMap::from([(root_id.to_owned(), ROOT_INODE)]);
         let mut queue = VecDeque::from([root_id.to_owned()]);
@@ -522,13 +530,10 @@ mod tests {
     fn rejects_invalid_metadata_and_ignores_tombstones() {
         let mut deleted = item("gone", "root", "gone", "file");
         deleted.deleted = true;
-        assert!(
-            VirtualTree::from_items("drive", "root", [deleted])
-                .unwrap()
-                .readdir(ROOT_INODE)
-                .unwrap()
-                .is_empty()
-        );
+        let tree = VirtualTree::from_items("drive", "root", [deleted]).unwrap();
+        assert!(tree.readdir(ROOT_INODE).unwrap().is_empty());
+        assert!(tree.is_deleted("gone"));
+        assert!(!tree.is_deleted("unknown"));
         let mut invalid = item("bad", "root", "../bad", "file");
         assert_eq!(
             VirtualTree::from_items("drive", "root", [invalid.clone()]).err(),
