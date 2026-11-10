@@ -4202,19 +4202,20 @@ async fn poll_catalog(
     }
 }
 
-/// Drafts are the durable queue; one candidate is retried per interval.
+/// Drafts are the durable queue. Drain ready files without waiting for the
+/// next idle poll; failed drafts keep their separate retry deadline.
 async fn poll_virtual_drafts(daemon: Daemon) {
     let mut interval = tokio::time::interval(Duration::from_secs(30));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut last_attempted = None;
     let mut retry_schedule = virtual_drafts::RetrySchedule::default();
     loop {
-        interval.tick().await;
         let now = Instant::now();
         retry_schedule.prune(now);
         let Some((identity, action)) =
             daemon.virtual_auto_upload_candidate(last_attempted.as_deref(), &retry_schedule, now)
         else {
+            interval.tick().await;
             continue;
         };
         let item_id = identity.item_id.clone();
